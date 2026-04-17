@@ -2,7 +2,9 @@
 //!
 //! Scope (per RFC 6716 §4.3):
 //!
-//! * §4.3 frame header: silence=0, post_filter=None, transient=false, intra=true.
+//! * §4.3 frame header: silence=0, post_filter=None, transient=false,
+//!   `intra` is per-frame (true on the first frame, false thereafter — see
+//!   the "Inter-frame energy prediction" paragraph below).
 //! * §4.3.2.1 coarse energy: [`crate::quant_bands::quant_coarse_energy`] —
 //!   Laplace-encoded, inter/intra prediction coefficients as per libopus.
 //! * §4.3.2.2 fine energy: [`crate::quant_bands::quant_fine_energy`].
@@ -36,8 +38,14 @@
 //!   dual-stereo only (L and R as two independent mono bands). Intensity
 //!   stereo would buy extra HF bits on low bit-rate stereo; at 64 kbit/s
 //!   the dual path produces well-separated L/R output.
-//! * **Inter-frame energy prediction** — every frame is `intra=true`, which
-//!   costs more bits on steady-state content but eliminates state drift.
+//!
+//! Inter-frame energy prediction IS enabled (RFC 6716 §4.3.2.1): the first
+//! frame of the session is forced `intra=true` (no prior state), all
+//! subsequent frames use `intra=false` so the Laplace-coded residuals
+//! predict from the previous frame's quantised band energies. This saves
+//! bits on steady-state content at the cost of state-drift exposure if the
+//! decoder loses a packet — callers that need resync boundaries should
+//! reinstantiate the encoder.
 
 use std::collections::VecDeque;
 
@@ -117,6 +125,10 @@ pub struct CeltEncoder {
     prev_tail: Vec<Vec<f32>>,
     /// Previous frame's quantised band energies (per-channel × NB_EBANDS).
     old_band_e: Vec<f32>,
+    /// Whether the next encoded frame is the first frame of the session.
+    /// The first frame MUST use `intra=true` because `old_band_e` is zero-
+    /// initialised and would otherwise poison the decoder's prediction.
+    first_frame: bool,
     output: VecDeque<Packet>,
     bytes_per_frame: usize,
     pts_counter: i64,
@@ -148,6 +160,7 @@ impl CeltEncoder {
             pending: Vec::new(),
             prev_tail: vec![vec![0.0; OVERLAP]; channels],
             old_band_e: vec![0.0; NB_EBANDS * 2],
+            first_frame: true,
             output: VecDeque::new(),
             bytes_per_frame,
             pts_counter: 0,
@@ -216,10 +229,15 @@ impl CeltEncoder {
         }
 
         // 4) Range-code the frame.
+        // Intra-vs-inter decision: force intra on the first frame of the
+        // session (old_band_e is all zeros — using it as prediction state
+        // would poison the decoder). Subsequent frames use inter prediction
+        // for tighter residuals on steady-state content.
+        let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, no post-filter, transient=0, intra=1.
-        encode_header(&mut rc, false, None, false, true);
+        // Header: silence=0, no post-filter, transient=0, intra=<flag>.
+        encode_header(&mut rc, false, None, false, intra);
 
         // Coarse energy.
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];
@@ -232,7 +250,7 @@ impl CeltEncoder {
             &mut old_e_bands,
             0,
             NB_EBANDS,
-            true,
+            intra,
             1,
             lm as usize,
         );
@@ -373,6 +391,7 @@ impl CeltEncoder {
 
         // Commit energy state for next frame.
         self.old_band_e = old_e_bands;
+        self.first_frame = false;
 
         let buf = rc.done()?;
         let tb = TimeBase::new(1, SAMPLE_RATE as i64);
@@ -444,10 +463,13 @@ impl CeltEncoder {
         }
 
         // Range-code the frame.
+        // Intra-vs-inter decision: first frame forced intra (zero old state),
+        // subsequent frames use inter prediction. See mono path for details.
+        let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, no post-filter, transient=0, intra=1.
-        encode_header(&mut rc, false, None, false, true);
+        // Header: silence=0, no post-filter, transient=0, intra=<flag>.
+        encode_header(&mut rc, false, None, false, intra);
 
         // Coarse energy (both channels).
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];
@@ -460,7 +482,7 @@ impl CeltEncoder {
             &mut old_e_bands,
             0,
             NB_EBANDS,
-            true,
+            intra,
             channels,
             lm as usize,
         );
@@ -589,6 +611,7 @@ impl CeltEncoder {
 
         // Commit energy state for next frame.
         self.old_band_e = old_e_bands;
+        self.first_frame = false;
 
         let buf = rc.done()?;
         let tb = TimeBase::new(1, SAMPLE_RATE as i64);
@@ -747,6 +770,39 @@ mod tests {
         let h = h.unwrap();
         assert!(!h.silence);
         assert!(!h.transient);
-        assert!(h.intra);
+        // First frame of the session must be intra (no valid prior state).
+        assert!(h.intra, "first frame of a session must be intra");
+    }
+
+    /// Second frame onward must advertise `intra=false` — inter-frame energy
+    /// prediction kicks in as soon as there's valid prior state.
+    #[test]
+    fn second_frame_uses_inter_prediction() {
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        // Frame 1: intra.
+        let pcm1: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin() * 0.3
+            })
+            .collect();
+        let pkt1 = enc.encode_frame(&pcm1).unwrap();
+        // Frame 2: should now be inter.
+        let pcm2: Vec<f32> = (FRAME_SAMPLES..2 * FRAME_SAMPLES)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin() * 0.3
+            })
+            .collect();
+        let pkt2 = enc.encode_frame(&pcm2).unwrap();
+
+        let mut rd1 = crate::range_decoder::RangeDecoder::new(&pkt1.data);
+        let h1 = crate::header::decode_header(&mut rd1).unwrap();
+        assert!(h1.intra, "frame 1 must be intra");
+
+        let mut rd2 = crate::range_decoder::RangeDecoder::new(&pkt2.data);
+        let h2 = crate::header::decode_header(&mut rd2).unwrap();
+        assert!(!h2.intra, "frame 2 must be inter");
     }
 }

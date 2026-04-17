@@ -416,6 +416,84 @@ fn sine_roundtrip_produces_audible_output() {
 }
 
 #[test]
+fn inter_frame_sine_roundtrip_audible_across_frames() {
+    // 10 frames of 1 kHz sine. The encoder emits frame 0 as `intra=true`
+    // (no prior energy state) and frames 1..=9 as `intra=false`, using
+    // the previous frame's decoded band energies as prediction. Every
+    // decoded frame from 2 onward (frame 0 has empty overlap on the
+    // left, frame 1 still has an incomplete OLA state) should carry
+    // audible energy at the target tone.
+    let n_frames = 10;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    let freq = 1000.0;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+        .collect();
+
+    let packets = encode_signal_to_packets(&signal);
+    assert_eq!(
+        packets.len(),
+        n_frames,
+        "expected one packet per input frame"
+    );
+
+    // Inspect the header `intra` flag for each packet. The first must
+    // be `intra=true`; all subsequent ones must be `intra=false`
+    // (inter-frame prediction).
+    for (i, pkt) in packets.iter().enumerate() {
+        let mut rc = RangeDecoder::new(&pkt.data);
+        let h = decode_header(&mut rc).expect("header should parse");
+        if i == 0 {
+            assert!(h.intra, "frame 0 must be intra");
+        } else {
+            assert!(!h.intra, "frame {i} must be inter");
+        }
+    }
+
+    let decoded = decode_packets(&packets, n_samples);
+
+    // For each frame from index 2 onward (skip frame 0 empty-tail and
+    // frame 1 still-settling overlap), check the decoded frame has
+    // non-trivial energy at 1 kHz. This verifies inter-frame prediction
+    // doesn't cause the energy state to drift to silence or blow up.
+    let goertzel = |samples: &[f32], f: f32| -> f32 {
+        let w = 2.0 * std::f32::consts::PI * f / SAMPLE_RATE as f32;
+        let cw = w.cos();
+        let (mut s0, mut s1, mut s2) = (0f32, 0f32, 0f32);
+        for &x in samples {
+            s0 = 2.0 * cw * s1 - s2 + x;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).sqrt()
+    };
+    for frame_idx in 2..n_frames {
+        let start = FRAME_SAMPLES * frame_idx;
+        let end = start + FRAME_SAMPLES;
+        let slice = &decoded[start..end];
+        let e: f32 = slice.iter().map(|v| v * v).sum::<f32>() / FRAME_SAMPLES as f32;
+        assert!(
+            e > 1e-6,
+            "frame {frame_idx}: decoded output is silent under inter-frame prediction (energy {e})"
+        );
+        let mag_target = goertzel(slice, freq);
+        let mag_off = goertzel(slice, 5000.0);
+        // Target tone must still dominate off-band noise. Threshold
+        // matches the single-frame sine test (0.3x) — the whole point of
+        // this test is to verify that prediction state doesn't drift so
+        // far from truth that the tone vanishes.
+        assert!(
+            mag_target > 0.3 * mag_off,
+            "frame {frame_idx}: 1 kHz tone buried under inter prediction (tgt {mag_target:.3}, off {mag_off:.3})"
+        );
+    }
+    println!(
+        "inter-frame sine roundtrip: {} frames decoded, all audible",
+        n_frames
+    );
+}
+
+#[test]
 fn noise_roundtrip_does_not_crash() {
     // 2 frames of pseudo-random white noise at amplitude 0.1.
     let n_frames = 2;
