@@ -186,6 +186,35 @@ impl CeltEncoder {
         let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
         debug_assert_eq!(lm, 3);
 
+        // Silence-flag fast path. If the input frame is below a hard -90 dBFS
+        // floor (peak |s| < 1e-5), emit a silence-only packet: the decoder
+        // sees the silence bit and skips every other §4.3.2-§4.3.7 symbol,
+        // producing zero PCM. This is RFC 6716 §4.3 Table 56 silence, not the
+        // same as DTX — the packet is still emitted, just tiny.
+        let peak = pcm.iter().fold(0f32, |m, &s| m.max(s.abs()));
+        if peak < 1e-5 {
+            let bytes = self.bytes_per_frame;
+            let mut rc = RangeEncoder::new(bytes as u32);
+            encode_header(&mut rc, true, None, false, self.first_frame);
+            // Silence wipes the band-energy prediction state: there's nothing
+            // useful to carry forward.
+            for v in &mut self.old_band_e {
+                *v = 0.0;
+            }
+            // And also the OLA tail — the next frame's overlap region is zero.
+            for v in &mut self.prev_tail[0] {
+                *v = 0.0;
+            }
+            self.first_frame = false;
+            let buf = rc.done()?;
+            let tb = TimeBase::new(1, SAMPLE_RATE as i64);
+            let pts = self.pts_counter;
+            self.pts_counter += FRAME_SAMPLES as i64;
+            return Ok(Packet::new(0, tb, buf)
+                .with_pts(pts)
+                .with_duration(FRAME_SAMPLES as i64));
+        }
+
         // Build the 2N-point MDCT input frame where N = CODED_N (the
         // coded-bin count). We resample the PCM into CODED_N samples by
         // simple truncation: keep the first CODED_N samples of the frame +
@@ -411,6 +440,30 @@ impl CeltEncoder {
         let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
         debug_assert_eq!(lm, 3);
         let channels = 2usize;
+
+        // Silence fast path — peak across both channels below -90 dBFS.
+        let peak = pcm.iter().fold(0f32, |m, &s| m.max(s.abs()));
+        if peak < 1e-5 {
+            let bytes = self.bytes_per_frame;
+            let mut rc = RangeEncoder::new(bytes as u32);
+            encode_header(&mut rc, true, None, false, self.first_frame);
+            for v in &mut self.old_band_e {
+                *v = 0.0;
+            }
+            for ch in &mut self.prev_tail {
+                for v in ch {
+                    *v = 0.0;
+                }
+            }
+            self.first_frame = false;
+            let buf = rc.done()?;
+            let tb = TimeBase::new(1, SAMPLE_RATE as i64);
+            let pts = self.pts_counter;
+            self.pts_counter += FRAME_SAMPLES as i64;
+            return Ok(Packet::new(0, tb, buf)
+                .with_pts(pts)
+                .with_duration(FRAME_SAMPLES as i64));
+        }
 
         // De-interleave into L and R PCM.
         let mut l_pcm = vec![0f32; FRAME_SAMPLES];
@@ -752,10 +805,11 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 mod tests {
     use super::*;
 
-    /// Build a CELT encoder and drive it with one frame of silence — the
-    /// encoded packet should parse back via the decoder without error.
+    /// Build a CELT encoder and drive it with one frame of pure silence — the
+    /// encoder should emit the silence-flag fast path (RFC 6716 §4.3 Table 56),
+    /// so the decoded header signals silence and skips every other symbol.
     #[test]
-    fn silence_frame_produces_valid_packet() {
+    fn silence_frame_produces_silence_flag() {
         let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
         p.channels = Some(1);
         p.sample_rate = Some(SAMPLE_RATE);
@@ -763,14 +817,47 @@ mod tests {
         let pcm = vec![0.0f32; FRAME_SAMPLES];
         let pkt = enc.encode_frame(&pcm).unwrap();
         assert!(!pkt.data.is_empty());
-        // Smoke-check via the range decoder: the header should parse.
+        // Header should decode as silence (None).
         let mut rd = crate::range_decoder::RangeDecoder::new(&pkt.data);
         let h = crate::header::decode_header(&mut rd);
-        assert!(h.is_some(), "header should parse");
-        let h = h.unwrap();
+        assert!(
+            h.is_none(),
+            "silence frame must set the silence flag (header returns None)"
+        );
+    }
+
+    /// A near-silent frame (all samples below -90 dBFS) must also trip the
+    /// silence flag, not the full PVQ path.
+    #[test]
+    fn near_silence_frame_produces_silence_flag() {
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        let pcm = vec![1e-6f32; FRAME_SAMPLES];
+        let pkt = enc.encode_frame(&pcm).unwrap();
+        let mut rd = crate::range_decoder::RangeDecoder::new(&pkt.data);
+        assert!(crate::header::decode_header(&mut rd).is_none());
+    }
+
+    /// A non-silent (sine) frame must follow the normal §4.3 pipeline —
+    /// silence=false, transient=false, intra=true on first frame.
+    #[test]
+    fn sine_frame_skips_silence_flag() {
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin() * 0.3
+            })
+            .collect();
+        let pkt = enc.encode_frame(&pcm).unwrap();
+        let mut rd = crate::range_decoder::RangeDecoder::new(&pkt.data);
+        let h = crate::header::decode_header(&mut rd).expect("non-silent header should parse");
         assert!(!h.silence);
         assert!(!h.transient);
-        // First frame of the session must be intra (no valid prior state).
         assert!(h.intra, "first frame of a session must be intra");
     }
 
