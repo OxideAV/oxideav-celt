@@ -6,7 +6,7 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-celt"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust CELT (MDCT path of Opus, RFC 6716) — range decoder + scaffold"
+description = "Pure-Rust CELT (MDCT path of Opus, RFC 6716) — encoder + decoder, 48 kHz mono/stereo long-block"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-celt"
