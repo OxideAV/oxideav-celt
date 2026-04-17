@@ -90,6 +90,7 @@
 
 pub mod bands;
 pub mod cwrs;
+pub mod decoder;
 pub mod encoder;
 pub mod encoder_bands;
 pub mod encoder_rate;
@@ -104,7 +105,7 @@ pub mod rate;
 pub mod tables;
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
-use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Error, Result};
+use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
 
 pub const CODEC_ID_STR: &str = "celt";
 
@@ -117,13 +118,8 @@ pub fn register(reg: &mut CodecRegistry) {
     reg.register_both(CodecId::new(CODEC_ID_STR), caps, make_decoder, make_encoder);
 }
 
-fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    // CELT-only standalone (i.e. without the Opus framing) isn't on the
-    // CodecRegistry path today — Opus packets dispatch through `oxideav-opus`,
-    // which holds the per-stream CELT state and runs the §4.3 pipeline.
-    Err(Error::unsupported(
-        "Standalone CELT decoder is not exposed; use the `opus` codec id",
-    ))
+fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    decoder::make_decoder(params)
 }
 
 fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {

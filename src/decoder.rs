@@ -1,0 +1,620 @@
+//! CELT decoder — 48 kHz, 960 samples/frame, LM=3, FB.
+//!
+//! Scope matches what the in-crate encoder emits (RFC 6716 §4.3): mono or
+//! dual-stereo long-block, non-transient, no post-filter. A packet produced
+//! by a full libopus CELT encoder may exercise paths the decoder here does
+//! not yet cover (transients / short blocks, intensity stereo, post-filter,
+//! band boosts other than zero). Those paths assert on unexpected header
+//! flags so callers see a clear `Error::unsupported` instead of silently
+//! producing garbage.
+//!
+//! For the full Opus decoder (SILK + CELT + hybrid + range-coder framing),
+//! use the `oxideav-opus` crate, which dispatches into these same modules.
+
+use std::collections::VecDeque;
+
+use oxideav_codec::Decoder;
+use oxideav_core::{
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+};
+
+use crate::bands::{denormalise_bands, quant_all_bands};
+use crate::header::decode_header;
+use crate::mdct::imdct_sub;
+use crate::quant_bands::{unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy};
+use crate::range_decoder::{RangeDecoder, BITRES};
+use crate::rate::clt_compute_allocation;
+use crate::tables::{
+    init_caps, lm_for_frame_samples, EBAND_5MS, NB_EBANDS, SPREAD_ICDF, SPREAD_NORMAL,
+    TF_SELECT_TABLE, TRIM_ICDF,
+};
+
+pub const FRAME_SAMPLES: usize = 960;
+pub const SAMPLE_RATE: u32 = 48_000;
+const OVERLAP: usize = 120;
+
+#[rustfmt::skip]
+const WINDOW_120: [f32; 120] = [
+    6.7286966e-05, 0.00060551348, 0.0016815970, 0.0032947962, 0.0054439943,
+    0.0081276923, 0.011344001, 0.015090633, 0.019364886, 0.024163635,
+    0.029483315, 0.035319905, 0.041668911, 0.048525347, 0.055883718,
+    0.063737999, 0.072081616, 0.080907428, 0.090207705, 0.099974111,
+    0.11019769, 0.12086883, 0.13197729, 0.14351214, 0.15546177,
+    0.16781389, 0.18055550, 0.19367290, 0.20715171, 0.22097682,
+    0.23513243, 0.24960208, 0.26436860, 0.27941419, 0.29472040,
+    0.31026818, 0.32603788, 0.34200931, 0.35816177, 0.37447407,
+    0.39092462, 0.40749142, 0.42415215, 0.44088423, 0.45766484,
+    0.47447104, 0.49127978, 0.50806798, 0.52481261, 0.54149077,
+    0.55807973, 0.57455701, 0.59090049, 0.60708841, 0.62309951,
+    0.63891306, 0.65450896, 0.66986776, 0.68497077, 0.69980010,
+    0.71433873, 0.72857055, 0.74248043, 0.75605424, 0.76927895,
+    0.78214257, 0.79463430, 0.80674445, 0.81846456, 0.82978733,
+    0.84070669, 0.85121779, 0.86131698, 0.87100183, 0.88027111,
+    0.88912479, 0.89756398, 0.90559094, 0.91320904, 0.92042270,
+    0.92723738, 0.93365955, 0.93969656, 0.94535671, 0.95064907,
+    0.95558353, 0.96017067, 0.96442171, 0.96834849, 0.97196334,
+    0.97527906, 0.97830883, 0.98106616, 0.98356480, 0.98581869,
+    0.98784191, 0.98964856, 0.99125274, 0.99266849, 0.99390969,
+    0.99499004, 0.99592297, 0.99672162, 0.99739874, 0.99796667,
+    0.99843728, 0.99882195, 0.99913147, 0.99937606, 0.99956527,
+    0.99970802, 0.99981248, 0.99988613, 0.99993565, 0.99996697,
+    0.99998518, 0.99999457, 0.99999859, 0.99999982, 1.0000000,
+];
+
+pub struct CeltDecoder {
+    params: CodecParameters,
+    channels: usize,
+    old_band_e: Vec<f32>,
+    prev_tail: Vec<Vec<f32>>,
+    rng: u32,
+    output: VecDeque<Frame>,
+    pts_counter: i64,
+}
+
+impl CeltDecoder {
+    pub fn new(params: &CodecParameters) -> Result<Self> {
+        let channels = params.channels.unwrap_or(1) as usize;
+        if channels != 1 && channels != 2 {
+            return Err(Error::unsupported(
+                "CELT decoder: only mono (1) and stereo (2) channels are supported",
+            ));
+        }
+        let sr = params.sample_rate.unwrap_or(SAMPLE_RATE);
+        if sr != SAMPLE_RATE {
+            return Err(Error::unsupported("CELT decoder: only 48 kHz is supported"));
+        }
+        let mut out_params = params.clone();
+        out_params.channels = Some(channels as u16);
+        out_params.sample_rate = Some(SAMPLE_RATE);
+        Ok(Self {
+            params: out_params,
+            channels,
+            old_band_e: vec![0.0; NB_EBANDS * 2],
+            prev_tail: vec![vec![0.0; OVERLAP]; channels],
+            rng: 0,
+            output: VecDeque::new(),
+            pts_counter: 0,
+        })
+    }
+
+    fn decode_frame_mono(&mut self, bytes: &[u8]) -> Result<Vec<f32>> {
+        let mut rc = RangeDecoder::new(bytes);
+        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+        let end_band = NB_EBANDS;
+        let start_band = 0usize;
+
+        let header = match decode_header(&mut rc) {
+            Some(h) => h,
+            None => {
+                // silence flag was set — emit zeros, advance OLA state so the
+                // next frame's overlap lands on actual zeros.
+                for v in &mut self.prev_tail[0] {
+                    *v = 0.0;
+                }
+                return Ok(vec![0.0; FRAME_SAMPLES]);
+            }
+        };
+        if header.transient {
+            return Err(Error::unsupported(
+                "CELT decoder: transient / short-block packets are not supported",
+            ));
+        }
+        if header.post_filter.is_some() {
+            return Err(Error::unsupported(
+                "CELT decoder: comb post-filter flag is not supported",
+            ));
+        }
+
+        let m = 1i32 << lm;
+        let n = (m * EBAND_5MS[NB_EBANDS] as i32) as usize;
+
+        unquant_coarse_energy(
+            &mut rc,
+            &mut self.old_band_e,
+            start_band,
+            end_band,
+            header.intra,
+            1,
+            lm as usize,
+        );
+
+        let budget = rc.storage() * 8;
+        let mut tell_u = rc.tell() as u32;
+        let mut logp = 4u32;
+        let tf_select_rsv = if lm > 0 && tell_u + logp < budget {
+            1
+        } else {
+            0
+        };
+        let budget_after = budget - tf_select_rsv;
+        let mut tf_res = vec![0i32; NB_EBANDS];
+        let mut tf_changed = 0i32;
+        let mut curr = 0i32;
+        for i in start_band..end_band {
+            if tell_u + logp <= budget_after {
+                let bit = rc.decode_bit_logp(logp);
+                curr ^= bit as i32;
+                tell_u = rc.tell() as u32;
+                tf_changed |= curr;
+            }
+            tf_res[i] = curr;
+            logp = 5;
+        }
+        let mut tf_select = 0i32;
+        if tf_select_rsv != 0
+            && TF_SELECT_TABLE[lm as usize][4 * header.transient as usize + tf_changed as usize]
+                != TF_SELECT_TABLE[lm as usize]
+                    [4 * header.transient as usize + 2 + tf_changed as usize]
+        {
+            tf_select = if rc.decode_bit_logp(1) { 1 } else { 0 };
+        }
+        for i in start_band..end_band {
+            let idx = (4 * header.transient as i32 + 2 * tf_select + tf_res[i]) as usize;
+            tf_res[i] = TF_SELECT_TABLE[lm as usize][idx] as i32;
+        }
+
+        let mut tell = rc.tell();
+        let total_bits_check = (rc.storage() * 8) as i32;
+        let spread = if tell + 4 <= total_bits_check {
+            rc.decode_icdf(&SPREAD_ICDF, 5) as i32
+        } else {
+            SPREAD_NORMAL
+        };
+
+        let cap = init_caps(lm as usize, 1);
+        let mut offsets = [0i32; NB_EBANDS];
+        let mut dynalloc_logp = 6i32;
+        let mut total_bits_frac = ((bytes.len() as i32) * 8) << BITRES;
+        tell = rc.tell_frac() as i32;
+        for i in start_band..end_band {
+            let width = (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m;
+            let quanta = (width << BITRES).min((6 << BITRES).max(width));
+            let mut dynalloc_loop_logp = dynalloc_logp;
+            let mut boost = 0i32;
+            while tell + (dynalloc_loop_logp << BITRES) < total_bits_frac && boost < cap[i] {
+                let flag = rc.decode_bit_logp(dynalloc_loop_logp as u32);
+                tell = rc.tell_frac() as i32;
+                if !flag {
+                    break;
+                }
+                boost += quanta;
+                total_bits_frac -= quanta;
+                dynalloc_loop_logp = 1;
+            }
+            offsets[i] = boost;
+            if boost > 0 {
+                dynalloc_logp = 2.max(dynalloc_logp - 1);
+            }
+        }
+
+        let alloc_trim = if tell + (6 << BITRES) <= total_bits_frac {
+            rc.decode_icdf(&TRIM_ICDF, 7) as i32
+        } else {
+            5
+        };
+
+        let bits = (((bytes.len() as i32) * 8) << BITRES) - rc.tell_frac() as i32 - 1;
+
+        let mut pulses = vec![0i32; NB_EBANDS];
+        let mut fine_quant = vec![0i32; NB_EBANDS];
+        let mut fine_priority = vec![0i32; NB_EBANDS];
+        let mut intensity = 0i32;
+        let mut dual_stereo = 0i32;
+        let mut balance = 0i32;
+        let coded_bands = clt_compute_allocation(
+            start_band,
+            end_band,
+            &offsets,
+            &cap,
+            alloc_trim,
+            &mut intensity,
+            &mut dual_stereo,
+            bits,
+            &mut balance,
+            &mut pulses,
+            &mut fine_quant,
+            &mut fine_priority,
+            1,
+            lm,
+            &mut rc,
+        );
+
+        unquant_fine_energy(
+            &mut rc,
+            &mut self.old_band_e,
+            start_band,
+            end_band,
+            &fine_quant,
+            1,
+        );
+
+        let mut x_buf = vec![0f32; n];
+        let mut collapse_masks = vec![0u8; NB_EBANDS];
+        let total_pvq_bits = (bytes.len() as i32) * (8 << BITRES);
+        let band_e_snapshot = self.old_band_e.clone();
+        quant_all_bands(
+            start_band,
+            end_band,
+            &mut x_buf,
+            None,
+            &mut collapse_masks,
+            &band_e_snapshot,
+            &pulses,
+            false,
+            spread,
+            dual_stereo,
+            intensity,
+            &tf_res,
+            total_pvq_bits,
+            balance,
+            &mut rc,
+            lm,
+            coded_bands,
+            &mut self.rng,
+            false,
+        );
+
+        let bits_left = (bytes.len() as i32) * 8 - rc.tell();
+        unquant_energy_finalise(
+            &mut rc,
+            &mut self.old_band_e,
+            start_band,
+            end_band,
+            &fine_quant,
+            &fine_priority,
+            bits_left,
+            1,
+        );
+
+        let mut freq = vec![0f32; n];
+        denormalise_bands(
+            &x_buf,
+            &mut freq,
+            &self.old_band_e[..NB_EBANDS],
+            start_band,
+            end_band,
+            m as usize,
+            false,
+        );
+
+        let sub_n = n;
+        let mut raw_coded = vec![0f32; 2 * sub_n];
+        imdct_sub(&freq, &mut raw_coded, sub_n);
+        let mut raw = vec![0f32; 2 * FRAME_SAMPLES];
+        raw[..2 * sub_n].copy_from_slice(&raw_coded);
+
+        let mut out = vec![0f32; FRAME_SAMPLES];
+        for i in 0..OVERLAP {
+            let w = WINDOW_120[i];
+            out[i] = self.prev_tail[0][i] + w * raw[i];
+        }
+        for i in OVERLAP..FRAME_SAMPLES {
+            out[i] = raw[i];
+        }
+        for i in 0..OVERLAP {
+            let w = WINDOW_120[OVERLAP - 1 - i];
+            self.prev_tail[0][i] = w * raw[FRAME_SAMPLES + i];
+        }
+        Ok(out)
+    }
+
+    fn decode_frame_stereo(&mut self, bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut rc = RangeDecoder::new(bytes);
+        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+        let end_band = NB_EBANDS;
+        let start_band = 0usize;
+        let channels = 2usize;
+
+        let header = match decode_header(&mut rc) {
+            Some(h) => h,
+            None => {
+                for v in &mut self.prev_tail[0] {
+                    *v = 0.0;
+                }
+                for v in &mut self.prev_tail[1] {
+                    *v = 0.0;
+                }
+                return Ok((vec![0.0; FRAME_SAMPLES], vec![0.0; FRAME_SAMPLES]));
+            }
+        };
+        if header.transient {
+            return Err(Error::unsupported(
+                "CELT decoder: transient / short-block packets are not supported",
+            ));
+        }
+        if header.post_filter.is_some() {
+            return Err(Error::unsupported(
+                "CELT decoder: comb post-filter flag is not supported",
+            ));
+        }
+
+        let m = 1i32 << lm;
+        let n = (m * EBAND_5MS[NB_EBANDS] as i32) as usize;
+
+        unquant_coarse_energy(
+            &mut rc,
+            &mut self.old_band_e,
+            start_band,
+            end_band,
+            header.intra,
+            channels,
+            lm as usize,
+        );
+
+        let budget = rc.storage() * 8;
+        let mut tell_u = rc.tell() as u32;
+        let mut logp = 4u32;
+        let tf_select_rsv = if lm > 0 && tell_u + logp < budget {
+            1
+        } else {
+            0
+        };
+        let budget_after = budget - tf_select_rsv;
+        let mut tf_res = vec![0i32; NB_EBANDS];
+        let mut tf_changed = 0i32;
+        let mut curr = 0i32;
+        for i in start_band..end_band {
+            if tell_u + logp <= budget_after {
+                let bit = rc.decode_bit_logp(logp);
+                curr ^= bit as i32;
+                tell_u = rc.tell() as u32;
+                tf_changed |= curr;
+            }
+            tf_res[i] = curr;
+            logp = 5;
+        }
+        let mut tf_select = 0i32;
+        if tf_select_rsv != 0
+            && TF_SELECT_TABLE[lm as usize][4 * header.transient as usize + tf_changed as usize]
+                != TF_SELECT_TABLE[lm as usize]
+                    [4 * header.transient as usize + 2 + tf_changed as usize]
+        {
+            tf_select = if rc.decode_bit_logp(1) { 1 } else { 0 };
+        }
+        for i in start_band..end_band {
+            let idx = (4 * header.transient as i32 + 2 * tf_select + tf_res[i]) as usize;
+            tf_res[i] = TF_SELECT_TABLE[lm as usize][idx] as i32;
+        }
+
+        let mut tell = rc.tell();
+        let total_bits_check = (rc.storage() * 8) as i32;
+        let spread = if tell + 4 <= total_bits_check {
+            rc.decode_icdf(&SPREAD_ICDF, 5) as i32
+        } else {
+            SPREAD_NORMAL
+        };
+
+        let cap = init_caps(lm as usize, channels);
+        let mut offsets = [0i32; NB_EBANDS];
+        let mut dynalloc_logp = 6i32;
+        let mut total_bits_frac = ((bytes.len() as i32) * 8) << BITRES;
+        tell = rc.tell_frac() as i32;
+        for i in start_band..end_band {
+            let width = (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m * channels as i32;
+            let quanta = (width << BITRES).min((6 << BITRES).max(width));
+            let mut dynalloc_loop_logp = dynalloc_logp;
+            let mut boost = 0i32;
+            while tell + (dynalloc_loop_logp << BITRES) < total_bits_frac && boost < cap[i] {
+                let flag = rc.decode_bit_logp(dynalloc_loop_logp as u32);
+                tell = rc.tell_frac() as i32;
+                if !flag {
+                    break;
+                }
+                boost += quanta;
+                total_bits_frac -= quanta;
+                dynalloc_loop_logp = 1;
+            }
+            offsets[i] = boost;
+            if boost > 0 {
+                dynalloc_logp = 2.max(dynalloc_logp - 1);
+            }
+        }
+
+        let alloc_trim = if tell + (6 << BITRES) <= total_bits_frac {
+            rc.decode_icdf(&TRIM_ICDF, 7) as i32
+        } else {
+            5
+        };
+
+        let bits = (((bytes.len() as i32) * 8) << BITRES) - rc.tell_frac() as i32 - 1;
+
+        let mut pulses = vec![0i32; NB_EBANDS];
+        let mut fine_quant = vec![0i32; NB_EBANDS];
+        let mut fine_priority = vec![0i32; NB_EBANDS];
+        let mut intensity = 0i32;
+        let mut dual_stereo = 0i32;
+        let mut balance = 0i32;
+        let coded_bands = clt_compute_allocation(
+            start_band,
+            end_band,
+            &offsets,
+            &cap,
+            alloc_trim,
+            &mut intensity,
+            &mut dual_stereo,
+            bits,
+            &mut balance,
+            &mut pulses,
+            &mut fine_quant,
+            &mut fine_priority,
+            channels as i32,
+            lm,
+            &mut rc,
+        );
+
+        unquant_fine_energy(
+            &mut rc,
+            &mut self.old_band_e,
+            start_band,
+            end_band,
+            &fine_quant,
+            channels,
+        );
+
+        let mut x_buf = vec![0f32; n];
+        let mut y_buf = vec![0f32; n];
+        let mut collapse_masks = vec![0u8; NB_EBANDS * channels];
+        let total_pvq_bits = (bytes.len() as i32) * (8 << BITRES);
+        let band_e_snapshot = self.old_band_e.clone();
+        quant_all_bands(
+            start_band,
+            end_band,
+            &mut x_buf,
+            Some(&mut y_buf),
+            &mut collapse_masks,
+            &band_e_snapshot,
+            &pulses,
+            false,
+            spread,
+            dual_stereo,
+            intensity,
+            &tf_res,
+            total_pvq_bits,
+            balance,
+            &mut rc,
+            lm,
+            coded_bands,
+            &mut self.rng,
+            false,
+        );
+
+        let bits_left = (bytes.len() as i32) * 8 - rc.tell();
+        unquant_energy_finalise(
+            &mut rc,
+            &mut self.old_band_e,
+            start_band,
+            end_band,
+            &fine_quant,
+            &fine_priority,
+            bits_left,
+            channels,
+        );
+
+        let mut freq_l = vec![0f32; n];
+        let mut freq_r = vec![0f32; n];
+        denormalise_bands(
+            &x_buf,
+            &mut freq_l,
+            &self.old_band_e[..NB_EBANDS],
+            start_band,
+            end_band,
+            m as usize,
+            false,
+        );
+        denormalise_bands(
+            &y_buf,
+            &mut freq_r,
+            &self.old_band_e[NB_EBANDS..2 * NB_EBANDS],
+            start_band,
+            end_band,
+            m as usize,
+            false,
+        );
+
+        let sub_n = n;
+        let mut out_l = vec![0f32; FRAME_SAMPLES];
+        let mut out_r = vec![0f32; FRAME_SAMPLES];
+        for (ch, freq, out) in [(0usize, &freq_l, &mut out_l), (1usize, &freq_r, &mut out_r)] {
+            let mut raw_coded = vec![0f32; 2 * sub_n];
+            imdct_sub(freq, &mut raw_coded, sub_n);
+            let mut raw = vec![0f32; 2 * FRAME_SAMPLES];
+            raw[..2 * sub_n].copy_from_slice(&raw_coded);
+            for i in 0..OVERLAP {
+                let w = WINDOW_120[i];
+                out[i] = self.prev_tail[ch][i] + w * raw[i];
+            }
+            for i in OVERLAP..FRAME_SAMPLES {
+                out[i] = raw[i];
+            }
+            for i in 0..OVERLAP {
+                let w = WINDOW_120[OVERLAP - 1 - i];
+                self.prev_tail[ch][i] = w * raw[FRAME_SAMPLES + i];
+            }
+        }
+        Ok((out_l, out_r))
+    }
+
+    fn build_audio_frame(&mut self, pcm: Vec<f32>, samples: usize) -> Frame {
+        let mut bytes = Vec::with_capacity(pcm.len() * 4);
+        for s in pcm {
+            bytes.extend_from_slice(&s.to_le_bytes());
+        }
+        let pts = self.pts_counter;
+        self.pts_counter += samples as i64;
+        Frame::Audio(AudioFrame {
+            format: SampleFormat::F32,
+            channels: self.channels as u16,
+            sample_rate: SAMPLE_RATE,
+            samples: samples as u32,
+            pts: Some(pts),
+            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
+            data: vec![bytes],
+        })
+    }
+}
+
+impl Decoder for CeltDecoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.params.codec_id
+    }
+
+    fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        if self.channels == 1 {
+            let pcm = self.decode_frame_mono(&packet.data)?;
+            let frame = self.build_audio_frame(pcm, FRAME_SAMPLES);
+            self.output.push_back(frame);
+        } else {
+            let (l, r) = self.decode_frame_stereo(&packet.data)?;
+            let mut interleaved = Vec::with_capacity(FRAME_SAMPLES * 2);
+            for i in 0..FRAME_SAMPLES {
+                interleaved.push(l[i]);
+                interleaved.push(r[i]);
+            }
+            let frame = self.build_audio_frame(interleaved, FRAME_SAMPLES);
+            self.output.push_back(frame);
+        }
+        Ok(())
+    }
+
+    fn receive_frame(&mut self) -> Result<Frame> {
+        self.output.pop_front().ok_or(Error::NeedMore)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.output.clear();
+        self.old_band_e.iter_mut().for_each(|v| *v = 0.0);
+        for ch in &mut self.prev_tail {
+            ch.iter_mut().for_each(|v| *v = 0.0);
+        }
+        self.rng = 0;
+        Ok(())
+    }
+}
+
+pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(CeltDecoder::new(params)?))
+}
