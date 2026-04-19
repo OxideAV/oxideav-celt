@@ -1,0 +1,130 @@
+oxideav-celt third-party notices
+================================
+
+This crate is distributed under the MIT license (see LICENSE) and
+additionally incorporates material from the following upstream
+projects. Their copyright notices and license terms are reproduced
+below and apply to the incorporated material.
+
+
+libopus (Xiph.Org Foundation)
+-----------------------------
+
+CELT is the MDCT path of the Opus codec (RFC 6716). Bit-exact
+conformance with the Opus reference implementation (libopus) requires
+reproducing specific numeric tables and a range-coder implementation
+that matches the reference byte-for-byte. The following files in this
+crate derive from libopus:
+
+  * `src/tables.rs` — All static CELT tables are pure constants
+    transcribed verbatim from the libopus reference, specifically:
+      - `celt/static_modes_float.h` (eband5ms, window/MDCT twiddles,
+        mean-energy offsets, pred/beta coefficients)
+      - `celt/quant_bands.c`        (e_prob_model, small_energy_icdf)
+      - `celt/rate.c` / `celt/rate.h` (cache_index50, cache_bits50,
+        cache_caps50, LOG2_FRAC_TABLE, logN400, MAX_FINE_BITS,
+        FINE_OFFSET, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE,
+        ALLOC_STEPS, bit_allocation table)
+      - `celt/mode.c` / `celt/modes.c` (band_allocation,
+        compute_ebands layout)
+      - `celt/celt.c` (tf_select_table, comb-filter tap sets,
+        COMBFILTER_MINPERIOD)
+      - `celt/mathops.h` (bitexact_cos, bitexact_log2tan)
+    These tables are required for bit-exact conformance with the Opus
+    RFC 6716 reference decoder.
+
+  * `src/range_decoder.rs` — Port of the libopus range decoder
+    (`celt/entdec.c` together with `celt/entcode.c` primitives and
+    the `celt/mfrngcod.h` constants). The range coder state and
+    renormalisation logic mirror libopus `ec_ctx` / `ec_dec` 1:1 so
+    that the decoded bitstream position matches the reference
+    byte-for-byte.
+
+  * `src/range_encoder.rs` — Port of libopus `celt/entenc.c`
+    (`ec_enc_carry_out`, `ec_enc_done`, etc.), mirroring the decoder
+    port so encoder output is bit-exact with libopus.
+
+  * `src/laplace.rs` — Port of libopus `celt/laplace.c`
+    (`ec_laplace_decode` / `ec_laplace_encode`).
+
+  * `src/cwrs.rs` — PVQ codebook decoder/encoder derived from
+    libopus `celt/cwrs.c` (RFC 6716 §4.3.4.5).
+
+  * `src/bands.rs` — CELT band decoding derived from libopus
+    `celt/bands.c` (RFC 6716 §4.3.4 – §4.3.6), including the
+    `celt_lcg_rand` linear-congruential generator.
+
+  * `src/rate.rs` — CELT bit allocator derived from libopus
+    `celt/rate.c` (`bits2pulses`, `pulses2bits`,
+    `clt_compute_allocation`).
+
+  * `src/quant_bands.rs` — Coarse/fine energy (de)quantisation
+    derived from libopus `celt/quant_bands.c`.
+
+  * `src/mdct.rs` — CELT inverse MDCT, referencing libopus
+    `celt/mdct.c::clt_mdct_backward` (N/4 twiddle layout and overlap
+    indexing). Uses an independently implemented Bluestein FFT rather
+    than libopus' radix-2/3/5 kf_bfly.
+
+  * `src/post_filter.rs` — CELT pitch / comb post-filter
+    (RFC 6716 §4.3.8), referencing libopus `celt/celt.c`
+    `comb_filter`.
+
+  * `src/encoder.rs`, `src/decoder.rs`, `src/lib.rs` — Top-level
+    CELT driver code that coordinates the modules above; internal
+    control flow mirrors libopus `celt_encode_with_ec` /
+    `celt_decode_with_ec`.
+
+Algorithms in the Rust ports listed above are independent Rust
+re-implementations cross-checked against libopus for bit-exact
+conformance. They do not reproduce libopus source code verbatim
+(unlike the numeric tables in `src/tables.rs`) but are listed here
+for completeness because the structure of the code closely follows
+the reference.
+
+libopus is distributed under the following terms:
+
+    Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic,
+                        Jean-Marc Valin, Timothy B. Terriberry,
+                        CSIRO, Gregory Maxwell, Mark Borgerding,
+                        Erik de Castro Lopo, Mozilla, Amazon
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+    - Redistributions of source code must retain the above copyright
+    notice, this list of conditions and the following disclaimer.
+
+    - Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+
+    - Neither the name of Internet Society, IETF or IETF Trust, nor the
+    names of specific contributors, may be used to endorse or promote
+    products derived from this software without specific prior written
+    permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER
+    OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+    LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+    NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+    Opus is subject to the royalty-free patent licenses which are
+    specified at:
+
+    Xiph.Org Foundation:
+    https://datatracker.ietf.org/ipr/1524/
+
+    Microsoft Corporation:
+    https://datatracker.ietf.org/ipr/1914/
+
+    Broadcom Corporation:
+    https://datatracker.ietf.org/ipr/1526/
