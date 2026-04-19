@@ -18,9 +18,9 @@ use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::bands::{denormalise_bands, quant_all_bands};
+use crate::bands::{anti_collapse, denormalise_bands, quant_all_bands};
 use crate::header::decode_header;
-use crate::mdct::imdct_sub;
+use crate::mdct::{imdct_sub, imdct_sub_short};
 use crate::quant_bands::{unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy};
 use crate::range_decoder::{RangeDecoder, BITRES};
 use crate::rate::clt_compute_allocation;
@@ -32,6 +32,29 @@ use crate::tables::{
 pub const FRAME_SAMPLES: usize = 960;
 pub const SAMPLE_RATE: u32 = 48_000;
 const OVERLAP: usize = 120;
+/// Internal MDCT coefficient count: `EBAND_5MS[21] * M = 100 * 8 = 800` at
+/// LM=3. The long-block IMDCT produces 2N=1600 time-domain samples; the
+/// remaining 2*(FRAME_SAMPLES - CODED_N) = 320 at the far edges of the true
+/// 1920-sample long window are zero-filled and contribute nothing, matching
+/// the encoder's convention.
+const CODED_N: usize = 800;
+/// Short sub-block coefficient count at LM=3, i.e. `CODED_N / M = 800 / 8`.
+/// Each short sub-block runs a 200→100 MDCT with a 100-sample cosine window.
+const SHORT_N: usize = 100;
+
+/// Build the CELT-style short-block cosine window of length `len`. Uses the
+/// Vorbis/CELT sin-sin window formula — the same shape as `WINDOW_120` but
+/// scaled to an arbitrary length. Perfect reconstruction of adjacent 50%-
+/// overlapped sub-blocks relies on `w[i]^2 + w[len-1-i]^2 = 1`.
+fn build_short_window(len: usize) -> Vec<f32> {
+    let mut w = vec![0f32; len];
+    for i in 0..len {
+        let base = std::f32::consts::FRAC_PI_2 * (i as f32 + 0.5) / len as f32;
+        let s = base.sin();
+        w[i] = (std::f32::consts::FRAC_PI_2 * s * s).sin();
+    }
+    w
+}
 
 #[rustfmt::skip]
 const WINDOW_120: [f32; 120] = [
@@ -65,10 +88,15 @@ pub struct CeltDecoder {
     params: CodecParameters,
     channels: usize,
     old_band_e: Vec<f32>,
+    /// Two frames of prior quantised log-energy, used by §4.3.5 anti-collapse.
+    /// Layout: `channels * NB_EBANDS` per slot.
+    prev1_log_e: Vec<f32>,
+    prev2_log_e: Vec<f32>,
     prev_tail: Vec<Vec<f32>>,
     rng: u32,
     output: VecDeque<Frame>,
     pts_counter: i64,
+    short_window: Vec<f32>,
 }
 
 impl CeltDecoder {
@@ -90,10 +118,13 @@ impl CeltDecoder {
             params: out_params,
             channels,
             old_band_e: vec![0.0; NB_EBANDS * 2],
+            prev1_log_e: vec![0.0; NB_EBANDS * 2],
+            prev2_log_e: vec![0.0; NB_EBANDS * 2],
             prev_tail: vec![vec![0.0; OVERLAP]; channels],
             rng: 0,
             output: VecDeque::new(),
             pts_counter: 0,
+            short_window: build_short_window(SHORT_N),
         })
     }
 
@@ -111,19 +142,18 @@ impl CeltDecoder {
                 for v in &mut self.prev_tail[0] {
                     *v = 0.0;
                 }
+                // Roll prev1/prev2 log-energy for §4.3.5 anti-collapse state.
+                self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
+                self.prev1_log_e.copy_from_slice(&self.old_band_e);
                 return Ok(vec![0.0; FRAME_SAMPLES]);
             }
         };
-        if header.transient {
-            return Err(Error::unsupported(
-                "CELT decoder: transient / short-block packets are not supported",
-            ));
-        }
         if header.post_filter.is_some() {
             return Err(Error::unsupported(
                 "CELT decoder: comb post-filter flag is not supported",
             ));
         }
+        let transient = header.transient;
 
         let m = 1i32 << lm;
         let n = (m * EBAND_5MS[NB_EBANDS] as i32) as usize;
@@ -213,7 +243,15 @@ impl CeltDecoder {
             5
         };
 
-        let bits = (((bytes.len() as i32) * 8) << BITRES) - rc.tell_frac() as i32 - 1;
+        // Allocation residual (fractional bits). Anti-collapse reservation
+        // (RFC §4.3.5) takes 1 bit when transient && LM>=2 && bits big enough.
+        let mut bits = (((bytes.len() as i32) * 8) << BITRES) - rc.tell_frac() as i32 - 1;
+        let anti_collapse_rsv = if transient && lm >= 2 && bits >= ((lm + 2) << BITRES) {
+            1 << BITRES
+        } else {
+            0i32
+        };
+        bits -= anti_collapse_rsv;
 
         let mut pulses = vec![0i32; NB_EBANDS];
         let mut fine_quant = vec![0i32; NB_EBANDS];
@@ -250,7 +288,7 @@ impl CeltDecoder {
 
         let mut x_buf = vec![0f32; n];
         let mut collapse_masks = vec![0u8; NB_EBANDS];
-        let total_pvq_bits = (bytes.len() as i32) * (8 << BITRES);
+        let total_pvq_bits = ((bytes.len() as i32) * 8 << BITRES) - anti_collapse_rsv;
         let band_e_snapshot = self.old_band_e.clone();
         quant_all_bands(
             start_band,
@@ -260,7 +298,7 @@ impl CeltDecoder {
             &mut collapse_masks,
             &band_e_snapshot,
             &pulses,
-            false,
+            transient,
             spread,
             dual_stereo,
             intensity,
@@ -274,6 +312,13 @@ impl CeltDecoder {
             false,
         );
 
+        // Anti-collapse ON flag (1 range-coded bit when reserved). §4.3.5.
+        let anti_collapse_on = if anti_collapse_rsv > 0 {
+            rc.decode_bits(1) != 0
+        } else {
+            false
+        };
+
         let bits_left = (bytes.len() as i32) * 8 - rc.tell();
         unquant_energy_finalise(
             &mut rc,
@@ -285,6 +330,23 @@ impl CeltDecoder {
             bits_left,
             1,
         );
+
+        if anti_collapse_on {
+            anti_collapse(
+                &mut x_buf,
+                &collapse_masks,
+                lm,
+                1,
+                n,
+                start_band,
+                end_band,
+                &self.old_band_e,
+                &self.prev1_log_e,
+                &self.prev2_log_e,
+                &pulses,
+                self.rng,
+            );
+        }
 
         let mut freq = vec![0f32; n];
         denormalise_bands(
@@ -298,10 +360,26 @@ impl CeltDecoder {
         );
 
         let sub_n = n;
-        let mut raw_coded = vec![0f32; 2 * sub_n];
-        imdct_sub(&freq, &mut raw_coded, sub_n);
         let mut raw = vec![0f32; 2 * FRAME_SAMPLES];
-        raw[..2 * sub_n].copy_from_slice(&raw_coded);
+        if transient {
+            // 8 × short_n-point IMDCTs interleaved into `freq`, then OLA
+            // across the M sub-blocks into `raw`. The caller-side front
+            // and back overlap with the previous/next frame uses the long
+            // window (120 taps).
+            let mut raw_coded = vec![0f32; 2 * sub_n];
+            imdct_sub_short(
+                &freq,
+                &mut raw_coded,
+                sub_n,
+                lm as usize,
+                &self.short_window,
+            );
+            raw[..2 * sub_n].copy_from_slice(&raw_coded);
+        } else {
+            let mut raw_coded = vec![0f32; 2 * sub_n];
+            imdct_sub(&freq, &mut raw_coded, sub_n);
+            raw[..2 * sub_n].copy_from_slice(&raw_coded);
+        }
 
         let mut out = vec![0f32; FRAME_SAMPLES];
         for i in 0..OVERLAP {
@@ -315,6 +393,9 @@ impl CeltDecoder {
             let w = WINDOW_120[OVERLAP - 1 - i];
             self.prev_tail[0][i] = w * raw[FRAME_SAMPLES + i];
         }
+        // Roll anti-collapse log-energy state.
+        self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
+        self.prev1_log_e.copy_from_slice(&self.old_band_e);
         Ok(out)
     }
 
@@ -334,19 +415,17 @@ impl CeltDecoder {
                 for v in &mut self.prev_tail[1] {
                     *v = 0.0;
                 }
+                self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
+                self.prev1_log_e.copy_from_slice(&self.old_band_e);
                 return Ok((vec![0.0; FRAME_SAMPLES], vec![0.0; FRAME_SAMPLES]));
             }
         };
-        if header.transient {
-            return Err(Error::unsupported(
-                "CELT decoder: transient / short-block packets are not supported",
-            ));
-        }
         if header.post_filter.is_some() {
             return Err(Error::unsupported(
                 "CELT decoder: comb post-filter flag is not supported",
             ));
         }
+        let transient = header.transient;
 
         let m = 1i32 << lm;
         let n = (m * EBAND_5MS[NB_EBANDS] as i32) as usize;
@@ -436,7 +515,13 @@ impl CeltDecoder {
             5
         };
 
-        let bits = (((bytes.len() as i32) * 8) << BITRES) - rc.tell_frac() as i32 - 1;
+        let mut bits = (((bytes.len() as i32) * 8) << BITRES) - rc.tell_frac() as i32 - 1;
+        let anti_collapse_rsv = if transient && lm >= 2 && bits >= ((lm + 2) << BITRES) {
+            1 << BITRES
+        } else {
+            0i32
+        };
+        bits -= anti_collapse_rsv;
 
         let mut pulses = vec![0i32; NB_EBANDS];
         let mut fine_quant = vec![0i32; NB_EBANDS];
@@ -474,7 +559,7 @@ impl CeltDecoder {
         let mut x_buf = vec![0f32; n];
         let mut y_buf = vec![0f32; n];
         let mut collapse_masks = vec![0u8; NB_EBANDS * channels];
-        let total_pvq_bits = (bytes.len() as i32) * (8 << BITRES);
+        let total_pvq_bits = ((bytes.len() as i32) * 8 << BITRES) - anti_collapse_rsv;
         let band_e_snapshot = self.old_band_e.clone();
         quant_all_bands(
             start_band,
@@ -484,7 +569,7 @@ impl CeltDecoder {
             &mut collapse_masks,
             &band_e_snapshot,
             &pulses,
-            false,
+            transient,
             spread,
             dual_stereo,
             intensity,
@@ -498,6 +583,12 @@ impl CeltDecoder {
             false,
         );
 
+        let anti_collapse_on = if anti_collapse_rsv > 0 {
+            rc.decode_bits(1) != 0
+        } else {
+            false
+        };
+
         let bits_left = (bytes.len() as i32) * 8 - rc.tell();
         unquant_energy_finalise(
             &mut rc,
@@ -509,6 +600,30 @@ impl CeltDecoder {
             bits_left,
             channels,
         );
+
+        if anti_collapse_on {
+            // `x_buf | y_buf` concatenated as a 2*N buffer for anti-collapse's
+            // per-channel indexing (chan * size + ...).
+            let mut xy = vec![0f32; 2 * n];
+            xy[..n].copy_from_slice(&x_buf);
+            xy[n..].copy_from_slice(&y_buf);
+            anti_collapse(
+                &mut xy,
+                &collapse_masks,
+                lm,
+                channels,
+                n,
+                start_band,
+                end_band,
+                &self.old_band_e,
+                &self.prev1_log_e,
+                &self.prev2_log_e,
+                &pulses,
+                self.rng,
+            );
+            x_buf.copy_from_slice(&xy[..n]);
+            y_buf.copy_from_slice(&xy[n..]);
+        }
 
         let mut freq_l = vec![0f32; n];
         let mut freq_r = vec![0f32; n];
@@ -535,10 +650,16 @@ impl CeltDecoder {
         let mut out_l = vec![0f32; FRAME_SAMPLES];
         let mut out_r = vec![0f32; FRAME_SAMPLES];
         for (ch, freq, out) in [(0usize, &freq_l, &mut out_l), (1usize, &freq_r, &mut out_r)] {
-            let mut raw_coded = vec![0f32; 2 * sub_n];
-            imdct_sub(freq, &mut raw_coded, sub_n);
             let mut raw = vec![0f32; 2 * FRAME_SAMPLES];
-            raw[..2 * sub_n].copy_from_slice(&raw_coded);
+            if transient {
+                let mut raw_coded = vec![0f32; 2 * sub_n];
+                imdct_sub_short(freq, &mut raw_coded, sub_n, lm as usize, &self.short_window);
+                raw[..2 * sub_n].copy_from_slice(&raw_coded);
+            } else {
+                let mut raw_coded = vec![0f32; 2 * sub_n];
+                imdct_sub(freq, &mut raw_coded, sub_n);
+                raw[..2 * sub_n].copy_from_slice(&raw_coded);
+            }
             for i in 0..OVERLAP {
                 let w = WINDOW_120[i];
                 out[i] = self.prev_tail[ch][i] + w * raw[i];
@@ -551,6 +672,8 @@ impl CeltDecoder {
                 self.prev_tail[ch][i] = w * raw[FRAME_SAMPLES + i];
             }
         }
+        self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
+        self.prev1_log_e.copy_from_slice(&self.old_band_e);
         Ok((out_l, out_r))
     }
 
@@ -607,6 +730,8 @@ impl Decoder for CeltDecoder {
     fn reset(&mut self) -> Result<()> {
         self.output.clear();
         self.old_band_e.iter_mut().for_each(|v| *v = 0.0);
+        self.prev1_log_e.iter_mut().for_each(|v| *v = 0.0);
+        self.prev2_log_e.iter_mut().for_each(|v| *v = 0.0);
         for ch in &mut self.prev_tail {
             ch.iter_mut().for_each(|v| *v = 0.0);
         }

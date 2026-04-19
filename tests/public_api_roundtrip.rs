@@ -5,6 +5,8 @@
 //! `tests/roundtrip.rs`. This is the surface that external callers and the
 //! aggregator registry talk to.
 
+#![allow(clippy::while_let_loop)]
+
 use oxideav_celt::decoder::CeltDecoder;
 use oxideav_celt::encoder::{CeltEncoder, FRAME_SAMPLES, SAMPLE_RATE};
 use oxideav_codec::{Decoder, Encoder};

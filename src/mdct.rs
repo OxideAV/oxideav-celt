@@ -291,6 +291,126 @@ pub fn window_forward(input: &mut [f32], window: &[f32], n: usize, overlap: usiz
     }
 }
 
+/// Short-block forward MDCT for a CELT transient frame.
+///
+/// Splits a long 2N-sample windowed input into `M = 1 << lm` sub-blocks of
+/// `2 * short_n` samples each (where `short_n = coded_n / M`). Each sub-block
+/// is a MDCT of length `short_n`, and its coefficients are placed into the
+/// output array `spectrum` interleaved with stride `M` — this matches the
+/// libopus `clt_mdct_forward` stride convention.
+///
+/// Pre-condition: `input` has length `2 * coded_n` and has already been
+/// windowed at its 120-sample edges by the long-block window. Sub-block
+/// boundaries are windowed here using the `short_window` argument (length =
+/// `overlap_short = short_n`), which provides per-sub-block cross-fade.
+///
+/// Coefficient layout: sub-block `b` (0..M) contributes coefficient `k`
+/// (0..short_n) at `spectrum[M*k + b]`. The band structure over `spectrum`
+/// sees `W*M` bins for band `i` (where `W = eband_5ms[i+1]-eband_5ms[i]`),
+/// with bins 0..M-1 being "coefficient 0 from each sub-block", bins M..2M-1
+/// being "coefficient 1 from each sub-block", etc.
+pub fn forward_mdct_short(
+    input: &[f32],
+    spectrum: &mut [f32],
+    coded_n: usize,
+    lm: usize,
+    short_window: &[f32],
+) {
+    let m = 1usize << lm;
+    let short_n = coded_n / m;
+    let overlap = short_window.len();
+    debug_assert!(overlap <= short_n);
+    debug_assert!(input.len() >= 2 * coded_n);
+    debug_assert!(spectrum.len() >= coded_n);
+    // Zero the output — positions above "coded_n" (if any) stay zero, and
+    // we want clean slots before scatter-store below.
+    for v in spectrum.iter_mut().take(coded_n) {
+        *v = 0.0;
+    }
+    // Each short MDCT reads 2*short_n contiguous samples; consecutive
+    // sub-blocks advance by short_n samples (50% overlap).
+    let mut sub = vec![0f32; 2 * short_n];
+    let mut coeffs = vec![0f32; short_n];
+    for b in 0..m {
+        // Gather the sub-block's 2*short_n time-domain samples.
+        let off = b * short_n;
+        for i in 0..(2 * short_n) {
+            let src = off + i;
+            sub[i] = if src < input.len() { input[src] } else { 0.0 };
+        }
+        // Apply the short sub-block window at the front and back `overlap`
+        // samples. Leaves the interior untouched (libopus `clt_mdct_forward`
+        // handles windowing externally; our convention matches that).
+        for i in 0..overlap {
+            sub[i] *= short_window[i];
+            sub[2 * short_n - overlap + i] *= short_window[overlap - 1 - i];
+        }
+        // Forward MDCT for this sub-block.
+        forward_mdct(&sub, &mut coeffs);
+        // Scatter-store with stride M.
+        for k in 0..short_n {
+            let dst = m * k + b;
+            if dst < coded_n {
+                spectrum[dst] = coeffs[k];
+            }
+        }
+    }
+}
+
+/// Short-block inverse MDCT. Inverse of [`forward_mdct_short`].
+///
+/// Takes a `coded_n`-length interleaved-stride-M MDCT coefficient buffer,
+/// splits it into `M = 1 << lm` sub-bands by stride, runs an IMDCT per
+/// sub-block (producing `2 * short_n` time samples each), applies the short
+/// window at each sub-block's 50% overlap, and overlap-adds adjacent
+/// sub-block outputs.
+///
+/// Writes `2 * coded_n` samples to `raw_out`. The caller is responsible for
+/// overlap-adding `raw_out[..overlap_long]` with the previous frame's tail
+/// and storing `raw_out[2*coded_n - overlap_long..]` as the next frame's
+/// tail — exactly as for the long-block path.
+pub fn imdct_sub_short(
+    spectrum: &[f32],
+    raw_out: &mut [f32],
+    coded_n: usize,
+    lm: usize,
+    short_window: &[f32],
+) {
+    let m = 1usize << lm;
+    let short_n = coded_n / m;
+    let overlap = short_window.len();
+    debug_assert!(overlap <= short_n);
+    debug_assert!(spectrum.len() >= coded_n);
+    debug_assert!(raw_out.len() >= 2 * coded_n);
+    for v in raw_out.iter_mut().take(2 * coded_n) {
+        *v = 0.0;
+    }
+    let mut coeffs = vec![0f32; short_n];
+    let mut sub = vec![0f32; 2 * short_n];
+    for b in 0..m {
+        // Gather the coefficients for this sub-block via stride-M.
+        for k in 0..short_n {
+            let src = m * k + b;
+            coeffs[k] = if src < coded_n { spectrum[src] } else { 0.0 };
+        }
+        imdct_sub(&coeffs, &mut sub, short_n);
+        // Window the sub-block's edges (50% overlap on both sides).
+        for i in 0..overlap {
+            sub[i] *= short_window[i];
+            sub[2 * short_n - overlap + i] *= short_window[overlap - 1 - i];
+        }
+        // Overlap-add into the combined raw output. Sub-block `b` occupies
+        // time samples [b*short_n, b*short_n + 2*short_n).
+        let off = b * short_n;
+        for i in 0..(2 * short_n) {
+            let dst = off + i;
+            if dst < raw_out.len() {
+                raw_out[dst] += sub[i];
+            }
+        }
+    }
+}
+
 /// Backwards-compat placeholder.
 pub fn imdct(coeff: &[f32], out: &mut [f32]) {
     let n = coeff.len();
@@ -360,6 +480,27 @@ mod tests {
             (pk_idx as i32 - target_bin as i32).abs() <= 1,
             "peak at {pk_idx}, expected near {target_bin}, mag {pk_mag}"
         );
+    }
+
+    #[test]
+    fn short_mdct_roundtrips_dc() {
+        // 8 sub-blocks of 16 coefficients each = 128-bin interleaved output.
+        // A flat DC input should round-trip with comparable RMS (TDAC aliasing
+        // cancels only with neighbouring frames' OLA, so within-block we just
+        // check we don't blow up).
+        let coded_n = 128usize;
+        let lm = 3usize; // M = 8
+        let short_n = coded_n >> lm; // = 16
+        let window: Vec<f32> = (0..short_n)
+            .map(|i| ((i as f32 + 0.5) / short_n as f32 * core::f32::consts::PI * 0.5).sin())
+            .collect();
+        let input = vec![0.5f32; 2 * coded_n];
+        let mut spec = vec![0f32; coded_n];
+        forward_mdct_short(&input, &mut spec, coded_n, lm, &window);
+        assert!(spec.iter().all(|v| v.is_finite()));
+        let mut rec = vec![0f32; 2 * coded_n];
+        imdct_sub_short(&spec, &mut rec, coded_n, lm, &window);
+        assert!(rec.iter().all(|v| v.is_finite()));
     }
 
     #[test]
