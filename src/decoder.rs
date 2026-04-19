@@ -170,7 +170,7 @@ impl CeltDecoder {
 
         let budget = rc.storage() * 8;
         let mut tell_u = rc.tell() as u32;
-        let mut logp = 4u32;
+        let mut logp: u32 = if transient { 2 } else { 4 };
         let tf_select_rsv = if lm > 0 && tell_u + logp < budget {
             1
         } else {
@@ -188,18 +188,17 @@ impl CeltDecoder {
                 tf_changed |= curr;
             }
             tf_res[i] = curr;
-            logp = 5;
+            logp = if transient { 4 } else { 5 };
         }
         let mut tf_select = 0i32;
         if tf_select_rsv != 0
-            && TF_SELECT_TABLE[lm as usize][4 * header.transient as usize + tf_changed as usize]
-                != TF_SELECT_TABLE[lm as usize]
-                    [4 * header.transient as usize + 2 + tf_changed as usize]
+            && TF_SELECT_TABLE[lm as usize][4 * transient as usize + tf_changed as usize]
+                != TF_SELECT_TABLE[lm as usize][4 * transient as usize + 2 + tf_changed as usize]
         {
             tf_select = if rc.decode_bit_logp(1) { 1 } else { 0 };
         }
         for i in start_band..end_band {
-            let idx = (4 * header.transient as i32 + 2 * tf_select + tf_res[i]) as usize;
+            let idx = (4 * transient as i32 + 2 * tf_select + tf_res[i]) as usize;
             tf_res[i] = TF_SELECT_TABLE[lm as usize][idx] as i32;
         }
 
@@ -442,7 +441,7 @@ impl CeltDecoder {
 
         let budget = rc.storage() * 8;
         let mut tell_u = rc.tell() as u32;
-        let mut logp = 4u32;
+        let mut logp: u32 = if transient { 2 } else { 4 };
         let tf_select_rsv = if lm > 0 && tell_u + logp < budget {
             1
         } else {
@@ -460,18 +459,17 @@ impl CeltDecoder {
                 tf_changed |= curr;
             }
             tf_res[i] = curr;
-            logp = 5;
+            logp = if transient { 4 } else { 5 };
         }
         let mut tf_select = 0i32;
         if tf_select_rsv != 0
-            && TF_SELECT_TABLE[lm as usize][4 * header.transient as usize + tf_changed as usize]
-                != TF_SELECT_TABLE[lm as usize]
-                    [4 * header.transient as usize + 2 + tf_changed as usize]
+            && TF_SELECT_TABLE[lm as usize][4 * transient as usize + tf_changed as usize]
+                != TF_SELECT_TABLE[lm as usize][4 * transient as usize + 2 + tf_changed as usize]
         {
             tf_select = if rc.decode_bit_logp(1) { 1 } else { 0 };
         }
         for i in start_band..end_band {
-            let idx = (4 * header.transient as i32 + 2 * tf_select + tf_res[i]) as usize;
+            let idx = (4 * transient as i32 + 2 * tf_select + tf_res[i]) as usize;
             tf_res[i] = TF_SELECT_TABLE[lm as usize][idx] as i32;
         }
 

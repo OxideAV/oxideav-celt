@@ -80,11 +80,68 @@ const OVERLAP: usize = 120;
 /// next frame's overlap supplies).
 pub const CODED_N: usize = 800;
 
+/// Short-block sub-MDCT coefficient count at LM=3: `CODED_N / M = 800 / 8`.
+const SHORT_N: usize = 100;
+
 /// Fixed target bitrate for mono: 160 bytes/frame ≈ 64 kbit/s at 20 ms.
 const DEFAULT_BYTES_PER_FRAME: usize = 160;
 /// Stereo needs more headroom for per-channel coarse/fine energy overhead
 /// and the L/R shape bits. 256 bytes/frame ≈ 102 kbit/s at 20 ms.
 const DEFAULT_BYTES_PER_FRAME_STEREO: usize = 256;
+
+/// Build the CELT-style short-block cosine window of length `len`. Kept in
+/// sync with `decoder.rs::build_short_window` — the two must produce
+/// bit-identical tables.
+fn build_short_window(len: usize) -> Vec<f32> {
+    let mut w = vec![0f32; len];
+    for i in 0..len {
+        let base = std::f32::consts::FRAC_PI_2 * (i as f32 + 0.5) / len as f32;
+        let s = base.sin();
+        w[i] = (std::f32::consts::FRAC_PI_2 * s * s).sin();
+    }
+    w
+}
+
+/// Transient detection (libopus `transient_analysis` surrogate).
+///
+/// Splits `pcm` into 8 sub-blocks of 120 samples each and compares the peak
+/// sub-block RMS to the overall RMS. If the ratio exceeds `threshold` the
+/// frame is flagged transient. This captures percussive bursts (a loud block
+/// against a quiet one) without the full libopus masking curve.
+fn detect_transient(pcm: &[f32]) -> bool {
+    const SUB_BLOCKS: usize = 8;
+    let block_len = pcm.len() / SUB_BLOCKS;
+    if block_len == 0 {
+        return false;
+    }
+    let mut energies = [0f32; SUB_BLOCKS];
+    for b in 0..SUB_BLOCKS {
+        let lo = b * block_len;
+        let hi = lo + block_len;
+        let mut e = 0f32;
+        for &s in &pcm[lo..hi] {
+            e += s * s;
+        }
+        energies[b] = e / block_len as f32;
+    }
+    // Peak / floor ratio in dB.
+    let mut peak = energies[0];
+    let mut floor = energies[0];
+    for &e in &energies[1..] {
+        peak = peak.max(e);
+        floor = floor.min(e);
+    }
+    // Guard against silent floors (avoid div-by-zero → spurious detection).
+    // If the loudest block is near silence, the frame isn't transient.
+    if peak < 1e-8 {
+        return false;
+    }
+    let floor = floor.max(1e-10);
+    let ratio_db = 10.0 * (peak / floor).log10();
+    // ~18 dB threshold — tuned so steady tones + slow envelopes stay long,
+    // while sharp onsets (silence → full-scale burst) flip to short.
+    ratio_db > 18.0
+}
 
 /// CELT window — same as libopus and the decoder's post-filter (120 taps).
 #[rustfmt::skip]
@@ -132,6 +189,9 @@ pub struct CeltEncoder {
     output: VecDeque<Packet>,
     bytes_per_frame: usize,
     pts_counter: i64,
+    /// Cached 100-tap cosine window for short sub-block MDCTs. Mirrors
+    /// `CeltDecoder::short_window`.
+    short_window: Vec<f32>,
 }
 
 impl CeltEncoder {
@@ -164,6 +224,7 @@ impl CeltEncoder {
             output: VecDeque::new(),
             bytes_per_frame,
             pts_counter: 0,
+            short_window: build_short_window(SHORT_N),
         })
     }
 
@@ -222,6 +283,12 @@ impl CeltEncoder {
         // but keeps the encoder's MDCT coefficient count consistent with
         // what the decoder's `pcm_per_ch = vec![0f32; 800]` expects.
         let n = CODED_N;
+
+        // Transient detection: run BEFORE assembling the windowed MDCT
+        // input, on the raw PCM so the sub-block energies reflect actual
+        // input dynamics (not post-window envelope decay).
+        let transient = detect_transient(pcm);
+
         let mut raw = vec![0f32; 2 * n];
         raw[..OVERLAP].copy_from_slice(&self.prev_tail[0]);
         // Place up to CODED_N PCM samples starting after the overlap.
@@ -232,12 +299,21 @@ impl CeltEncoder {
         // the coded n=800 tail, so the OLA at the decoder side lines up.
         self.prev_tail[0].copy_from_slice(&pcm[FRAME_SAMPLES - OVERLAP..]);
 
-        // Apply CELT window (only the overlap regions).
+        // Apply CELT window (only the overlap regions) — this windowing
+        // acts at the frame boundary for both long and short blocks, so the
+        // decoder's matching OLA with the adjacent frame's tail lines up.
         crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
 
-        // 2) Forward MDCT → N coefficients.
+        // 2) Forward MDCT → N coefficients. Short blocks run 8 × 200→100
+        // sub-MDCTs with their own 100-tap sin² window at sub-block
+        // boundaries, interleaved into `coeffs` at stride M (matching the
+        // decoder's `imdct_sub_short` coefficient layout).
         let mut coeffs = vec![0f32; n];
-        forward_mdct(&raw, &mut coeffs);
+        if transient {
+            crate::mdct::forward_mdct_short(&raw, &mut coeffs, n, lm as usize, &self.short_window);
+        } else {
+            forward_mdct(&raw, &mut coeffs);
+        }
 
         // 3) Compute per-band log-energy and normalised shape.
         let m = 1i32 << lm;
@@ -265,8 +341,8 @@ impl CeltEncoder {
         let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, no post-filter, transient=0, intra=<flag>.
-        encode_header(&mut rc, false, None, false, intra);
+        // Header: silence=0, no post-filter, transient=<flag>, intra=<flag>.
+        encode_header(&mut rc, false, None, transient, intra);
 
         // Coarse energy.
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];
@@ -284,31 +360,59 @@ impl CeltEncoder {
             lm as usize,
         );
 
-        // tf_decode: emit all zeros (no transient).
-        // Decoder loop: `if tell + logp <= budget_after: decode_bit_logp(logp)`,
-        // initial logp=4 (non-transient), then 5 for each. To keep tf_res=0
-        // we emit `false` for every one of these bits.
+        // tf_decode: pick per-band raw deltas + tf_select so that the
+        // decoder's `TF_SELECT_TABLE` lookup produces `tf_res[i] = 0` for
+        // every band. With `tf_res = 0` across the board, `quant_all_bands`
+        // runs its "no tf_change" path — stride-M partitioning (short blocks)
+        // for transient frames, stride-1 for long. No haar recombine.
+        //
+        // TF_SELECT_TABLE row layout: `[raw=0|tsel=0, raw=1|tsel=0, raw=0|
+        // tsel=1, raw=1|tsel=1]` for non-transient, and the same at offset 4
+        // for transient. LM=3:
+        //   non-transient = [0, -1, 0, -1]  (all entries equal 0 when raw=0)
+        //   transient     = [3,  0, 1, -1]  (entry with value 0 is raw=1, tsel=0)
+        // so:
+        //   * non-transient → raw=0, tsel=0, no emission needed for tsel.
+        //   * transient → raw=1 for every band, tsel=0 → table emits 0.
+        // The range-coder output depends on the cumulative XOR; raw[i]=1
+        // for all i maps to delta bit = 1 at band 0, 0 for bands 1..20.
+        let (tf_delta_first, tf_delta_rest) = if transient {
+            (true, false)
+        } else {
+            (false, false)
+        };
+        let tf_sel: bool = false; // always 0 — we want post-lookup = 0.
+
         let budget = (bytes * 8) as u32;
         let mut tell_u = rc.tell() as u32;
-        let mut logp = 4u32;
+        let mut logp: u32 = if transient { 2 } else { 4 };
         let tf_select_rsv = if lm > 0 && tell_u + logp + 1 <= budget {
             1
         } else {
             0
         };
         let budget_after = budget - tf_select_rsv;
-        let mut tf_res = vec![0i32; NB_EBANDS];
-        for _i in 0..NB_EBANDS {
+        for band_i in 0..NB_EBANDS {
             if tell_u + logp <= budget_after {
-                rc.encode_bit_logp(false, logp);
+                let bit = if band_i == 0 {
+                    tf_delta_first
+                } else {
+                    tf_delta_rest
+                };
+                rc.encode_bit_logp(bit, logp);
                 tell_u = rc.tell() as u32;
             }
-            logp = 5;
+            logp = if transient { 4 } else { 5 };
         }
-        // tf_select is only emitted if the two table rows differ.
-        // TF_SELECT_TABLE[3][0] vs [3][2]: both are 0 (all non-transient entries
-        // start with 0). So we don't write tf_select.
-        let _ = tf_select_rsv;
+        if tf_select_rsv != 0
+            && crate::tables::TF_SELECT_TABLE[lm as usize][4 * transient as usize]
+                != crate::tables::TF_SELECT_TABLE[lm as usize][4 * transient as usize + 2]
+        {
+            rc.encode_bit_logp(tf_sel, 1);
+        }
+        // After the decoder's cumulative-XOR + lookup, `tf_res[i] = 0`
+        // everywhere — verified by construction above.
+        let tf_res = vec![0i32; NB_EBANDS];
 
         // Spread decision.
         let mut tell = rc.tell();
@@ -346,7 +450,14 @@ impl CeltEncoder {
         }
 
         let mut bits = ((bytes as i32) * 8 << BITRES) - rc.tell_frac() as i32 - 1;
-        // No anti-collapse rsv since transient=false.
+        // Anti-collapse reservation (§4.3.5): 1 bit for transient LM>=2 frames
+        // when budget is large enough. Mirrors the decoder gate exactly.
+        let anti_collapse_rsv = if transient && lm >= 2 && bits >= ((lm + 2) << BITRES) {
+            1 << BITRES
+        } else {
+            0i32
+        };
+        bits -= anti_collapse_rsv;
 
         let mut pulses = vec![0i32; NB_EBANDS];
         let mut fine_quant = vec![0i32; NB_EBANDS];
@@ -385,7 +496,7 @@ impl CeltEncoder {
         );
 
         // PVQ shape.
-        let total_pvq_bits = (bytes as i32) * (8 << BITRES);
+        let total_pvq_bits = (bytes as i32) * (8 << BITRES) - anti_collapse_rsv;
         let mut collapse_masks = vec![0u8; NB_EBANDS];
         let mut rng_local = 0u32;
         encode_all_bands_mono(
@@ -394,6 +505,7 @@ impl CeltEncoder {
             &mut shape,
             &mut collapse_masks,
             &pulses,
+            transient,
             SPREAD_NORMAL,
             &tf_res,
             total_pvq_bits,
@@ -403,6 +515,12 @@ impl CeltEncoder {
             coded_bands,
             &mut rng_local,
         );
+
+        // Anti-collapse ON flag. We choose `off`, so emit the reserved 1 bit
+        // as zero — decoder skips the anti-collapse pass.
+        if anti_collapse_rsv > 0 {
+            rc.encode_bits(0, 1);
+        }
 
         // Final fine-energy pass (bits left from total - rc.tell()).
         let bits_left = (bytes as i32) * 8 - rc.tell();
@@ -473,6 +591,9 @@ impl CeltEncoder {
             r_pcm[i] = pcm[2 * i + 1];
         }
 
+        // Transient detection: flag if either channel has percussive onset.
+        let transient = detect_transient(&l_pcm) || detect_transient(&r_pcm);
+
         let n = CODED_N;
         let m = 1i32 << lm;
 
@@ -489,7 +610,11 @@ impl CeltEncoder {
             raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm_ch[..take]);
             self.prev_tail[ch].copy_from_slice(&pcm_ch[FRAME_SAMPLES - OVERLAP..]);
             crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
-            forward_mdct(&raw, coeffs);
+            if transient {
+                crate::mdct::forward_mdct_short(&raw, coeffs, n, lm as usize, &self.short_window);
+            } else {
+                forward_mdct(&raw, coeffs);
+            }
         }
 
         // Per-band log-energy and normalised shape, per channel.
@@ -521,8 +646,8 @@ impl CeltEncoder {
         let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, no post-filter, transient=0, intra=<flag>.
-        encode_header(&mut rc, false, None, false, intra);
+        // Header: silence=0, no post-filter, transient=<flag>, intra=<flag>.
+        encode_header(&mut rc, false, None, transient, intra);
 
         // Coarse energy (both channels).
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];
@@ -540,25 +665,42 @@ impl CeltEncoder {
             lm as usize,
         );
 
-        // tf_decode: emit all zeros.
+        // tf_decode: pick deltas + tf_select so the decoder's TF_SELECT_TABLE
+        // lookup yields tf_res = 0 everywhere. See mono path for the logic.
+        let (tf_delta_first, tf_delta_rest) = if transient {
+            (true, false)
+        } else {
+            (false, false)
+        };
+        let tf_sel: bool = false;
         let budget = (bytes * 8) as u32;
         let mut tell_u = rc.tell() as u32;
-        let mut logp = 4u32;
+        let mut logp: u32 = if transient { 2 } else { 4 };
         let tf_select_rsv = if lm > 0 && tell_u + logp + 1 <= budget {
             1
         } else {
             0
         };
         let budget_after = budget - tf_select_rsv;
-        let tf_res = vec![0i32; NB_EBANDS];
-        for _i in 0..NB_EBANDS {
+        for band_i in 0..NB_EBANDS {
             if tell_u + logp <= budget_after {
-                rc.encode_bit_logp(false, logp);
+                let bit = if band_i == 0 {
+                    tf_delta_first
+                } else {
+                    tf_delta_rest
+                };
+                rc.encode_bit_logp(bit, logp);
                 tell_u = rc.tell() as u32;
             }
-            logp = 5;
+            logp = if transient { 4 } else { 5 };
         }
-        let _ = tf_select_rsv;
+        if tf_select_rsv != 0
+            && crate::tables::TF_SELECT_TABLE[lm as usize][4 * transient as usize]
+                != crate::tables::TF_SELECT_TABLE[lm as usize][4 * transient as usize + 2]
+        {
+            rc.encode_bit_logp(tf_sel, 1);
+        }
+        let tf_res = vec![0i32; NB_EBANDS];
 
         // Spread decision.
         let mut tell = rc.tell();
@@ -588,7 +730,13 @@ impl CeltEncoder {
             rc.encode_icdf(5, &TRIM_ICDF, 7);
         }
 
-        let bits = ((bytes as i32) * 8 << BITRES) - rc.tell_frac() as i32 - 1;
+        let mut bits = ((bytes as i32) * 8 << BITRES) - rc.tell_frac() as i32 - 1;
+        let anti_collapse_rsv = if transient && lm >= 2 && bits >= ((lm + 2) << BITRES) {
+            1 << BITRES
+        } else {
+            0i32
+        };
+        bits -= anti_collapse_rsv;
 
         let mut pulses = vec![0i32; NB_EBANDS];
         let mut fine_quant = vec![0i32; NB_EBANDS];
@@ -628,7 +776,7 @@ impl CeltEncoder {
         );
 
         // PVQ shape — dual-stereo.
-        let total_pvq_bits = (bytes as i32) * (8 << BITRES);
+        let total_pvq_bits = (bytes as i32) * (8 << BITRES) - anti_collapse_rsv;
         let mut collapse_masks = vec![0u8; NB_EBANDS * channels];
         let mut rng_local = 0u32;
         encode_all_bands_stereo_dual(
@@ -638,6 +786,7 @@ impl CeltEncoder {
             &mut shape_r,
             &mut collapse_masks,
             &pulses,
+            transient,
             SPREAD_NORMAL,
             &tf_res,
             total_pvq_bits,
@@ -647,6 +796,11 @@ impl CeltEncoder {
             coded_bands,
             &mut rng_local,
         );
+
+        // Anti-collapse-on flag = 0 (we don't run anti-collapse on encode).
+        if anti_collapse_rsv > 0 {
+            rc.encode_bits(0, 1);
+        }
 
         // Final fine-energy pass.
         let bits_left = (bytes as i32) * 8 - rc.tell();

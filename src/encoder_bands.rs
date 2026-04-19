@@ -8,11 +8,12 @@
 //! resynthesis the decoder does, so the encoder's running norm buffer
 //! exactly matches what the decoder will see.
 //!
-//! Scope: the full decoder path is ported in this module. Transients and
-//! short blocks are NOT implemented on the encode side (we always encode
-//! with `big_b == 1`, matching `short_blocks = false`). The encoder caller
-//! in `encoder.rs` enforces this.
+//! Scope: the full decoder path is ported in this module. Both long
+//! (`short_blocks = false`, `big_b = 1`) and short (`short_blocks = true`,
+//! `big_b = M = 1 << lm`) block coding are supported — the caller selects
+//! which via the `short_blocks` argument.
 
+use crate::bands::{deinterleave_hadamard, interleave_hadamard};
 use crate::cwrs::{encode_pulses, pvq_search};
 use crate::range_encoder::{RangeEncoder, BITRES};
 use crate::tables::{
@@ -583,7 +584,7 @@ fn quant_partition_enc(
     }
 }
 
-/// Top-level band encoder for stereo, dual-stereo, long-block CELT frames.
+/// Top-level band encoder for stereo, dual-stereo CELT frames.
 ///
 /// Mirrors the decoder's `quant_all_bands` path when `dual_stereo != 0 &&
 /// intensity == coded_bands` — i.e. "L and R coded as two independent
@@ -596,6 +597,10 @@ fn quant_partition_enc(
 /// `y` holds R-channel normalised coefficients. Both are resynthesised in
 /// place to match what the decoder will reconstruct (so the encoder's norm
 /// fold buffer stays in sync with the decoder's).
+///
+/// When `short_blocks` is true the encoder uses `big_b = M = 1 << lm` so
+/// each band is split into M time-stripes (matching `quant_all_bands`'s
+/// transient path).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_all_bands_stereo_dual(
     start: usize,
@@ -604,6 +609,7 @@ pub fn encode_all_bands_stereo_dual(
     y: &mut [f32],
     collapse_masks: &mut [u8],
     pulses: &[i32],
+    short_blocks: bool,
     spread: i32,
     tf_res: &[i32],
     total_bits: i32,
@@ -614,7 +620,7 @@ pub fn encode_all_bands_stereo_dual(
     seed: &mut u32,
 ) {
     let m = 1i32 << lm;
-    let big_b: i32 = 1; // long block
+    let big_b: i32 = if short_blocks { m } else { 1 };
     let nb_ebands = NB_EBANDS;
     let c_count = 2usize;
     let norm_offset = (m * EBAND_5MS[start] as i32) as usize;
@@ -691,6 +697,22 @@ pub fn encode_all_bands_stereo_dual(
         } else {
             // Dual-stereo: encode L and R independently with half the
             // band budget each. Mirrors decoder `quant_all_bands` dual path.
+            // For short blocks, apply the same Hadamard (de)interleave
+            // wrapper as the decoder's `quant_band` uses when `big_b > 1`.
+            let long_blocks = big_b == 1;
+            let n_b = n / big_b;
+            let mut lb_x_t = lowband_x.clone();
+            let mut lb_y_t = lowband_y.clone();
+            if big_b > 1 {
+                deinterleave_hadamard(&mut x_buf, n_b, big_b, long_blocks);
+                deinterleave_hadamard(&mut y_buf, n_b, big_b, long_blocks);
+                if let Some(lb) = lb_x_t.as_mut() {
+                    deinterleave_hadamard(lb, n_b, big_b, long_blocks);
+                }
+                if let Some(lb) = lb_y_t.as_mut() {
+                    deinterleave_hadamard(lb, n_b, big_b, long_blocks);
+                }
+            }
             let cm_x = quant_partition_enc(
                 &mut ctx,
                 rc,
@@ -698,7 +720,7 @@ pub fn encode_all_bands_stereo_dual(
                 n,
                 b / 2,
                 big_b,
-                lowband_x.as_deref(),
+                lb_x_t.as_deref(),
                 lm,
                 Q15_ONE,
                 mask_for(big_b) as i32,
@@ -710,11 +732,15 @@ pub fn encode_all_bands_stereo_dual(
                 n,
                 b / 2,
                 big_b,
-                lowband_y.as_deref(),
+                lb_y_t.as_deref(),
                 lm,
                 Q15_ONE,
                 mask_for(big_b) as i32,
             );
+            if big_b > 1 {
+                interleave_hadamard(&mut x_buf, n_b, big_b, long_blocks);
+                interleave_hadamard(&mut y_buf, n_b, big_b, long_blocks);
+            }
             cm = cm_x | cm_y;
         }
         x[band_off..band_off + band_len].copy_from_slice(&x_buf);
@@ -733,7 +759,14 @@ pub fn encode_all_bands_stereo_dual(
     }
 }
 
-/// Top-level band encoder for mono, long-block CELT frames.
+/// Top-level band encoder for mono CELT frames (long or short blocks).
+///
+/// `short_blocks = true` selects `big_b = M = 1 << lm`, giving each band M
+/// time-stripes (decoder's transient path in `quant_all_bands`). The
+/// encoder wraps `quant_partition_enc` with `deinterleave_hadamard` on the
+/// input and `interleave_hadamard` on the output, mirroring the decoder's
+/// `quant_band` — tf_change is assumed zero so the haar / time_divide
+/// stacks drop out.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_all_bands_mono(
     start: usize,
@@ -741,6 +774,7 @@ pub fn encode_all_bands_mono(
     x: &mut [f32],
     collapse_masks: &mut [u8],
     pulses: &[i32],
+    short_blocks: bool,
     spread: i32,
     tf_res: &[i32],
     total_bits: i32,
@@ -751,7 +785,7 @@ pub fn encode_all_bands_mono(
     seed: &mut u32,
 ) {
     let m = 1i32 << lm;
-    let big_b: i32 = 1; // long block
+    let big_b: i32 = if short_blocks { m } else { 1 };
     let nb_ebands = NB_EBANDS;
     let norm_offset = (m * EBAND_5MS[start] as i32) as usize;
     let norm_len = (m as usize * EBAND_5MS[nb_ebands - 1] as usize - norm_offset).max(1);
@@ -813,10 +847,18 @@ pub fn encode_all_bands_mono(
         if n == 1 {
             cm = quant_band_n1_enc(&mut ctx, rc, &mut x_buf);
         } else {
-            // Mirror `quant_band` (no tf_change recombine / time-divide for
-            // the simple encoder — we always pass tf_res = 0). The full
-            // `haar1` stack triggers when `tf_change != 0`; since we emit
-            // `tf_res = 0`, none of it runs.
+            // Mirror `quant_band`. tf_change assumed zero so the recombine /
+            // time_divide stacks drop out; the remaining `big_b > 1` case
+            // swaps the input between stride-M and Hadamard layout.
+            let long_blocks = big_b == 1;
+            let n_b = n / big_b;
+            let mut lowband_transformed = lowband_x.clone();
+            if big_b > 1 {
+                deinterleave_hadamard(&mut x_buf, n_b, big_b, long_blocks);
+                if let Some(lb) = lowband_transformed.as_mut() {
+                    deinterleave_hadamard(lb, n_b, big_b, long_blocks);
+                }
+            }
             cm = quant_partition_enc(
                 &mut ctx,
                 rc,
@@ -824,14 +866,14 @@ pub fn encode_all_bands_mono(
                 n,
                 b,
                 big_b,
-                lowband_x.as_deref(),
+                lowband_transformed.as_deref(),
                 lm,
                 Q15_ONE,
                 mask_for(big_b) as i32,
             );
-            // Apply `lowband_out` scaling — matches decoder's post-partition
-            // normalisation factor `sqrt(n0 * 4_194_304)`.
-            let _ = (); // the encoder doesn't need lowband_out separately.
+            if big_b > 1 {
+                interleave_hadamard(&mut x_buf, n_b, big_b, long_blocks);
+            }
         }
         x[band_off..band_off + band_len].copy_from_slice(&x_buf);
         // Update the norm buffer with the (resynthesised) band shape.
