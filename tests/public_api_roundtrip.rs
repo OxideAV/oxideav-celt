@@ -155,11 +155,11 @@ fn sine_roundtrip_through_public_api() {
 /// `transient=true`, and the decoder must parse that packet without error
 /// and produce finite output with sane RMS.
 ///
-/// We ALSO compare pre-echo RMS against a long-only baseline (produced
-/// from the same bursty input but with the detector disabled via a slow
-/// envelope prefix that keeps sub-block energies smooth). The transient
-/// pipeline should show lower pre-echo on the SHARP burst since short
-/// blocks confine the attack's MDCT time-spread to 2.5 ms instead of 20.
+/// We also A/B the same burst signal against a long-only baseline
+/// (forced via `set_force_long_only(true)`) and report both pre-echo
+/// RMS values. Short blocks bound the MDCT's time-spread to 2.5 ms per
+/// sub-block instead of 20 ms per frame, so the short-block pre-echo
+/// should be meaningfully smaller than the long-only pre-echo.
 #[test]
 fn transient_roundtrip_has_bounded_preecho() {
     let params = build_params(1);
@@ -225,28 +225,69 @@ fn transient_roundtrip_has_bounded_preecho() {
     assert_eq!(decoded.len(), n_samples);
     assert!(decoded.iter().all(|v| v.is_finite()));
 
-    // Diagnostic: report pre-echo RMS so regressions are visible in the
-    // test log even though we don't assert a specific bound.
     let rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
     let pre_lo = burst_frame * FRAME_SAMPLES;
     let pre_hi = burst_start - 120;
     let post_lo = burst_start + burst_len;
     let post_hi = post_lo + FRAME_SAMPLES;
-    let pre_echo = rms(&decoded[pre_lo..pre_hi]);
-    let post_rms = rms(&decoded[post_lo..post_hi]);
-    let total_rms = rms(&decoded);
-    println!(
-        "transient round-trip: pre-echo RMS {:.4e}, post-burst RMS {:.4e}, total RMS {:.4e}",
-        pre_echo, post_rms, total_rms
+    let pre_echo_short = rms(&decoded[pre_lo..pre_hi]);
+    let post_rms_short = rms(&decoded[post_lo..post_hi]);
+
+    // Sanity: decoder output is in a plausible amplitude range.
+    assert!(
+        rms(&decoded) < 10.0 && rms(&decoded) > 1e-3,
+        "total RMS out of range"
+    );
+    assert!(
+        post_rms_short > 1e-3,
+        "post-burst region silent: {post_rms_short}"
     );
 
-    // Sanity: decoder output is in a plausible amplitude range and the
-    // transient frame's post-burst region has real signal.
-    assert!(
-        total_rms > 1e-3 && total_rms < 10.0,
-        "total RMS out of range: {total_rms}"
+    // A/B comparison: re-encode the SAME signal with the detector forced
+    // off, and measure the long-only pre-echo on the identical pre-burst
+    // region.
+    let mut enc_long = CeltEncoder::new(&params).unwrap();
+    enc_long.set_force_long_only(true);
+    let mut dec_long = CeltDecoder::new(&params).unwrap();
+    for chunk in signal.chunks(FRAME_SAMPLES) {
+        if chunk.len() == FRAME_SAMPLES {
+            enc_long.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc_long.flush().unwrap();
+    let mut decoded_long: Vec<f32> = Vec::new();
+    while let Ok(pkt) = enc_long.receive_packet() {
+        dec_long.send_packet(&pkt).unwrap();
+        while let Ok(frame) = dec_long.receive_frame() {
+            decoded_long.extend(decoded_f32(&frame));
+        }
+    }
+    assert_eq!(decoded_long.len(), n_samples);
+    let pre_echo_long = rms(&decoded_long[pre_lo..pre_hi]);
+
+    println!(
+        "transient A/B: pre-echo short-block {:.4e}, long-only {:.4e}",
+        pre_echo_short, pre_echo_long
     );
-    assert!(post_rms > 1e-3, "post-burst region silent: {post_rms}");
+    // On a real bit-exact MDCT+IMDCT pair, short-block coding should
+    // dramatically reduce pre-echo vs. long-only (by ~Nlong / Nshort = 8).
+    // Our current MDCT pair is correct up to CELT's 50% TDAC-alias
+    // convention but is not bit-exact (Bluestein-based rather than
+    // libopus' kiss_fft), so the two paths produce similar pre-echo
+    // numbers on this stimulus — the aliasing artefacts dominate the
+    // "real" time-spread.
+    //
+    // To keep this test a meaningful regression signal without blocking
+    // progress on the larger IMDCT-bit-exact gap (see README "Known
+    // Gaps"), we assert a LOOSE upper bound: the short-block pipeline
+    // must not be dramatically worse than the long-only baseline. A 3x
+    // regression would indicate the short-MDCT + Hadamard wrapper has
+    // regressed; 5% is just float noise.
+    assert!(
+        pre_echo_short <= 3.0 * pre_echo_long,
+        "short-block pre-echo ({pre_echo_short}) is >3x the long-only baseline ({pre_echo_long}); \
+         short-MDCT / Hadamard regression?"
+    );
 }
 
 #[test]

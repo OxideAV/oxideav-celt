@@ -192,6 +192,10 @@ pub struct CeltEncoder {
     /// Cached 100-tap cosine window for short sub-block MDCTs. Mirrors
     /// `CeltDecoder::short_window`.
     short_window: Vec<f32>,
+    /// When true, suppress `detect_transient` and always emit long blocks.
+    /// Intended for A/B testing short-block vs long-only reconstruction
+    /// quality; production users shouldn't set this.
+    force_long_only: bool,
 }
 
 impl CeltEncoder {
@@ -225,7 +229,16 @@ impl CeltEncoder {
             bytes_per_frame,
             pts_counter: 0,
             short_window: build_short_window(SHORT_N),
+            force_long_only: false,
         })
+    }
+
+    /// Force the encoder to emit long blocks for every frame, bypassing
+    /// transient detection. Used by the round-trip tests to A/B short-
+    /// block coding against a long-only baseline on the same input.
+    #[doc(hidden)]
+    pub fn set_force_long_only(&mut self, value: bool) {
+        self.force_long_only = value;
     }
 
     fn drain_frames(&mut self) -> Result<()> {
@@ -287,7 +300,7 @@ impl CeltEncoder {
         // Transient detection: run BEFORE assembling the windowed MDCT
         // input, on the raw PCM so the sub-block energies reflect actual
         // input dynamics (not post-window envelope decay).
-        let transient = detect_transient(pcm);
+        let transient = !self.force_long_only && detect_transient(pcm);
 
         let mut raw = vec![0f32; 2 * n];
         raw[..OVERLAP].copy_from_slice(&self.prev_tail[0]);
@@ -592,7 +605,8 @@ impl CeltEncoder {
         }
 
         // Transient detection: flag if either channel has percussive onset.
-        let transient = detect_transient(&l_pcm) || detect_transient(&r_pcm);
+        let transient =
+            !self.force_long_only && (detect_transient(&l_pcm) || detect_transient(&r_pcm));
 
         let n = CODED_N;
         let m = 1i32 << lm;
