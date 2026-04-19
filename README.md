@@ -61,9 +61,10 @@ The codec is also discoverable through the `CodecRegistry` via
 
 ## Supported configuration
 
-This crate targets the fullband long-block subset of CELT — the same
-profile an Opus encoder picks for "music" content at the default
-20 ms frame size.
+This crate targets the fullband subset of CELT — the same profile an
+Opus encoder picks for "music" content at the default 20 ms frame size.
+Both long-block (single 800-coefficient MDCT) and short-block (8 ×
+100-coefficient sub-MDCTs on transient frames) coding are supported.
 
 | Parameter      | Value                                 |
 |----------------|---------------------------------------|
@@ -76,9 +77,10 @@ profile an Opus encoder picks for "music" content at the default
 
 The decoder accepts any packet that matches the encoder's profile, plus
 the RFC 6716 §4.3 silence flag (packets with the silence bit set decode
-to zeros). Frames marked `transient` or carrying comb-post-filter
-parameters return `Error::Unsupported` — the decoder does not yet cover
-those paths.
+to zeros) and §4.3 transient frames (decoded via 8 × 200→100 short
+IMDCTs with stride-M coefficient interleaving and §4.3.5 anti-collapse
+reservation + flag parsing). Frames carrying comb-post-filter parameters
+still return `Error::Unsupported`.
 
 ### Intra vs inter frames
 
@@ -119,12 +121,18 @@ Following the RFC 6716 §4.3 section numbers:
   intensity / dual-stereo flags, coded-bands split, fine/PVQ partition.
 - §4.3.4 PVQ shape — tf_decode, spreading flag, theta-split band
   recursion, mono / dual-stereo, canonical codeword enumeration
-  (`cwrs`), `exp_rotation`, collapse-mask extraction.
-- §4.3.5 anti-collapse — pulse-injection on transient long blocks
-  (decoder path; the encoder currently does not emit transients).
+  (`cwrs`), `exp_rotation`, collapse-mask extraction. Long AND short
+  (`big_b = M`) block partitioning via Hadamard deinterleave / interleave.
+- §4.3.5 anti-collapse — reserved and parsed on transient frames;
+  the encoder currently emits `anti_collapse_on = 0`, the decoder
+  runs the pulse-injection fix-up when the flag is set.
 - §4.3.6 denormalisation.
-- §4.3.7 inverse MDCT — pre-twiddle, length-N/4 complex FFT via
-  Bluestein, post-twiddle, window + overlap-add.
+- §4.3.7 MDCT — forward (encoder) and inverse (decoder) via pre-twiddle
+  + length-N/4 Bluestein FFT + post-twiddle. Transient frames run
+  8 × 200→100 short sub-MDCTs with a 100-tap sin² window, interleaved
+  at stride M into the 800-bin coefficient buffer. Encoder ships a
+  simple energy-ratio `transient_analysis` surrogate that flips
+  `transient=true` on percussive onsets.
 - §4.3.8 comb pitch post-filter — decoder path (the encoder does not
   emit post-filter taps).
 
@@ -140,13 +148,11 @@ These paths are partially or fully missing. The codec runs end-to-end
 without them, but bit-for-bit parity with libopus requires closing
 every gap below.
 
-- **Transient detection / short blocks.** The encoder always emits
-  `transient=false` and a single 960-sample long block. Percussive
-  content will suffer pre-echo artefacts. The decoder rejects
-  `transient=true` packets with `Error::Unsupported`.
-- **Time-frequency change flags.** `tf_res[i] = 0` on the encode side;
-  the decoder reads the symbols faithfully but the encoder never
-  chooses a non-zero TF resolution.
+- **Time-frequency change flags.** `tf_res[i] = 0` on the encode side
+  after the TF_SELECT_TABLE lookup; the encoder picks raw TF deltas
+  and `tf_select` so the lookup yields zero per band. A libopus-style
+  per-band TF decision that actually chooses non-zero tf_res values
+  is not yet implemented.
 - **Dynalloc band-energy boosts.** No per-band boost is emitted.
 - **Intensity stereo.** Stereo uses dual-stereo only — L and R coded as
   two independent mono bands in one packet. Intensity stereo would buy

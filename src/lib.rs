@@ -16,7 +16,14 @@
 //!   - mono / dual-stereo / intensity-stereo,
 //!   - PVQ codeword decoder (`cwrs::decode_pulses`) — recurrence form,
 //!   - exp_rotation / collapse-mask extraction.
-//! * §4.3.5 anti-collapse processing (`bands::anti_collapse`).
+//! * §4.3.5 anti-collapse processing (`bands::anti_collapse`), reserved
+//!   and parsed on transient LM>=2 frames. Encoder emits
+//!   `anti_collapse_on = 0` (no enc-side pulse injection); decoder runs
+//!   the fix-up when the flag is set.
+//! * §4.3.4 short-block band partitioning — when `short_blocks = true`
+//!   the decoder uses `big_b = M` and each band splits into M time
+//!   stripes via Hadamard (de)interleave. Encoder matches this via
+//!   `encoder_bands::encode_all_bands_*(short_blocks=true)`.
 //! * §4.3.6 denormalisation (`bands::denormalise_bands`).
 //! * §4.3.7 inverse MDCT (`mdct::imdct_sub`) — pre-twiddle → length-N/4
 //!   complex FFT (Bluestein for non-power-of-two sizes) → post-twiddle
