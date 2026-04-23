@@ -19,7 +19,7 @@
 //! filter applies. If both frames share the same parameters the overlap
 //! region is skipped (pure new filter over the whole frame).
 
-use crate::tables::{COMB_FILTER_MINPERIOD, COMB_FILTER_TAPS};
+use crate::tables::{COMB_FILTER_MAXPERIOD, COMB_FILTER_MINPERIOD, COMB_FILTER_TAPS};
 
 const Q15ONE: f32 = 1.0;
 
@@ -53,8 +53,15 @@ pub fn comb_filter(
         // Zero gain on both sides: identity. Leave y untouched.
         return;
     }
-    let t0 = t0.max(COMB_FILTER_MINPERIOD as i32) as usize;
-    let t1 = t1.max(COMB_FILTER_MINPERIOD as i32) as usize;
+    // RFC 6716 §4.3.7.1: the encoded pitch period is `T = (16 << octave) +
+    // fine_pitch - 1`, bounded in [15, 1022]. `COMB_FILTER_MINPERIOD` (15) is
+    // the spec-mandated floor; the caller may pass 0 (no prior post-filter)
+    // or a clamped value, so we guard here too. `MAXPERIOD` (1024) bounds the
+    // history-buffer lookbacks at `y[n - T + 2]` / `y[n - T - 2]`.
+    let t0 = (t0.max(COMB_FILTER_MINPERIOD as i32) as usize)
+        .min(COMB_FILTER_MAXPERIOD as usize);
+    let t1 = (t1.max(COMB_FILTER_MINPERIOD as i32) as usize)
+        .min(COMB_FILTER_MAXPERIOD as usize);
     let g00 = g0 * COMB_FILTER_TAPS[tapset0][0];
     let g01 = g0 * COMB_FILTER_TAPS[tapset0][1];
     let g02 = g0 * COMB_FILTER_TAPS[tapset0][2];
@@ -62,7 +69,17 @@ pub fn comb_filter(
     let g11 = g1 * COMB_FILTER_TAPS[tapset1][1];
     let g12 = g1 * COMB_FILTER_TAPS[tapset1][2];
     let same = g0 == g1 && t0 == t1 && tapset0 == tapset1;
-    let overlap = if same { 0 } else { overlap };
+    // Clamp overlap to the frame length. RFC 6716 §4.3.7.1 specifies a
+    // crossfade "using the square of the MDCT window" between the old and
+    // new post-filter, but the window is fixed at 120 samples while the
+    // caller may hand us a sub-frame shorter than the window (libopus
+    // splits the frame into a 120-sample head and an `n - 120` tail when
+    // the CELT frame size exceeds the short MDCT block, and the tail can
+    // be smaller than the window for e.g. 5 ms CELT frames where N=200,
+    // giving a 80-sample tail). In that case we truncate the crossfade to
+    // the available data — there's nothing to blend past the end of the
+    // sub-frame.
+    let overlap = if same { 0 } else { overlap.min(n) };
 
     // Read y[i] with negative i falling back to x_history. When i >= 0 we
     // read from y itself; the caller runs the filter in-place, and since T
