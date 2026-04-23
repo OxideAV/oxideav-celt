@@ -67,8 +67,10 @@ crate derive from libopus:
     than libopus' radix-2/3/5 kf_bfly.
 
   * `src/post_filter.rs` — CELT pitch / comb post-filter
-    (RFC 6716 §4.3.8), referencing libopus `celt/celt.c`
-    `comb_filter`.
+    (RFC 6716 §4.3.7.1), referencing libopus `celt/celt.c`
+    `comb_filter`. Also implements the single-pole de-emphasis
+    filter (RFC §4.3.7.2, `alpha_p = 0.8500061035`), the inverse of
+    the libopus `celt_preemphasis` pre-filter used by the encoder.
 
   * `src/encoder.rs`, `src/decoder.rs`, `src/lib.rs` — Top-level
     CELT driver code that coordinates the modules above; internal

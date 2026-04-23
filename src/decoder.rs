@@ -21,12 +21,13 @@ use oxideav_core::{
 use crate::bands::{anti_collapse, denormalise_bands, quant_all_bands};
 use crate::header::decode_header;
 use crate::mdct::{imdct_sub, imdct_sub_short};
+use crate::post_filter::{comb_filter, decode_pitch_gain, decode_pitch_period, deemphasis};
 use crate::quant_bands::{unquant_coarse_energy, unquant_energy_finalise, unquant_fine_energy};
 use crate::range_decoder::{RangeDecoder, BITRES};
 use crate::rate::clt_compute_allocation;
 use crate::tables::{
-    init_caps, lm_for_frame_samples, EBAND_5MS, NB_EBANDS, SPREAD_ICDF, SPREAD_NORMAL,
-    TF_SELECT_TABLE, TRIM_ICDF,
+    init_caps, lm_for_frame_samples, COMB_FILTER_MAXPERIOD, EBAND_5MS, NB_EBANDS, SPREAD_ICDF,
+    SPREAD_NORMAL, TF_SELECT_TABLE, TRIM_ICDF,
 };
 
 pub const FRAME_SAMPLES: usize = 960;
@@ -97,6 +98,21 @@ pub struct CeltDecoder {
     output: VecDeque<Frame>,
     pts_counter: i64,
     short_window: Vec<f32>,
+    /// Comb post-filter state, per RFC 6716 §4.3.7.1. One slot per channel.
+    /// `pf_period_old[c] / pf_gain_old[c] / pf_tapset_old[c]` are the
+    /// parameters from the *previous* decoded frame — they drive the
+    /// crossfade at the start of the current frame. Fresh decoders start at
+    /// (0, 0.0, 0) = "no post-filter in history".
+    pf_period_old: Vec<i32>,
+    pf_gain_old: Vec<f32>,
+    pf_tapset_old: Vec<usize>,
+    /// Per-channel comb-filter history buffer: the last
+    /// `COMB_FILTER_MAXPERIOD + 2` post-filtered output samples from prior
+    /// frames, used by `comb_filter` for the `y[n - T]` lookbacks at the
+    /// start of the current frame.
+    pf_history: Vec<Vec<f32>>,
+    /// De-emphasis filter state (`y[n-1]`) per channel (RFC §4.3.7.2).
+    deemph_state: Vec<f32>,
 }
 
 impl CeltDecoder {
@@ -114,6 +130,7 @@ impl CeltDecoder {
         let mut out_params = params.clone();
         out_params.channels = Some(channels as u16);
         out_params.sample_rate = Some(SAMPLE_RATE);
+        let pf_hist_len = COMB_FILTER_MAXPERIOD as usize + 2;
         Ok(Self {
             params: out_params,
             channels,
@@ -125,6 +142,11 @@ impl CeltDecoder {
             output: VecDeque::new(),
             pts_counter: 0,
             short_window: build_short_window(SHORT_N),
+            pf_period_old: vec![0; channels],
+            pf_gain_old: vec![0.0; channels],
+            pf_tapset_old: vec![0; channels],
+            pf_history: vec![vec![0.0; pf_hist_len]; channels],
+            deemph_state: vec![0.0; channels],
         })
     }
 
@@ -145,15 +167,27 @@ impl CeltDecoder {
                 // Roll prev1/prev2 log-energy for §4.3.5 anti-collapse state.
                 self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
                 self.prev1_log_e.copy_from_slice(&self.old_band_e);
-                return Ok(vec![0.0; FRAME_SAMPLES]);
+                // Silence still ages the post-filter state: no new params,
+                // next frame treats this frame's silent tail as history. We
+                // keep `pf_*_old` (which govern this frame's crossfade) and
+                // slide the comb-filter history forward by one FRAME_SAMPLES
+                // of zeros. Deemphasis state decays to zero naturally.
+                let zeros = vec![0.0f32; FRAME_SAMPLES];
+                let mut out = zeros.clone();
+                self.run_postfilter_and_deemph(0, &mut out, 0, 0.0, 0);
+                return Ok(out);
             }
         };
-        if header.post_filter.is_some() {
-            return Err(Error::unsupported(
-                "CELT decoder: comb post-filter flag is not supported",
-            ));
-        }
         let transient = header.transient;
+        // Current-frame post-filter params (None → zero gain, no filter).
+        let (pf_t1, pf_g1, pf_tapset1) = match header.post_filter {
+            Some(pf) => (
+                decode_pitch_period(pf.octave, pf.period) as i32,
+                decode_pitch_gain(pf.gain),
+                pf.tapset as usize,
+            ),
+            None => (0i32, 0.0f32, 0usize),
+        };
 
         let m = 1i32 << lm;
         let n = (m * EBAND_5MS[NB_EBANDS] as i32) as usize;
@@ -392,6 +426,9 @@ impl CeltDecoder {
             let w = WINDOW_120[OVERLAP - 1 - i];
             self.prev_tail[0][i] = w * raw[FRAME_SAMPLES + i];
         }
+        // Post-filter (RFC §4.3.7.1) + de-emphasis (§4.3.7.2), and roll
+        // comb-filter history + deemph state.
+        self.run_postfilter_and_deemph(0, &mut out, pf_t1, pf_g1, pf_tapset1);
         // Roll anti-collapse log-energy state.
         self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
         self.prev1_log_e.copy_from_slice(&self.old_band_e);
@@ -416,15 +453,27 @@ impl CeltDecoder {
                 }
                 self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
                 self.prev1_log_e.copy_from_slice(&self.old_band_e);
-                return Ok((vec![0.0; FRAME_SAMPLES], vec![0.0; FRAME_SAMPLES]));
+                // Silence path: still age the post-filter history + deemph
+                // state by running an all-zero frame through them (see the
+                // mono silence path for rationale).
+                let mut zl = vec![0.0f32; FRAME_SAMPLES];
+                let mut zr = vec![0.0f32; FRAME_SAMPLES];
+                self.run_postfilter_and_deemph(0, &mut zl, 0, 0.0, 0);
+                self.run_postfilter_and_deemph(1, &mut zr, 0, 0.0, 0);
+                return Ok((zl, zr));
             }
         };
-        if header.post_filter.is_some() {
-            return Err(Error::unsupported(
-                "CELT decoder: comb post-filter flag is not supported",
-            ));
-        }
         let transient = header.transient;
+        // Current-frame post-filter params (mono in Opus — stereo CELT
+        // shares one set across L+R, per libopus).
+        let (pf_t1, pf_g1, pf_tapset1) = match header.post_filter {
+            Some(pf) => (
+                decode_pitch_period(pf.octave, pf.period) as i32,
+                decode_pitch_gain(pf.gain),
+                pf.tapset as usize,
+            ),
+            None => (0i32, 0.0f32, 0usize),
+        };
 
         let m = 1i32 << lm;
         let n = (m * EBAND_5MS[NB_EBANDS] as i32) as usize;
@@ -670,9 +719,77 @@ impl CeltDecoder {
                 self.prev_tail[ch][i] = w * raw[FRAME_SAMPLES + i];
             }
         }
+        // Post-filter + de-emphasis on each channel. Both channels share the
+        // single pitch / gain / tapset decoded from the header.
+        self.run_postfilter_and_deemph(0, &mut out_l, pf_t1, pf_g1, pf_tapset1);
+        self.run_postfilter_and_deemph(1, &mut out_r, pf_t1, pf_g1, pf_tapset1);
         self.prev2_log_e.copy_from_slice(&self.prev1_log_e);
         self.prev1_log_e.copy_from_slice(&self.old_band_e);
         Ok((out_l, out_r))
+    }
+
+    /// Run the RFC 6716 §4.3.7 tail of the decode pipeline on one channel of
+    /// `FRAME_SAMPLES` post-IMDCT+OLA samples. Consumes the current-frame
+    /// pitch parameters `(pf_t1, pf_g1, pf_tapset1)`, uses the stored
+    /// previous-frame ones as the crossfade source, writes the filtered
+    /// output back in place, then:
+    ///
+    /// 1. Updates `pf_history[ch]` with the last `COMB_FILTER_MAXPERIOD + 2`
+    ///    samples of the *post-filtered but not yet de-emphasized* output.
+    /// 2. Rotates `pf_*_old[ch]` to the current-frame values.
+    /// 3. Applies in-place single-pole de-emphasis, updating
+    ///    `deemph_state[ch]`.
+    fn run_postfilter_and_deemph(
+        &mut self,
+        ch: usize,
+        out: &mut [f32],
+        pf_t1: i32,
+        pf_g1: f32,
+        pf_tapset1: usize,
+    ) {
+        let pf_t0 = self.pf_period_old[ch];
+        let pf_g0 = self.pf_gain_old[ch];
+        let pf_tapset0 = self.pf_tapset_old[ch];
+
+        // The post-filter uses the 120-tap long MDCT window for its
+        // crossfade (libopus passes `mode->window`, which at LM=3 is the
+        // 120-sample sin-window; this matches `WINDOW_120`).
+        comb_filter(
+            out,
+            &self.pf_history[ch],
+            pf_t0,
+            pf_t1,
+            out.len(),
+            pf_g0,
+            pf_g1,
+            pf_tapset0,
+            pf_tapset1,
+            &WINDOW_120,
+            OVERLAP,
+        );
+
+        // Update the MAX_PERIOD + 2 tail history with the trailing samples
+        // of the current frame's post-filtered output. When the frame is
+        // shorter than the history buffer we slide existing contents left.
+        let hist_len = self.pf_history[ch].len();
+        if out.len() >= hist_len {
+            let start = out.len() - hist_len;
+            self.pf_history[ch].copy_from_slice(&out[start..]);
+        } else {
+            // Shift older history left, append current frame at the end.
+            let keep = hist_len - out.len();
+            self.pf_history[ch].copy_within(hist_len - keep.., 0);
+            // above is a no-op when keep == 0; the next copy fills the tail
+            self.pf_history[ch][keep..].copy_from_slice(out);
+        }
+
+        // Rotate post-filter params.
+        self.pf_period_old[ch] = pf_t1;
+        self.pf_gain_old[ch] = pf_g1;
+        self.pf_tapset_old[ch] = pf_tapset1;
+
+        // De-emphasis.
+        self.deemph_state[ch] = deemphasis(out, self.deemph_state[ch]);
     }
 
     fn build_audio_frame(&mut self, pcm: Vec<f32>, samples: usize) -> Frame {
@@ -734,6 +851,21 @@ impl Decoder for CeltDecoder {
             ch.iter_mut().for_each(|v| *v = 0.0);
         }
         self.rng = 0;
+        for v in &mut self.pf_period_old {
+            *v = 0;
+        }
+        for v in &mut self.pf_gain_old {
+            *v = 0.0;
+        }
+        for v in &mut self.pf_tapset_old {
+            *v = 0;
+        }
+        for h in &mut self.pf_history {
+            h.iter_mut().for_each(|v| *v = 0.0);
+        }
+        for v in &mut self.deemph_state {
+            *v = 0.0;
+        }
         Ok(())
     }
 }

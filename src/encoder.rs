@@ -196,6 +196,11 @@ pub struct CeltEncoder {
     /// Intended for A/B testing short-block vs long-only reconstruction
     /// quality; production users shouldn't set this.
     force_long_only: bool,
+    /// Pre-emphasis filter state (`x[n-1]` of the raw PCM, per channel).
+    /// Applied as `y[n] = x[n] - alpha_p * x[n-1]` before MDCT. Pairs with
+    /// the decoder's post-IMDCT de-emphasis so a full encode→decode chain
+    /// recovers the original scale (the two are exact inverses).
+    preemph_state: Vec<f32>,
 }
 
 impl CeltEncoder {
@@ -230,6 +235,7 @@ impl CeltEncoder {
             pts_counter: 0,
             short_window: build_short_window(SHORT_N),
             force_long_only: false,
+            preemph_state: vec![0.0; channels],
         })
     }
 
@@ -255,17 +261,36 @@ impl CeltEncoder {
         Ok(())
     }
 
-    fn encode_frame(&mut self, pcm: &[f32]) -> Result<Packet> {
-        debug_assert_eq!(pcm.len(), FRAME_SAMPLES);
+    fn encode_frame(&mut self, pcm_in: &[f32]) -> Result<Packet> {
+        debug_assert_eq!(pcm_in.len(), FRAME_SAMPLES);
         let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
         debug_assert_eq!(lm, 3);
+
+        // Pre-emphasis (RFC 6716 §4.3.7.2 inverse): `y[n] = x[n] - alpha_p *
+        // x[n-1]`. Carried state is the previous raw input sample per
+        // channel. Runs here so both the silence peak check (below) and all
+        // downstream MDCT stages see the pre-emphasized signal — the
+        // decoder's post-IMDCT de-emphasis is the exact inverse.
+        let alpha = crate::tables::DEEMPHASIS_COEF;
+        let mut pcm: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES);
+        {
+            let mut prev = self.preemph_state[0];
+            for &x in pcm_in {
+                pcm.push(x - alpha * prev);
+                prev = x;
+            }
+            self.preemph_state[0] = prev;
+        }
+        let pcm = pcm.as_slice();
 
         // Silence-flag fast path. If the input frame is below a hard -90 dBFS
         // floor (peak |s| < 1e-5), emit a silence-only packet: the decoder
         // sees the silence bit and skips every other §4.3.2-§4.3.7 symbol,
         // producing zero PCM. This is RFC 6716 §4.3 Table 56 silence, not the
-        // same as DTX — the packet is still emitted, just tiny.
-        let peak = pcm.iter().fold(0f32, |m, &s| m.max(s.abs()));
+        // same as DTX — the packet is still emitted, just tiny. Peak is
+        // measured on the raw input to avoid pre-emphasis boosting HF noise
+        // into the non-silent regime.
+        let peak = pcm_in.iter().fold(0f32, |m, &s| m.max(s.abs()));
         if peak < 1e-5 {
             let bytes = self.bytes_per_frame;
             let mut rc = RangeEncoder::new(bytes as u32);
@@ -596,12 +621,33 @@ impl CeltEncoder {
                 .with_duration(FRAME_SAMPLES as i64));
         }
 
-        // De-interleave into L and R PCM.
+        // De-interleave into L and R PCM, then apply per-channel
+        // pre-emphasis (RFC §4.3.7.2 inverse, matched by the decoder's
+        // de-emphasis).
         let mut l_pcm = vec![0f32; FRAME_SAMPLES];
         let mut r_pcm = vec![0f32; FRAME_SAMPLES];
         for i in 0..FRAME_SAMPLES {
             l_pcm[i] = pcm[2 * i];
             r_pcm[i] = pcm[2 * i + 1];
+        }
+        let alpha = crate::tables::DEEMPHASIS_COEF;
+        {
+            let mut prev = self.preemph_state[0];
+            for v in l_pcm.iter_mut() {
+                let x = *v;
+                *v = x - alpha * prev;
+                prev = x;
+            }
+            self.preemph_state[0] = prev;
+        }
+        {
+            let mut prev = self.preemph_state[1];
+            for v in r_pcm.iter_mut() {
+                let x = *v;
+                *v = x - alpha * prev;
+                prev = x;
+            }
+            self.preemph_state[1] = prev;
         }
 
         // Transient detection: flag if either channel has percussive onset.

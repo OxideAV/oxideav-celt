@@ -291,6 +291,15 @@ pub const COMB_FILTER_TAPS: [[f32; 3]; 3] = [
 /// CELT minimum comb-filter period (libopus `COMBFILTER_MINPERIOD`).
 pub const COMB_FILTER_MINPERIOD: u32 = 15;
 
+/// CELT maximum comb-filter period (libopus `COMBFILTER_MAXPERIOD`).
+/// Per RFC 6716 §4.3.7.1, the decoded pitch period is bounded in [15, 1022],
+/// so `MAXPERIOD` is 1024 samples (the required history buffer length).
+pub const COMB_FILTER_MAXPERIOD: u32 = 1024;
+
+/// De-emphasis filter coefficient (RFC 6716 §4.3.7.2 `alpha_p`). Applied as
+/// `y[n] = x[n] + alpha_p * y[n-1]` (inverse of the encoder's pre-emphasis).
+pub const DEEMPHASIS_COEF: f32 = 0.8500061035;
+
 /// `MAX_FINE_BITS` from libopus rate.h.
 pub const MAX_FINE_BITS: i32 = 8;
 
