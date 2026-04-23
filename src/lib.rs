@@ -28,7 +28,11 @@
 //! * §4.3.7 inverse MDCT (`mdct::imdct_sub`) — pre-twiddle → length-N/4
 //!   complex FFT (Bluestein for non-power-of-two sizes) → post-twiddle
 //!   → mirror, plus window + overlap-add in the opus crate.
-//! * §4.3.8 comb pitch post-filter (`post_filter::comb_filter`).
+//! * §4.3.7.1 comb pitch post-filter (`post_filter::comb_filter`) — wired
+//!   into the decoder's per-channel state (history + old-params rotation
+//!   + crossfade across the 120-sample overlap).
+//! * §4.3.7.2 single-pole de-emphasis + matching encoder-side pre-emphasis
+//!   (`post_filter::deemphasis`, `alpha_p = 0.8500061035`).
 //!
 //! Static tables (transcribed from libopus `static_modes_float.h`):
 //! `EBAND_5MS`, `E_PROB_MODEL`, `PRED_COEF`/`BETA_COEF`/`BETA_INTRA`,

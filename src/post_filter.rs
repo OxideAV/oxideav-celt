@@ -176,6 +176,38 @@ mod tests {
     }
 
     #[test]
+    fn preemph_and_deemph_are_inverses() {
+        // Apply encoder's pre-emphasis then decoder's de-emphasis. The
+        // output should recover the original signal sample-for-sample (up
+        // to f32 noise). Both filters run at the single-pole coefficient
+        // from RFC §4.3.7.2.
+        let alpha = crate::tables::DEEMPHASIS_COEF;
+        let x: Vec<f32> = (0..200)
+            .map(|i| (i as f32 * 0.0789).sin() * 0.5)
+            .collect();
+        // Pre-emphasis y[n] = x[n] - alpha*x[n-1].
+        let mut preemph_state = 0.0f32;
+        let mut pre = Vec::with_capacity(x.len());
+        for &v in &x {
+            pre.push(v - alpha * preemph_state);
+            preemph_state = v;
+        }
+        // De-emphasis: y[n] = x[n] + alpha*y[n-1] (in-place).
+        let mut back = pre.clone();
+        let _ = deemphasis(&mut back, 0.0);
+        // Recovered samples should match original within single-precision
+        // cumulative IIR error.
+        for (i, (&orig, &rec)) in x.iter().zip(back.iter()).enumerate() {
+            assert!(
+                (orig - rec).abs() < 1e-4,
+                "sample {i}: orig {} recovered {}",
+                orig,
+                rec
+            );
+        }
+    }
+
+    #[test]
     fn deemphasis_state_preserves_across_calls() {
         // Unit impulse: single-pole response is alpha^n.
         let mut x = vec![0.0f32; 8];

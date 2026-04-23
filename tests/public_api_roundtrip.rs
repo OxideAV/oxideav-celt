@@ -290,6 +290,76 @@ fn transient_roundtrip_has_bounded_preecho() {
     );
 }
 
+/// Post-filter flag smoke test: force the encoder to emit every frame with
+/// the RFC 6716 §4.3.7.1 post-filter flag set, and confirm the decoder
+/// runs the comb-filter + de-emphasis path without erroring or producing
+/// NaNs/Infs. Since the encoder does *not* run the matching pitch
+/// pre-filter, the decoded signal is degraded — we only gate on "no
+/// panics, no non-finite samples, nonzero output".
+#[test]
+fn post_filter_flag_decodes_without_error() {
+    use oxideav_celt::header::PostFilter;
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new(&params).unwrap();
+    enc.set_force_post_filter(Some(PostFilter {
+        octave: 2,
+        // fine_pitch = 7 → period = (16<<2) + 7 - 1 = 70 samples (≈686 Hz at 48 kHz).
+        period: 7,
+        gain: 4, // G = 3*5/32 = 0.46875
+        tapset: 0,
+    }));
+    let mut dec = CeltDecoder::new(&params).unwrap();
+
+    let n_frames = 6usize;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    // Periodic signal so the comb filter has something coherent to latch
+    // onto at T=70 samples (freq ~686 Hz).
+    let freq = 686.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.2)
+        .collect();
+
+    for chunk in signal.chunks(FRAME_SAMPLES) {
+        if chunk.len() == FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+
+    // Every emitted packet's header must parse with post_filter = Some.
+    let mut packets = Vec::new();
+    while let Ok(pkt) = enc.receive_packet() {
+        packets.push(pkt);
+    }
+    assert!(!packets.is_empty());
+    for (i, pkt) in packets.iter().enumerate() {
+        let mut rd = oxideav_celt::range_decoder::RangeDecoder::new(&pkt.data);
+        let h = oxideav_celt::header::decode_header(&mut rd).expect("header must parse");
+        assert!(
+            h.post_filter.is_some(),
+            "packet {i} does not carry post_filter=Some despite the test-knob"
+        );
+    }
+
+    // Decode every packet; the decoder must handle post_filter=Some without
+    // panicking or erroring.
+    let mut decoded: Vec<f32> = Vec::new();
+    for pkt in &packets {
+        dec.send_packet(pkt).expect("decoder must accept post_filter packets");
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.extend(decoded_f32(&frame));
+        }
+    }
+    assert_eq!(decoded.len(), n_samples);
+    assert!(decoded.iter().all(|v| v.is_finite()), "decoded non-finite");
+
+    // Output must carry nonzero energy — the decoder's post-filter path
+    // adds a comb tap but shouldn't zero out the signal entirely.
+    let mid = &decoded[FRAME_SAMPLES * 2..FRAME_SAMPLES * 4];
+    let e: f32 = mid.iter().map(|v| v * v).sum::<f32>() / mid.len() as f32;
+    assert!(e > 1e-6, "post-filter decoded output silent (energy {e})");
+}
+
 #[test]
 fn stereo_roundtrip_through_public_api() {
     let params = build_params(2);

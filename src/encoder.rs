@@ -201,6 +201,14 @@ pub struct CeltEncoder {
     /// the decoder's post-IMDCT de-emphasis so a full encode→decode chain
     /// recovers the original scale (the two are exact inverses).
     preemph_state: Vec<f32>,
+    /// Test-only: when set, every emitted packet carries a post-filter
+    /// header. The encoder does not run the encoder-side pitch pre-filter
+    /// (libopus `celt_preemphasis`/`comb_filter_inplace` pair) — this knob
+    /// simply fires the decoder's `comb_filter` + history + crossfade
+    /// machinery on a stream where the pre-filter analysis was skipped, so
+    /// the decoded output will not be the original signal. Purely a smoke
+    /// test that the decoder's post-filter path does not panic / error.
+    force_post_filter: Option<crate::header::PostFilter>,
 }
 
 impl CeltEncoder {
@@ -236,7 +244,18 @@ impl CeltEncoder {
             short_window: build_short_window(SHORT_N),
             force_long_only: false,
             preemph_state: vec![0.0; channels],
+            force_post_filter: None,
         })
+    }
+
+    /// Test hook: force every emitted packet to carry a post-filter header
+    /// with the given parameters. See the `force_post_filter` field for
+    /// caveats — this does not run the encoder-side pitch pre-filter, so
+    /// reconstruction quality is degraded. Used exclusively to exercise the
+    /// decoder's post-filter code path in integration tests.
+    #[doc(hidden)]
+    pub fn set_force_post_filter(&mut self, pf: Option<crate::header::PostFilter>) {
+        self.force_post_filter = pf;
     }
 
     /// Force the encoder to emit long blocks for every frame, bypassing
@@ -379,8 +398,9 @@ impl CeltEncoder {
         let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, no post-filter, transient=<flag>, intra=<flag>.
-        encode_header(&mut rc, false, None, transient, intra);
+        // Header: silence=0, optional post-filter (test-only hook),
+        // transient=<flag>, intra=<flag>.
+        encode_header(&mut rc, false, self.force_post_filter, transient, intra);
 
         // Coarse energy.
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];
@@ -706,8 +726,9 @@ impl CeltEncoder {
         let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, no post-filter, transient=<flag>, intra=<flag>.
-        encode_header(&mut rc, false, None, transient, intra);
+        // Header: silence=0, optional post-filter (test-only hook),
+        // transient=<flag>, intra=<flag>.
+        encode_header(&mut rc, false, self.force_post_filter, transient, intra);
 
         // Coarse energy (both channels).
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];
