@@ -316,6 +316,14 @@ impl RangeEncoder {
     pub fn total_bits(&self) -> u32 {
         self.storage * 8
     }
+
+    /// Live range-coder `rng` state. Used by CELT PVQ noise generation
+    /// (§4.3.4) and anti-collapse (§4.3.5) as the LCG seed — must be read
+    /// at the exact point the decoder would read its own `rng` so the
+    /// encoder/decoder noise schedule matches.
+    pub fn rng(&self) -> u32 {
+        self.rng
+    }
 }
 
 #[cfg(test)]

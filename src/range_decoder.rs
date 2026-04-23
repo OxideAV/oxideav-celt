@@ -280,6 +280,14 @@ impl<'a> RangeDecoder<'a> {
     pub fn storage(&self) -> u32 {
         self.storage
     }
+
+    /// Live range-coder `rng` state. libopus uses this as the LCG seed for
+    /// §4.3.4 PVQ noise generation and §4.3.5 anti-collapse noise shaping —
+    /// the "seed" captured by `BandCtx` must be this value at the moment
+    /// the band starts being decoded.
+    pub fn rng(&self) -> u32 {
+        self.rng
+    }
 }
 
 /// Fail-fast wrapper used at the top of a frame.

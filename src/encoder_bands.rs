@@ -680,7 +680,8 @@ pub fn encode_all_bands_stereo_dual(
             spread,
             tf_change,
             remaining_bits,
-            seed: *seed,
+            // Mirror the decoder: per-band seed is the live range-coder rng.
+            seed: rc.rng(),
             band_index: i,
             intensity: coded_bands as i32,
             disable_inv: false,
@@ -751,12 +752,12 @@ pub fn encode_all_bands_stereo_dual(
             norm[nstart..nstart + band_len].copy_from_slice(&x_buf);
             norm[norm_len + nstart..norm_len + nstart + band_len].copy_from_slice(&y_buf);
         }
-        *seed = ctx.seed;
         collapse_masks[i * c_count] = cm as u8;
         collapse_masks[i * c_count + 1] = cm as u8;
         balance += pulses[i] + tell;
         update_lowband = b > (n << BITRES);
     }
+    *seed = rc.rng();
 }
 
 /// Top-level band encoder for mono CELT frames (long or short blocks).
@@ -836,7 +837,8 @@ pub fn encode_all_bands_mono(
             spread,
             tf_change,
             remaining_bits,
-            seed: *seed,
+            // Mirror the decoder: per-band seed is the live range-coder rng.
+            seed: rc.rng(),
             band_index: i,
             intensity: 0,
             disable_inv: false,
@@ -881,9 +883,9 @@ pub fn encode_all_bands_mono(
         if nstart + band_len <= norm_len {
             norm[nstart..nstart + band_len].copy_from_slice(&x_buf);
         }
-        *seed = ctx.seed;
         collapse_masks[i] = cm as u8;
         balance += pulses[i] + tell;
         update_lowband = b > (n << BITRES);
     }
+    *seed = rc.rng();
 }

@@ -54,9 +54,10 @@
 //!   the wrong fold source for the second-band edge case (see
 //!   `special_hybrid_folding` in libopus, which we omit since CELT-only
 //!   doesn't trigger it for `start=0`).
-//! * **Anti-collapse seed**: we use the local `state.rng` as the LCG seed
-//!   instead of plumbing the live range-coder `rng` through `quant_all_bands`
-//!   per libopus.
+//! * **Anti-collapse seed** (fixed): the per-band `BandCtx.seed` and the
+//!   value handed to `anti_collapse` are now both `rc.rng()` captured at the
+//!   live range-coder state (encoder and decoder match each other and
+//!   libopus `ec->rng`).
 
 #![allow(
     dead_code,

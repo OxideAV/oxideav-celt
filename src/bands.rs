@@ -1008,11 +1008,17 @@ pub fn quant_all_bands(
             None
         };
 
+        // Per libopus `quant_all_bands`, the per-band seed is the live
+        // range-coder `rng` captured at the start of decoding this band
+        // — this makes the noise-fill + anti-collapse noise state follow
+        // the exact same schedule as the reference implementation. The
+        // `seed` parameter the caller passes in is overwritten with the
+        // post-loop rng below, matching libopus `st->rng = ec->rng`.
         let mut ctx = BandCtx {
             spread,
             tf_change,
             remaining_bits,
-            seed: *seed,
+            seed: rc.rng(),
             band_index: i,
             intensity,
             disable_inv,
@@ -1101,7 +1107,6 @@ pub fn quant_all_bands(
                 }
             }
         }
-        *seed = ctx.seed;
         collapse_masks[i * c_count] = cm as u8;
         if c_count > 1 {
             collapse_masks[i * c_count + 1] = cm as u8;
@@ -1109,6 +1114,9 @@ pub fn quant_all_bands(
         balance += pulses[i] + tell;
         update_lowband = b > (n << BITRES);
     }
+    // libopus: `st->rng = ec->rng` at the end of quant_all_bands. This is
+    // the value passed to `anti_collapse` as its LCG seed below.
+    *seed = rc.rng();
 }
 
 /// Anti-collapse processing (RFC 6716 §4.3.5). Replaces zero-energy MDCT
