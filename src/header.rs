@@ -62,7 +62,12 @@ pub fn encode_header(
         rc.encode_uint(pf.octave, 6);
         rc.encode_bits(pf.period, 4 + pf.octave);
         rc.encode_bits(pf.gain, 3);
-        rc.encode_icdf(pf.tapset as usize, &TAPSET_ICDF, 2);
+        // Mirror the decoder's libopus-style budget-guarded tapset: only
+        // emit the ICDF symbol if at least 2 bits of budget remain.
+        let total_bits = (rc.storage() * 8) as i32;
+        if rc.tell() + 2 <= total_bits {
+            rc.encode_icdf(pf.tapset as usize, &TAPSET_ICDF, 2);
+        }
     }
     rc.encode_bit_logp(transient, 3);
     rc.encode_bit_logp(intra, 3);
@@ -96,8 +101,16 @@ pub fn decode_header(rc: &mut RangeDecoder<'_>) -> Option<CeltHeader> {
         let period = rc.decode_bits(4 + octave);
         // gain: 3 raw bits.
         let gain = rc.decode_bits(3);
-        // tapset: ICDF {2, 1, 1}/4
-        let tapset = rc.decode_icdf(&TAPSET_ICDF, 2) as u32;
+        // tapset: ICDF {2, 1, 1}/4 — libopus only decodes the tapset if at
+        // least 2 bits of budget remain (celt_decoder.c:
+        // `if (ec_tell(dec)+2<=total_bits)`). Tiny frames skip it and
+        // default to tapset=0.
+        let total_bits = (rc.storage() * 8) as i32;
+        let tapset = if rc.tell() + 2 <= total_bits {
+            rc.decode_icdf(&TAPSET_ICDF, 2) as u32
+        } else {
+            0
+        };
         Some(PostFilter {
             octave,
             period,
