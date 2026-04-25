@@ -25,7 +25,7 @@ use oxideav_celt::tables::{
     init_caps, lm_for_frame_samples, EBAND_5MS, NB_EBANDS, SPREAD_ICDF, SPREAD_NORMAL,
     TF_SELECT_TABLE, TRIM_ICDF,
 };
-use oxideav_codec::Encoder;
+use oxideav_core::Encoder;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
 
 const OVERLAP: usize = 120;

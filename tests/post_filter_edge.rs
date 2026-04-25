@@ -33,9 +33,7 @@ fn comb_filter_short_subframe_no_panic() {
         .collect();
 
     // Different period and tapset so the crossfade actually runs.
-    comb_filter(
-        &mut y, &history, 20, 33, 80, 0.3, 0.5, 0, 1, &window, 120,
-    );
+    comb_filter(&mut y, &history, 20, 33, 80, 0.3, 0.5, 0, 1, &window, 120);
     // No panic == pass. Just assert the buffer was touched (non-all-zero).
     assert!(y.iter().any(|&v| v != 0.0));
 }
@@ -74,17 +72,9 @@ fn comb_filter_clamps_out_of_range_period() {
     let window = vec![0.0f32; 0];
     // Pass periods well outside the RFC range. Should not panic.
     comb_filter(
-        &mut y,
-        &history,
-        5_000, // way above MAXPERIOD = 1024
+        &mut y, &history, 5_000, // way above MAXPERIOD = 1024
         -50,   // below MINPERIOD = 15 (also negative)
-        120,
-        0.4,
-        0.4,
-        0,
-        0,
-        &window,
-        0,
+        120, 0.4, 0.4, 0, 0, &window, 0,
     );
     assert!(y.iter().all(|v| v.is_finite()));
 }

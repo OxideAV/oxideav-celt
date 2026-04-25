@@ -9,8 +9,8 @@
 
 use oxideav_celt::decoder::CeltDecoder;
 use oxideav_celt::encoder::{CeltEncoder, FRAME_SAMPLES, SAMPLE_RATE};
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+use oxideav_core::{Decoder, Encoder};
 
 fn build_params(channels: u16) -> CodecParameters {
     let mut p = CodecParameters::audio(CodecId::new(oxideav_celt::CODEC_ID_STR));
@@ -345,7 +345,8 @@ fn post_filter_flag_decodes_without_error() {
     // panicking or erroring.
     let mut decoded: Vec<f32> = Vec::new();
     for pkt in &packets {
-        dec.send_packet(pkt).expect("decoder must accept post_filter packets");
+        dec.send_packet(pkt)
+            .expect("decoder must accept post_filter packets");
         while let Ok(frame) = dec.receive_frame() {
             decoded.extend(decoded_f32(&frame));
         }

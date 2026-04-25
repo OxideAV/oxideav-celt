@@ -58,10 +58,8 @@ pub fn comb_filter(
     // the spec-mandated floor; the caller may pass 0 (no prior post-filter)
     // or a clamped value, so we guard here too. `MAXPERIOD` (1024) bounds the
     // history-buffer lookbacks at `y[n - T + 2]` / `y[n - T - 2]`.
-    let t0 = (t0.max(COMB_FILTER_MINPERIOD as i32) as usize)
-        .min(COMB_FILTER_MAXPERIOD as usize);
-    let t1 = (t1.max(COMB_FILTER_MINPERIOD as i32) as usize)
-        .min(COMB_FILTER_MAXPERIOD as usize);
+    let t0 = (t0.max(COMB_FILTER_MINPERIOD as i32) as usize).min(COMB_FILTER_MAXPERIOD as usize);
+    let t1 = (t1.max(COMB_FILTER_MINPERIOD as i32) as usize).min(COMB_FILTER_MAXPERIOD as usize);
     let g00 = g0 * COMB_FILTER_TAPS[tapset0][0];
     let g01 = g0 * COMB_FILTER_TAPS[tapset0][1];
     let g02 = g0 * COMB_FILTER_TAPS[tapset0][2];
@@ -106,8 +104,10 @@ pub fn comb_filter(
         let i_s = i as isize;
         let val = read(y, i_s)
             + (one_minus_f * g00) * read(y, i_s - t0 as isize)
-            + (one_minus_f * g01) * (read(y, i_s - t0 as isize + 1) + read(y, i_s - t0 as isize - 1))
-            + (one_minus_f * g02) * (read(y, i_s - t0 as isize + 2) + read(y, i_s - t0 as isize - 2))
+            + (one_minus_f * g01)
+                * (read(y, i_s - t0 as isize + 1) + read(y, i_s - t0 as isize - 1))
+            + (one_minus_f * g02)
+                * (read(y, i_s - t0 as isize + 2) + read(y, i_s - t0 as isize - 2))
             + (f * g10) * read(y, i_s - t1 as isize)
             + (f * g11) * (read(y, i_s - t1 as isize + 1) + read(y, i_s - t1 as isize - 1))
             + (f * g12) * (read(y, i_s - t1 as isize + 2) + read(y, i_s - t1 as isize - 2));
@@ -199,9 +199,7 @@ mod tests {
         // to f32 noise). Both filters run at the single-pole coefficient
         // from RFC §4.3.7.2.
         let alpha = crate::tables::DEEMPHASIS_COEF;
-        let x: Vec<f32> = (0..200)
-            .map(|i| (i as f32 * 0.0789).sin() * 0.5)
-            .collect();
+        let x: Vec<f32> = (0..200).map(|i| (i as f32 * 0.0789).sin() * 0.5).collect();
         // Pre-emphasis y[n] = x[n] - alpha*x[n-1].
         let mut preemph_state = 0.0f32;
         let mut pre = Vec::with_capacity(x.len());
