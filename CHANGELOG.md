@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.0...v0.2.0) - 2026-04-25
+
+### Other
+
+- drop oxideav-codec/oxideav-container shims, import from oxideav-core
+- clamp post-filter period to avoid OOB on short subframes
+- guard post-filter tapset on remaining bit budget
+- use live range-coder rng for per-band PVQ + anti-collapse seed
+- add post-filter smoke test + preemph/deemph inverse test
+- wire post-filter + pre/de-emphasis through decoder & encoder
+- add BSD-3-Clause attribution for libopus-derived code
+- release v0.1.0
+
 ## [0.1.0](https://github.com/OxideAV/oxideav-celt/compare/v0.0.4...v0.1.0) - 2026-04-19
 
 ### Other
