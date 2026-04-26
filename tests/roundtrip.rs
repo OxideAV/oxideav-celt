@@ -26,7 +26,7 @@ use oxideav_celt::tables::{
     TF_SELECT_TABLE, TRIM_ICDF,
 };
 use oxideav_core::Encoder;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet};
 
 const OVERLAP: usize = 120;
 
@@ -279,6 +279,7 @@ fn encode_signal_to_packets(signal: &[f32]) -> Vec<Packet> {
     let mut p = CodecParameters::audio(CodecId::new(oxideav_celt::CODEC_ID_STR));
     p.channels = Some(1);
     p.sample_rate = Some(SAMPLE_RATE);
+    p.sample_format = Some(oxideav_core::SampleFormat::F32);
     let mut enc = CeltEncoder::new(&p).unwrap();
 
     let mut packets = Vec::new();
@@ -292,12 +293,8 @@ fn encode_signal_to_packets(signal: &[f32]) -> Vec<Packet> {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::F32,
-            channels: 1,
-            sample_rate: SAMPLE_RATE,
             samples: FRAME_SAMPLES as u32,
             pts: None,
-            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).unwrap();
@@ -772,6 +769,7 @@ fn encode_stereo_signal_to_packets(l_r_interleaved: &[f32]) -> Vec<Packet> {
     let mut p = CodecParameters::audio(CodecId::new(oxideav_celt::CODEC_ID_STR));
     p.channels = Some(2);
     p.sample_rate = Some(SAMPLE_RATE);
+    p.sample_format = Some(oxideav_core::SampleFormat::F32);
     let mut enc = CeltEncoder::new(&p).unwrap();
 
     let mut packets = Vec::new();
@@ -785,12 +783,8 @@ fn encode_stereo_signal_to_packets(l_r_interleaved: &[f32]) -> Vec<Packet> {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         let frame = Frame::Audio(AudioFrame {
-            format: SampleFormat::F32,
-            channels: 2,
-            sample_rate: SAMPLE_RATE,
             samples: FRAME_SAMPLES as u32,
             pts: None,
-            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
             data: vec![bytes],
         });
         enc.send_frame(&frame).unwrap();

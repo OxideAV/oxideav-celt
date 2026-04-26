@@ -15,7 +15,7 @@ use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result,
 };
 
 use crate::bands::{anti_collapse, denormalise_bands, quant_all_bands};
@@ -800,12 +800,8 @@ impl CeltDecoder {
         let pts = self.pts_counter;
         self.pts_counter += samples as i64;
         Frame::Audio(AudioFrame {
-            format: SampleFormat::F32,
-            channels: self.channels as u16,
-            sample_rate: SAMPLE_RATE,
             samples: samples as u32,
             pts: Some(pts),
-            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
             data: vec![bytes],
         })
     }

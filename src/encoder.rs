@@ -929,13 +929,10 @@ impl Encoder for CeltEncoder {
                 ))
             }
         };
-        if (audio.channels as usize) != self.channels {
-            return Err(Error::invalid(format!(
-                "CELT encoder: expected {}-channel input, got {}",
-                self.channels, audio.channels
-            )));
-        }
-        let samples = extract_interleaved_f32(audio, self.channels)?;
+        let format = self.params.sample_format.ok_or_else(|| {
+            Error::invalid("CELT encoder: stream sample_format missing on CodecParameters")
+        })?;
+        let samples = extract_interleaved_f32(audio, self.channels, format)?;
         self.pending.extend(samples);
         self.drain_frames()
     }
@@ -966,10 +963,15 @@ impl Encoder for CeltEncoder {
 /// (L,R,L,R,... for stereo). Supports F32, F32P, S16, S16P.
 /// `channels` is the expected channel count; planar formats build the
 /// interleaved result by reading `channels` separate data planes.
-fn extract_interleaved_f32(audio: &AudioFrame, channels: usize) -> Result<Vec<f32>> {
+/// `format` is the stream's sample format from `CodecParameters`.
+fn extract_interleaved_f32(
+    audio: &AudioFrame,
+    channels: usize,
+    format: SampleFormat,
+) -> Result<Vec<f32>> {
     let n = audio.samples as usize;
     let mut out = vec![0f32; n * channels];
-    match audio.format {
+    match format {
         SampleFormat::F32 => {
             let bytes = &audio.data[0];
             if bytes.len() < n * channels * 4 {

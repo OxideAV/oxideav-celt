@@ -9,13 +9,14 @@
 
 use oxideav_celt::decoder::CeltDecoder;
 use oxideav_celt::encoder::{CeltEncoder, FRAME_SAMPLES, SAMPLE_RATE};
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame};
 use oxideav_core::{Decoder, Encoder};
 
 fn build_params(channels: u16) -> CodecParameters {
     let mut p = CodecParameters::audio(CodecId::new(oxideav_celt::CODEC_ID_STR));
     p.channels = Some(channels);
     p.sample_rate = Some(SAMPLE_RATE);
+    p.sample_format = Some(oxideav_core::SampleFormat::F32);
     p
 }
 
@@ -25,12 +26,8 @@ fn pcm_frame_f32(samples: &[f32], channels: u16) -> Frame {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
     Frame::Audio(AudioFrame {
-        format: SampleFormat::F32,
-        channels,
-        sample_rate: SAMPLE_RATE,
         samples: (samples.len() / channels as usize) as u32,
         pts: None,
-        time_base: TimeBase::new(1, SAMPLE_RATE as i64),
         data: vec![bytes],
     })
 }
