@@ -584,6 +584,299 @@ impl CeltEncoder {
         Ok(())
     }
 
+    /// Stereo variant of [`Self::encode_hybrid_body_mono`] — encode the
+    /// CELT high-band of an Opus Hybrid stereo frame (RFC 6716 §4.4) into
+    /// the caller-provided `RangeEncoder`. Mirrors the `decode_celt_body`
+    /// path with `channels = 2` and `start_band = 17`.
+    ///
+    /// `pcm_in` is **interleaved L,R,L,R...** (length = `2 * FRAME_SAMPLES`).
+    /// The encoder must have been constructed with `channels = 2` so that
+    /// `prev_tail` and `preemph_state` carry per-channel state.
+    ///
+    /// Layout of the emitted bits matches the decoder's hybrid stereo path:
+    /// header → coarse energy (both channels) → tf_decode → spread → dynalloc
+    /// → trim → allocation (`channels = 2`, dual-stereo coupling) → fine
+    /// energy → PVQ shape via `encode_all_bands_stereo_dual` restricted to
+    /// `[start_band, end_band)` → anti-collapse-on flag (always 0 since
+    /// hybrid is non-transient) → final fine pass.
+    ///
+    /// Cross-frame state (`old_band_e`, `prev_tail`, `preemph_state`,
+    /// `first_frame`) is updated for both channels.
+    pub fn encode_hybrid_body_stereo(
+        &mut self,
+        pcm_in: &[f32],
+        enc: &mut RangeEncoder,
+        start_band: usize,
+        end_band: usize,
+        bytes_remaining_budget: usize,
+    ) -> Result<()> {
+        if pcm_in.len() != 2 * FRAME_SAMPLES {
+            return Err(Error::invalid(
+                "CELT hybrid encoder: stereo path needs 2 * 960 (interleaved) samples",
+            ));
+        }
+        if !(start_band < end_band && end_band <= NB_EBANDS) {
+            return Err(Error::invalid(
+                "CELT hybrid encoder: invalid start/end band range",
+            ));
+        }
+        if self.channels != 2 {
+            return Err(Error::unsupported(
+                "CELT hybrid encoder: stereo path requires channels=2 encoder",
+            ));
+        }
+        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+        let channels = 2usize;
+
+        // De-interleave into L and R, applying per-channel pre-emphasis to
+        // match the decoder's per-channel de-emphasis on the summed Hybrid
+        // output.
+        let mut l_pcm = vec![0f32; FRAME_SAMPLES];
+        let mut r_pcm = vec![0f32; FRAME_SAMPLES];
+        for i in 0..FRAME_SAMPLES {
+            l_pcm[i] = pcm_in[2 * i];
+            r_pcm[i] = pcm_in[2 * i + 1];
+        }
+        let alpha = crate::tables::DEEMPHASIS_COEF;
+        {
+            let mut prev = self.preemph_state[0];
+            for v in l_pcm.iter_mut() {
+                let x = *v;
+                *v = x - alpha * prev;
+                prev = x;
+            }
+            self.preemph_state[0] = prev;
+        }
+        {
+            let mut prev = self.preemph_state[1];
+            for v in r_pcm.iter_mut() {
+                let x = *v;
+                *v = x - alpha * prev;
+                prev = x;
+            }
+            self.preemph_state[1] = prev;
+        }
+
+        // Hybrid never emits the silence fast path — the SILK body has
+        // already committed to a non-silent frame. Skip the peak gate.
+
+        let n = CODED_N;
+        // Hybrid frames never go transient — long blocks only.
+        let transient = false;
+
+        // Forward MDCT per channel.
+        let mut coeffs_l = vec![0f32; n];
+        let mut coeffs_r = vec![0f32; n];
+        for (ch, pcm_ch, coeffs) in [
+            (0usize, &l_pcm, &mut coeffs_l),
+            (1usize, &r_pcm, &mut coeffs_r),
+        ] {
+            let mut raw = vec![0f32; 2 * n];
+            raw[..OVERLAP].copy_from_slice(&self.prev_tail[ch]);
+            let take = n.min(pcm_ch.len());
+            raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm_ch[..take]);
+            self.prev_tail[ch].copy_from_slice(&pcm_ch[FRAME_SAMPLES - OVERLAP..]);
+            crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
+            forward_mdct(&raw, coeffs);
+        }
+
+        // Per-band log-energy and normalised shape, per channel.
+        let m = 1i32 << lm;
+        let mut band_log_e = vec![0f32; NB_EBANDS * channels];
+        let mut shape_l = vec![0f32; n];
+        let mut shape_r = vec![0f32; n];
+        for i in 0..NB_EBANDS {
+            let lo = (m * EBAND_5MS[i] as i32) as usize;
+            let hi = (m * EBAND_5MS[i + 1] as i32) as usize;
+            for (ch, coeffs, shape) in [
+                (0usize, &coeffs_l, &mut shape_l),
+                (1usize, &coeffs_r, &mut shape_r),
+            ] {
+                let mut e: f32 = 0.0;
+                for &c in &coeffs[lo..hi] {
+                    e += c * c;
+                }
+                let e = e.max(1e-30).sqrt();
+                band_log_e[ch * NB_EBANDS + i] = e.log2() - E_MEANS[i];
+                for c in &mut shape[lo..hi] {
+                    *c /= e;
+                }
+            }
+        }
+
+        // First-frame intra so old_band_e isn't poisoned.
+        let intra = self.first_frame;
+        let bytes = bytes_remaining_budget;
+
+        // Header: silence=0, no post-filter, transient=0, intra=<flag>.
+        encode_header(enc, false, None, transient, intra);
+
+        // Coarse energy (both channels, restricted to coded band range).
+        let mut new_log_e = vec![0f32; NB_EBANDS * 2];
+        new_log_e[..NB_EBANDS * channels].copy_from_slice(&band_log_e);
+        let mut old_e_bands = self.old_band_e.clone();
+        quant_coarse_energy(
+            enc,
+            &new_log_e,
+            &mut old_e_bands,
+            start_band,
+            end_band,
+            intra,
+            channels,
+            lm as usize,
+        );
+
+        // tf_decode: emit raw=0 + tsel=0 → tf_res[i] = 0 everywhere.
+        let tf_delta_first = false;
+        let tf_delta_rest = false;
+        let tf_sel: bool = false;
+
+        let budget = (bytes * 8) as u32;
+        let mut tell_u = enc.tell() as u32;
+        let mut logp: u32 = 4; // non-transient
+        let tf_select_rsv = if lm > 0 && tell_u + logp + 1 <= budget {
+            1
+        } else {
+            0
+        };
+        let budget_after = budget - tf_select_rsv;
+        for band_i in start_band..end_band {
+            if tell_u + logp <= budget_after {
+                let bit = if band_i == start_band {
+                    tf_delta_first
+                } else {
+                    tf_delta_rest
+                };
+                enc.encode_bit_logp(bit, logp);
+                tell_u = enc.tell() as u32;
+            }
+            logp = 5;
+        }
+        if tf_select_rsv != 0
+            && crate::tables::TF_SELECT_TABLE[lm as usize][0]
+                != crate::tables::TF_SELECT_TABLE[lm as usize][2]
+        {
+            enc.encode_bit_logp(tf_sel, 1);
+        }
+        let tf_res = vec![0i32; NB_EBANDS];
+
+        // Spread decision.
+        let tell = enc.tell();
+        let total_bits_check = (bytes * 8) as i32;
+        if tell + 4 <= total_bits_check {
+            enc.encode_icdf(SPREAD_NORMAL as usize, &SPREAD_ICDF, 5);
+        }
+
+        // Dynalloc — emit no boost per band.
+        let cap = init_caps(lm as usize, channels);
+        let mut offsets = [0i32; NB_EBANDS];
+        let dynalloc_logp = 6i32;
+        let total_bits_frac = (bytes as i32) * 8 << BITRES;
+        let mut tell = enc.tell_frac() as i32;
+        for i in start_band..end_band {
+            let _width = (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m;
+            let dynalloc_loop_logp = dynalloc_logp;
+            let boost = 0i32;
+            if tell + (dynalloc_loop_logp << BITRES) < total_bits_frac && boost < cap[i] {
+                enc.encode_bit_logp(false, dynalloc_loop_logp as u32);
+                tell = enc.tell_frac() as i32;
+            }
+            offsets[i] = boost;
+        }
+        let _ = total_bits_frac;
+
+        // Allocation trim.
+        if tell + (6 << BITRES) <= total_bits_frac {
+            enc.encode_icdf(5, &TRIM_ICDF, 7);
+        }
+
+        let mut bits = ((bytes as i32) * 8 << BITRES) - enc.tell_frac() as i32 - 1;
+        // Anti-collapse: never reserved on Hybrid (transient = false).
+        let anti_collapse_rsv = 0i32;
+        bits -= anti_collapse_rsv;
+
+        let mut pulses = vec![0i32; NB_EBANDS];
+        let mut fine_quant = vec![0i32; NB_EBANDS];
+        let mut fine_priority = vec![0i32; NB_EBANDS];
+        let mut balance = 0i32;
+        let mut intensity = 0i32;
+        let mut dual_stereo = 0i32;
+        let coded_bands = clt_compute_allocation_enc(
+            start_band,
+            end_band,
+            &offsets,
+            &cap,
+            5,
+            &mut intensity,
+            &mut dual_stereo,
+            bits,
+            &mut balance,
+            &mut pulses,
+            &mut fine_quant,
+            &mut fine_priority,
+            channels as i32,
+            lm,
+            enc,
+        );
+        let _ = (intensity, dual_stereo);
+
+        // Fine energy (both channels).
+        quant_fine_energy(
+            enc,
+            &new_log_e,
+            &mut old_e_bands,
+            start_band,
+            end_band,
+            &fine_quant,
+            channels,
+        );
+
+        // PVQ shape — dual-stereo, restricted to [start_band, end_band).
+        let total_pvq_bits = (bytes as i32) * (8 << BITRES) - anti_collapse_rsv;
+        let mut collapse_masks = vec![0u8; NB_EBANDS * channels];
+        let mut rng_local = 0u32;
+        encode_all_bands_stereo_dual(
+            start_band,
+            end_band,
+            &mut shape_l,
+            &mut shape_r,
+            &mut collapse_masks,
+            &pulses,
+            transient,
+            SPREAD_NORMAL,
+            &tf_res,
+            total_pvq_bits,
+            balance,
+            enc,
+            lm,
+            coded_bands,
+            &mut rng_local,
+        );
+
+        // Anti-collapse-on flag (anti_collapse_rsv == 0, so no bit emitted).
+        if anti_collapse_rsv > 0 {
+            enc.encode_bits(0, 1);
+        }
+
+        // Final fine-energy pass.
+        let bits_left = (bytes as i32) * 8 - enc.tell();
+        quant_energy_finalise(
+            enc,
+            &new_log_e,
+            &mut old_e_bands,
+            start_band,
+            end_band,
+            &fine_quant,
+            &fine_priority,
+            bits_left,
+            channels,
+        );
+
+        self.old_band_e = old_e_bands;
+        self.first_frame = false;
+        Ok(())
+    }
+
     fn drain_frames(&mut self) -> Result<()> {
         let needed = FRAME_SAMPLES * self.channels;
         while self.pending.len() >= needed {
