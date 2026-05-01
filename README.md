@@ -62,15 +62,17 @@ The codec is also discoverable through the `CodecRegistry` via
 ## Supported configuration
 
 This crate targets the fullband subset of CELT — the same profile an
-Opus encoder picks for "music" content at the default 20 ms frame size.
-Both long-block (single 800-coefficient MDCT) and short-block (8 ×
-100-coefficient sub-MDCTs on transient frames) coding are supported.
+Opus encoder picks for "music" content. Both 20 ms (LM=3, default) and
+10 ms (LM=2, opt-in via `*_with_frame_samples(_, 480)`) frame sizes
+ship; the 10 ms path is the CELT-MDCT length used by Opus 10 ms Hybrid
+(RFC 6716 Table 2 configs 6/8/10). Both long-block and short-block
+(transient) coding are supported at each frame size.
 
 | Parameter      | Value                                 |
 |----------------|---------------------------------------|
 | Sample rate    | 48 kHz only                           |
 | Channels       | 1 (mono) or 2 (stereo, dual-stereo)   |
-| Frame size     | 960 samples = 20 ms (LM=3, fullband)  |
+| Frame size     | 960 samples (LM=3, 20 ms, default) or 480 samples (LM=2, 10 ms) |
 | Sample format  | `F32`, `F32P`, `S16`, `S16P` on input |
 | Output format  | `F32`, interleaved                    |
 | Bandwidth      | Fullband (NB_EBANDS=21 bands)         |

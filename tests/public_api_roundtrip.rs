@@ -707,3 +707,268 @@ fn stationary_signal_snr_unchanged_by_detector() {
         "detector-on SNR ({snr_auto:.3}) differs from forced-long SNR ({snr_long:.3}) on a stationary signal — false positive?"
     );
 }
+
+// -------------------------------------------------------------------------
+// LM=2 (10 ms / 480-sample) round-trip — RFC 6716 §4.3 frame-size dispatch.
+//
+// The encoder/decoder default to LM=3 (20 ms / 960 samples). For Opus
+// 10 ms Hybrid (configs 6/8/10) and any direct CELT-only 10 ms use the
+// caller opts in via `*_with_frame_samples(_, 480)`. These tests confirm
+// the per-band quantisation, PVQ, TF analysis, silence/transient/post-
+// filter machinery all work end-to-end at LM=2:
+//
+//   * mono silence — silence flag fast-path round-trips.
+//   * mono sine — non-silent header + audible 1 kHz tone in the decoded
+//     output.
+//   * mono click — the transient detector still flips short-block under
+//     LM=2 (M=4 sub-blocks of 120 samples instead of M=8 × 120).
+//   * stereo sine — dual-stereo CELT body decodes without divergence.
+// -------------------------------------------------------------------------
+
+const LM2_FRAME_SAMPLES: usize = 480;
+
+#[test]
+fn lm2_silence_roundtrip() {
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+    let mut dec = CeltDecoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+    assert_eq!(enc.frame_samples(), LM2_FRAME_SAMPLES);
+    assert_eq!(dec.frame_samples(), LM2_FRAME_SAMPLES);
+
+    let n_frames = 4usize;
+    for _ in 0..n_frames {
+        let pcm = vec![0.0f32; LM2_FRAME_SAMPLES];
+        enc.send_frame(&pcm_frame_f32(&pcm, 1)).unwrap();
+    }
+    enc.flush().unwrap();
+
+    let mut decoded_frames = 0usize;
+    while let Ok(pkt) = enc.receive_packet() {
+        dec.send_packet(&pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            let pcm = decoded_f32(&frame);
+            assert_eq!(
+                pcm.len(),
+                LM2_FRAME_SAMPLES,
+                "LM=2 decoded frame must have 480 samples"
+            );
+            assert!(pcm.iter().all(|v| v.is_finite()));
+            let energy: f32 = pcm.iter().map(|v| v * v).sum();
+            assert!(
+                energy < 1e-6,
+                "LM=2 silence should decode to near-zero (got energy {energy})"
+            );
+            decoded_frames += 1;
+        }
+    }
+    assert_eq!(
+        decoded_frames, n_frames,
+        "LM=2: expected one decoded frame per encoded frame"
+    );
+}
+
+#[test]
+fn lm2_sine_roundtrip_audible_tone() {
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+    let mut dec = CeltDecoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+
+    let n_frames = 8usize;
+    let n_samples = LM2_FRAME_SAMPLES * n_frames;
+    let freq = 1000.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+        .collect();
+
+    for chunk in signal.chunks(LM2_FRAME_SAMPLES) {
+        if chunk.len() == LM2_FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+
+    // Headers should NOT carry the silence flag for a non-silent sine.
+    let mut packets = Vec::new();
+    while let Ok(pkt) = enc.receive_packet() {
+        packets.push(pkt);
+    }
+    assert_eq!(packets.len(), n_frames);
+    for (i, pkt) in packets.iter().enumerate() {
+        let mut rd = oxideav_celt::range_decoder::RangeDecoder::new(&pkt.data);
+        let h = oxideav_celt::header::decode_header(&mut rd)
+            .unwrap_or_else(|| panic!("LM=2 packet {i} unexpectedly carries silence flag"));
+        assert!(!h.transient, "LM=2 sine packet {i} flipped to transient");
+    }
+
+    // Decode and check the target frequency dominates the off-frequency
+    // baseline in the steady-state middle frames.
+    let mut decoded: Vec<f32> = Vec::with_capacity(n_samples);
+    for pkt in &packets {
+        dec.send_packet(pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.extend(decoded_f32(&frame));
+        }
+    }
+    assert_eq!(decoded.len(), n_samples);
+    assert!(decoded.iter().all(|v| v.is_finite()));
+
+    let goertzel = |samples: &[f32], f: f32| -> f32 {
+        let w = 2.0 * std::f32::consts::PI * f / SAMPLE_RATE as f32;
+        let cw = w.cos();
+        let (mut s0, mut s1, mut s2) = (0f32, 0f32, 0f32);
+        for &x in samples {
+            s0 = 2.0 * cw * s1 - s2 + x;
+            s2 = s1;
+            s1 = s0;
+        }
+        let _ = s0;
+        (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).sqrt()
+    };
+    // Skip the first 2 frames (OLA still settling) and last frame.
+    let lo = LM2_FRAME_SAMPLES * 2;
+    let hi = LM2_FRAME_SAMPLES * (n_frames - 1);
+    let slice = &decoded[lo..hi];
+    let mag_target = goertzel(slice, freq);
+    let mag_off = goertzel(slice, 5000.0);
+    let energy: f32 = slice.iter().map(|v| v * v).sum();
+    assert!(
+        energy > 1e-6,
+        "LM=2 decoded sine is silent: energy {energy}"
+    );
+    assert!(
+        mag_target > 0.3 * mag_off,
+        "LM=2 target tone buried in decoder output (tgt {mag_target:.3}, off {mag_off:.3})"
+    );
+}
+
+#[test]
+fn lm2_transient_roundtrip_short_blocks_decode() {
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+    let mut dec = CeltDecoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+
+    let n_frames = 4usize;
+    let n_samples = LM2_FRAME_SAMPLES * n_frames;
+    // Click in the middle of frame 2 — sharp burst against silence.
+    let burst_frame = 2usize;
+    let burst_start = burst_frame * LM2_FRAME_SAMPLES + 240;
+    let burst_len = 60usize;
+    let mut signal = vec![0f32; n_samples];
+    for s in &mut signal[burst_start..burst_start + burst_len] {
+        *s = 0.7;
+    }
+
+    for chunk in signal.chunks(LM2_FRAME_SAMPLES) {
+        if chunk.len() == LM2_FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+
+    let mut packets = Vec::new();
+    while let Ok(pkt) = enc.receive_packet() {
+        packets.push(pkt);
+    }
+    // At least one packet must be transient — short blocks at LM=2 use
+    // M=4 sub-blocks of 120 samples each.
+    let mut saw_transient = false;
+    for pkt in &packets {
+        let mut rd = oxideav_celt::range_decoder::RangeDecoder::new(&pkt.data);
+        if let Some(h) = oxideav_celt::header::decode_header(&mut rd) {
+            if h.transient {
+                saw_transient = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        saw_transient,
+        "LM=2 encoder did not emit transient on a click-vs-silence stimulus"
+    );
+
+    // Decoder must accept every packet (transient short-block path runs
+    // M × 100-sample IMDCTs) without errors or non-finite samples.
+    let mut decoded: Vec<f32> = Vec::with_capacity(n_samples);
+    for pkt in &packets {
+        dec.send_packet(pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.extend(decoded_f32(&frame));
+        }
+    }
+    assert_eq!(decoded.len(), n_samples);
+    assert!(decoded.iter().all(|v| v.is_finite()));
+    // Total energy across the stream must exceed a coarse floor — the
+    // burst-against-silence stimulus is sparse, so the per-region SNR is
+    // dominated by the IMDCT-not-bit-exact gap (see crate README "Known
+    // Gaps"). The point of this test is "transient decode does not blow
+    // up", not a quality gate.
+    let total_e: f32 = decoded.iter().map(|v| v * v).sum();
+    assert!(
+        total_e > 1e-9,
+        "LM=2 transient stream decoded to total silence (energy {total_e})"
+    );
+}
+
+#[test]
+fn lm2_stereo_sine_roundtrip() {
+    let params = build_params(2);
+    let mut enc = CeltEncoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+    let mut dec = CeltDecoder::new_with_frame_samples(&params, LM2_FRAME_SAMPLES).unwrap();
+
+    let n_frames = 5usize;
+    let n_samples = LM2_FRAME_SAMPLES * n_frames;
+    let f_l = 1000.0f32;
+    let f_r = 1500.0f32;
+    let mut interleaved: Vec<f32> = Vec::with_capacity(n_samples * 2);
+    for i in 0..n_samples {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        interleaved.push((2.0 * std::f32::consts::PI * f_l * t).sin() * 0.3);
+        interleaved.push((2.0 * std::f32::consts::PI * f_r * t).sin() * 0.3);
+    }
+    let frame_interleaved = LM2_FRAME_SAMPLES * 2;
+    for chunk in interleaved.chunks(frame_interleaved) {
+        if chunk.len() == frame_interleaved {
+            enc.send_frame(&pcm_frame_f32(chunk, 2)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+
+    let mut decoded: Vec<f32> = Vec::with_capacity(n_samples * 2);
+    while let Ok(pkt) = enc.receive_packet() {
+        dec.send_packet(&pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.extend(decoded_f32(&frame));
+        }
+    }
+    assert_eq!(decoded.len(), n_samples * 2);
+    assert!(decoded.iter().all(|v| v.is_finite()));
+
+    // De-interleave; both channels carry their respective tones with
+    // distinguishable energy.
+    let mut left = Vec::with_capacity(n_samples);
+    let mut right = Vec::with_capacity(n_samples);
+    for chunk in decoded.chunks_exact(2) {
+        left.push(chunk[0]);
+        right.push(chunk[1]);
+    }
+    let lo = LM2_FRAME_SAMPLES * 2;
+    let hi = LM2_FRAME_SAMPLES * (n_frames - 1);
+    let e_left: f32 = left[lo..hi].iter().map(|v| v * v).sum();
+    let e_right: f32 = right[lo..hi].iter().map(|v| v * v).sum();
+    assert!(e_left > 1e-3, "LM=2 stereo L silent: e={e_left}");
+    assert!(e_right > 1e-3, "LM=2 stereo R silent: e={e_right}");
+}
+
+#[test]
+fn lm2_constructor_rejects_unsupported_frame_size() {
+    let params = build_params(1);
+    // 240 (LM=1) and 120 (LM=0) are RFC-valid CELT modes but this
+    // encoder/decoder pair only supports the two Opus-relevant LMs.
+    assert!(CeltEncoder::new_with_frame_samples(&params, 240).is_err());
+    assert!(CeltDecoder::new_with_frame_samples(&params, 240).is_err());
+    assert!(CeltEncoder::new_with_frame_samples(&params, 120).is_err());
+    assert!(CeltDecoder::new_with_frame_samples(&params, 120).is_err());
+    // 720 — random non-power-of-two size, also rejected.
+    assert!(CeltEncoder::new_with_frame_samples(&params, 720).is_err());
+    assert!(CeltDecoder::new_with_frame_samples(&params, 720).is_err());
+}

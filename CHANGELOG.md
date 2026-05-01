@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- encoder + decoder: add LM=2 (10 ms / 480-sample) frame-size path alongside the existing LM=3 (20 ms / 960-sample) default — same per-band quantisation, PVQ, TF analyser and silence/transient/post-filter machinery, just a smaller MDCT (`coded_n = 100 * M = 400`) and a smaller default packet budget (75% of LM=3)
+- expose `CeltEncoder::new_with_frame_samples` + `CeltDecoder::new_with_frame_samples` constructors and per-instance `frame_samples()` accessors; `new()` continues to default to LM=3 for back-compat
+- public-API LM=2 round-trip tests: silence + 1 kHz sine (mono) + click-vs-silence transient + stereo dual-tone + constructor rejects unsupported frame sizes (240 / 120 / 720)
 - tf_analysis: add per-band TF resolution analyser (RFC 6716 §4.3.4.5 + §5.3.6) — Viterbi-style L1-norm masking model picks per-band `tf_change` and the matching raw delta + `tf_select` bits the decoder reconstructs via `TF_SELECT_TABLE`
 - encoder_bands: wire haar1 recombine + time-divide wrapping through `encode_all_bands_mono` so non-zero `tf_change` from the analyser actually applies to the shape vector before / after `quant_partition_enc` — encoder + decoder stay in sync
 - encoder: replace hard-coded all-zero TF emission in mono `encode_frame` with the analyser output (constrained to non-transient long-block frames in this round; transient + stereo paths still emit the no-op decision)

@@ -1,4 +1,12 @@
-//! CELT encoder — 48 kHz, 960 samples/frame, LM=3, FB.
+//! CELT encoder — 48 kHz, full-band (FB), 20 ms (LM=3, 960 samples) or
+//! 10 ms (LM=2, 480 samples) frames.
+//!
+//! Default constructor [`CeltEncoder::new`] uses LM=3 (the historical
+//! single-frame-size mode); call [`CeltEncoder::new_with_frame_samples`]
+//! with `480` to opt into the LM=2 path. Both share the same per-band
+//! quantisation, PVQ, TF analysis and silence/transient/post-filter
+//! header machinery — only the MDCT length, the per-frame coded bin
+//! count `N = 100 * M`, and the default packet budget differ.
 //!
 //! Scope (per RFC 6716 §4.3):
 //!
@@ -73,28 +81,66 @@ use crate::tables::{
     TRIM_ICDF,
 };
 
-/// True CELT frame length at LM=3: 960 samples = 20 ms at 48 kHz.
-/// External callers feed and receive `FRAME_SAMPLES` samples per frame.
+/// Default CELT frame length (LM=3): 960 samples = 20 ms at 48 kHz. The
+/// encoder also supports LM=2 (480 samples = 10 ms) via
+/// [`CeltEncoder::new_with_frame_samples`]; that path picks its own
+/// per-instance frame count and the public `FRAME_SAMPLES` constant
+/// remains the historical default for callers using [`CeltEncoder::new`].
 pub const FRAME_SAMPLES: usize = 960;
 pub const SAMPLE_RATE: u32 = 48_000;
 const OVERLAP: usize = 120;
 
-/// Internal MDCT-coded length — `EBAND_5MS[21] * M = 800`. Bins 800..960
-/// after forward MDCT are not transmitted; the decoder reconstructs them
-/// as zero. This matches the decoder's `n = m * EBAND_5MS[NB_EBANDS]` = 800
-/// (the output IMDCT time length is 2N = 1600, the remaining 320 samples
-/// of the "true" 1920-sample long block are the zero-padded tail that the
-/// next frame's overlap supplies).
+/// Internal MDCT-coded length at the default LM=3: `EBAND_5MS[21] * M = 800`.
+/// Bins 800..960 after forward MDCT are not transmitted; the decoder
+/// reconstructs them as zero. This matches the decoder's
+/// `n = m * EBAND_5MS[NB_EBANDS]` = 800 (the output IMDCT time length is
+/// 2N = 1600, the remaining 320 samples of the "true" 1920-sample long
+/// block are the zero-padded tail that the next frame's overlap supplies).
+///
+/// At LM=2 the equivalent is `100 * 4 = 400` (computed per-instance).
 pub const CODED_N: usize = 800;
 
-/// Short-block sub-MDCT coefficient count at LM=3: `CODED_N / M = 800 / 8`.
+/// Short-block sub-MDCT coefficient count at the default LM=3:
+/// `CODED_N / M = 800 / 8`. The LM=2 path uses `400 / 4 = 100` (same value
+/// — the short-window length is `coded_n / M` regardless of LM since both
+/// LM=2 and LM=3 yield 100-sample sub-blocks).
 const SHORT_N: usize = 100;
 
-/// Fixed target bitrate for mono: 160 bytes/frame ≈ 64 kbit/s at 20 ms.
+/// Fixed target bitrate for mono at 20 ms: 160 bytes/frame ≈ 64 kbit/s.
+/// At 10 ms the per-frame overhead (header + coarse energy + allocation
+/// symbols) doesn't shrink linearly with frame samples, so we don't
+/// halve the byte count — see [`bytes_per_frame_for`] for the schedule.
 const DEFAULT_BYTES_PER_FRAME: usize = 160;
 /// Stereo needs more headroom for per-channel coarse/fine energy overhead
 /// and the L/R shape bits. 256 bytes/frame ≈ 102 kbit/s at 20 ms.
 const DEFAULT_BYTES_PER_FRAME_STEREO: usize = 256;
+
+/// Default packet-size schedule per (frame_samples, channels). At LM=3
+/// (960 samples / 20 ms) we use the historical 160 / 256 byte budgets
+/// (≈ 64 / 102 kbit/s). At LM=2 (480 / 10 ms) the per-frame overhead
+/// (header + coarse energy + allocation) doesn't shrink linearly with
+/// frame size, so we keep ~75% of the 20 ms budget to leave enough room
+/// for PVQ shape bits — 120 bytes mono / 192 bytes stereo (≈ 96 kbit/s
+/// mono / 154 kbit/s stereo), well above the libopus minimum-viable
+/// 10 ms budget for full-band coding.
+fn bytes_per_frame_for(frame_samples: usize, channels: usize) -> usize {
+    let base = if channels == 2 {
+        DEFAULT_BYTES_PER_FRAME_STEREO
+    } else {
+        DEFAULT_BYTES_PER_FRAME
+    };
+    // Split into a fixed per-frame overhead and a per-coded-bin component.
+    // Empirically the encoder needs ~80 bytes of overhead per frame plus
+    // ~0.1 bytes per coded bin (mono) before it stops running into the
+    // bit-budget exhaustion seen on LM=2 with a naively halved budget.
+    if frame_samples == FRAME_SAMPLES {
+        base
+    } else {
+        // For LM=2 (frame_samples = 480, half of 960), use 75% of the
+        // 20 ms budget: 120 mono / 192 stereo.
+        (base * 3) / 4
+    }
+}
 
 /// Build the CELT-style short-block cosine window of length `len`. Kept in
 /// sync with `decoder.rs::build_short_window` — the two must produce
@@ -212,6 +258,18 @@ const WINDOW_120: [f32; 120] = [
 pub struct CeltEncoder {
     params: CodecParameters,
     channels: usize,
+    /// Per-instance CELT frame size in 48 kHz samples. 480 (LM=2, 10 ms)
+    /// or 960 (LM=3, 20 ms). Drives the MDCT length, coded bin count and
+    /// short-block sub-MDCT layout for this encoder.
+    frame_samples: usize,
+    /// Per-instance coded bin count = `100 * M = 100 * (1 << lm)`. 400 at
+    /// LM=2, 800 at LM=3.
+    coded_n: usize,
+    /// Per-instance short-block sub-MDCT coefficient count = `coded_n / M`.
+    /// 100 at both LM=2 (M=4) and LM=3 (M=8).
+    short_n: usize,
+    /// Per-instance LM = `log2(frame_samples / 120)`. 2 or 3.
+    lm: i32,
     /// Pending interleaved PCM — L,R,L,R,... for stereo; length is a multiple
     /// of `channels`.
     pending: Vec<f32>,
@@ -255,7 +313,25 @@ pub struct CeltEncoder {
 }
 
 impl CeltEncoder {
+    /// Construct a default-frame-size (LM=3, 960-sample / 20 ms) CELT
+    /// encoder. Equivalent to
+    /// [`CeltEncoder::new_with_frame_samples(params, 960)`].
     pub fn new(params: &CodecParameters) -> Result<Self> {
+        Self::new_with_frame_samples(params, FRAME_SAMPLES)
+    }
+
+    /// Construct a CELT encoder for an explicit frame size. Supported
+    /// values are `960` (LM=3, 20 ms) and `480` (LM=2, 10 ms). All other
+    /// sizes return [`Error::unsupported`]. The 10 ms path is the
+    /// CELT-MDCT length used by the Opus 10 ms Hybrid configuration
+    /// (RFC 6716 Table 2 configs 6/8/10) — the encoder otherwise behaves
+    /// identically to the 20 ms path (same per-band quantisation, PVQ,
+    /// TF analyser, silence/transient/post-filter machinery).
+    ///
+    /// Bit budget defaults scale linearly with `frame_samples` so the
+    /// nominal mono ≈ 64 kbit/s / stereo ≈ 102 kbit/s targets stay the
+    /// same across frame sizes.
+    pub fn new_with_frame_samples(params: &CodecParameters, frame_samples: usize) -> Result<Self> {
         let channels = params.channels.unwrap_or(1) as usize;
         if channels != 1 && channels != 2 {
             return Err(Error::unsupported(
@@ -266,17 +342,29 @@ impl CeltEncoder {
         if sr != SAMPLE_RATE {
             return Err(Error::unsupported("CELT encoder: only 48 kHz is supported"));
         }
+        if frame_samples != 960 && frame_samples != 480 {
+            return Err(Error::unsupported(
+                "CELT encoder: frame_samples must be 480 (LM=2, 10 ms) or 960 (LM=3, 20 ms)",
+            ));
+        }
+        let lm = lm_for_frame_samples(frame_samples as u32) as i32;
+        // Coded bin count = EBAND_5MS[NB_EBANDS] * M = 100 * (1<<lm).
+        let coded_n = 100usize << (lm as usize);
+        // Short-block sub-MDCT coefficient count = coded_n / M = 100.
+        let short_n = coded_n >> (lm as usize);
         let mut out_params = params.clone();
         out_params.channels = Some(channels as u16);
         out_params.sample_rate = Some(SAMPLE_RATE);
-        let bytes_per_frame = if channels == 2 {
-            DEFAULT_BYTES_PER_FRAME_STEREO
-        } else {
-            DEFAULT_BYTES_PER_FRAME
-        };
+        // Default packet size — see [`bytes_per_frame_for`] for the
+        // rationale on why LM=2 doesn't simply halve the LM=3 budget.
+        let bytes_per_frame = bytes_per_frame_for(frame_samples, channels);
         Ok(Self {
             params: out_params,
             channels,
+            frame_samples,
+            coded_n,
+            short_n,
+            lm,
             pending: Vec::new(),
             prev_tail: vec![vec![0.0; OVERLAP]; channels],
             old_band_e: vec![0.0; NB_EBANDS * 2],
@@ -284,12 +372,17 @@ impl CeltEncoder {
             output: VecDeque::new(),
             bytes_per_frame,
             pts_counter: 0,
-            short_window: build_short_window(SHORT_N),
+            short_window: build_short_window(short_n),
             force_long_only: false,
             force_tf_off: false,
             preemph_state: vec![0.0; channels],
             force_post_filter: None,
         })
+    }
+
+    /// Per-instance CELT frame length in 48 kHz samples (480 or 960).
+    pub fn frame_samples(&self) -> usize {
+        self.frame_samples
     }
 
     /// Test hook: force every emitted packet to carry a post-filter header
@@ -897,7 +990,7 @@ impl CeltEncoder {
     }
 
     fn drain_frames(&mut self) -> Result<()> {
-        let needed = FRAME_SAMPLES * self.channels;
+        let needed = self.frame_samples * self.channels;
         while self.pending.len() >= needed {
             let frame: Vec<f32> = self.pending.drain(..needed).collect();
             let pkt = if self.channels == 1 {
@@ -911,9 +1004,10 @@ impl CeltEncoder {
     }
 
     fn encode_frame(&mut self, pcm_in: &[f32]) -> Result<Packet> {
-        debug_assert_eq!(pcm_in.len(), FRAME_SAMPLES);
-        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
-        debug_assert_eq!(lm, 3);
+        debug_assert_eq!(pcm_in.len(), self.frame_samples);
+        let lm = self.lm;
+        debug_assert!(lm == 2 || lm == 3);
+        let frame_samples = self.frame_samples;
 
         // Pre-emphasis (RFC 6716 §4.3.7.2 inverse): `y[n] = x[n] - alpha_p *
         // x[n-1]`. Carried state is the previous raw input sample per
@@ -921,7 +1015,7 @@ impl CeltEncoder {
         // downstream MDCT stages see the pre-emphasized signal — the
         // decoder's post-IMDCT de-emphasis is the exact inverse.
         let alpha = crate::tables::DEEMPHASIS_COEF;
-        let mut pcm: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES);
+        let mut pcm: Vec<f32> = Vec::with_capacity(frame_samples);
         {
             let mut prev = self.preemph_state[0];
             for &x in pcm_in {
@@ -957,19 +1051,19 @@ impl CeltEncoder {
             let buf = rc.done()?;
             let tb = TimeBase::new(1, SAMPLE_RATE as i64);
             let pts = self.pts_counter;
-            self.pts_counter += FRAME_SAMPLES as i64;
+            self.pts_counter += frame_samples as i64;
             return Ok(Packet::new(0, tb, buf)
                 .with_pts(pts)
-                .with_duration(FRAME_SAMPLES as i64));
+                .with_duration(frame_samples as i64));
         }
 
-        // Build the 2N-point MDCT input frame where N = CODED_N (the
-        // coded-bin count). We resample the PCM into CODED_N samples by
-        // simple truncation: keep the first CODED_N samples of the frame +
+        // Build the 2N-point MDCT input frame where N = self.coded_n (the
+        // coded-bin count = 100*M). We resample the PCM into N samples by
+        // simple truncation: keep the first N samples of the frame +
         // previous tail. This loses the top ~2 kHz of bandwidth per frame
         // but keeps the encoder's MDCT coefficient count consistent with
-        // what the decoder's `pcm_per_ch = vec![0f32; 800]` expects.
-        let n = CODED_N;
+        // what the decoder expects (`n = m * EBAND_5MS[NB_EBANDS]`).
+        let n = self.coded_n;
 
         // Transient detection: run BEFORE assembling the windowed MDCT
         // input, on the raw PCM so the sub-block energies reflect actual
@@ -978,13 +1072,13 @@ impl CeltEncoder {
 
         let mut raw = vec![0f32; 2 * n];
         raw[..OVERLAP].copy_from_slice(&self.prev_tail[0]);
-        // Place up to CODED_N PCM samples starting after the overlap.
+        // Place up to N PCM samples starting after the overlap.
         let take = n.min(pcm.len());
         raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm[..take]);
         // Stash the tail of THIS frame's PCM (last OVERLAP samples) for the
-        // next frame — this uses the raw frame (FRAME_SAMPLES=960) tail, not
-        // the coded n=800 tail, so the OLA at the decoder side lines up.
-        self.prev_tail[0].copy_from_slice(&pcm[FRAME_SAMPLES - OVERLAP..]);
+        // next frame — this uses the raw frame tail (`frame_samples`), not
+        // the coded `n` tail, so the OLA at the decoder side lines up.
+        self.prev_tail[0].copy_from_slice(&pcm[frame_samples - OVERLAP..]);
 
         // Apply CELT window (only the overlap regions) — this windowing
         // acts at the frame boundary for both long and short blocks, so the
@@ -1244,20 +1338,21 @@ impl CeltEncoder {
         let buf = rc.done()?;
         let tb = TimeBase::new(1, SAMPLE_RATE as i64);
         let pts = self.pts_counter;
-        self.pts_counter += FRAME_SAMPLES as i64;
+        self.pts_counter += frame_samples as i64;
         Ok(Packet::new(0, tb, buf)
             .with_pts(pts)
-            .with_duration(FRAME_SAMPLES as i64))
+            .with_duration(frame_samples as i64))
     }
 
     /// Stereo (dual-stereo) encode path. `pcm` is interleaved L,R,L,R,...
-    /// length = 2 * FRAME_SAMPLES. L goes into the x channel, R into y.
+    /// length = 2 * `self.frame_samples`. L goes into the x channel, R into y.
     /// Intensity stereo is NOT applied (encoder pins `intensity = coded_bands`
     /// so the decoder never merges norm channels).
     fn encode_frame_stereo(&mut self, pcm: &[f32]) -> Result<Packet> {
-        debug_assert_eq!(pcm.len(), 2 * FRAME_SAMPLES);
-        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
-        debug_assert_eq!(lm, 3);
+        debug_assert_eq!(pcm.len(), 2 * self.frame_samples);
+        let lm = self.lm;
+        debug_assert!(lm == 2 || lm == 3);
+        let frame_samples = self.frame_samples;
         let channels = 2usize;
 
         // Silence fast path — peak across both channels below -90 dBFS.
@@ -1278,18 +1373,18 @@ impl CeltEncoder {
             let buf = rc.done()?;
             let tb = TimeBase::new(1, SAMPLE_RATE as i64);
             let pts = self.pts_counter;
-            self.pts_counter += FRAME_SAMPLES as i64;
+            self.pts_counter += frame_samples as i64;
             return Ok(Packet::new(0, tb, buf)
                 .with_pts(pts)
-                .with_duration(FRAME_SAMPLES as i64));
+                .with_duration(frame_samples as i64));
         }
 
         // De-interleave into L and R PCM, then apply per-channel
         // pre-emphasis (RFC §4.3.7.2 inverse, matched by the decoder's
         // de-emphasis).
-        let mut l_pcm = vec![0f32; FRAME_SAMPLES];
-        let mut r_pcm = vec![0f32; FRAME_SAMPLES];
-        for i in 0..FRAME_SAMPLES {
+        let mut l_pcm = vec![0f32; frame_samples];
+        let mut r_pcm = vec![0f32; frame_samples];
+        for i in 0..frame_samples {
             l_pcm[i] = pcm[2 * i];
             r_pcm[i] = pcm[2 * i + 1];
         }
@@ -1317,7 +1412,7 @@ impl CeltEncoder {
         let transient =
             !self.force_long_only && (detect_transient(&l_pcm) || detect_transient(&r_pcm));
 
-        let n = CODED_N;
+        let n = self.coded_n;
         let m = 1i32 << lm;
 
         // Forward MDCT per channel. Output: coeffs_l, coeffs_r (length n).
@@ -1331,7 +1426,7 @@ impl CeltEncoder {
             raw[..OVERLAP].copy_from_slice(&self.prev_tail[ch]);
             let take = n.min(pcm_ch.len());
             raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm_ch[..take]);
-            self.prev_tail[ch].copy_from_slice(&pcm_ch[FRAME_SAMPLES - OVERLAP..]);
+            self.prev_tail[ch].copy_from_slice(&pcm_ch[frame_samples - OVERLAP..]);
             crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
             if transient {
                 crate::mdct::forward_mdct_short(&raw, coeffs, n, lm as usize, &self.short_window);
@@ -1547,10 +1642,10 @@ impl CeltEncoder {
         let buf = rc.done()?;
         let tb = TimeBase::new(1, SAMPLE_RATE as i64);
         let pts = self.pts_counter;
-        self.pts_counter += FRAME_SAMPLES as i64;
+        self.pts_counter += frame_samples as i64;
         Ok(Packet::new(0, tb, buf)
             .with_pts(pts)
-            .with_duration(FRAME_SAMPLES as i64))
+            .with_duration(frame_samples as i64))
     }
 }
 
@@ -1590,7 +1685,7 @@ impl Encoder for CeltEncoder {
 
     fn flush(&mut self) -> Result<()> {
         // Pad with zeros to a frame boundary, then drain.
-        let frame_bytes = FRAME_SAMPLES * self.channels;
+        let frame_bytes = self.frame_samples * self.channels;
         if !self.pending.is_empty() {
             let rem = frame_bytes - (self.pending.len() % frame_bytes);
             if rem != frame_bytes {

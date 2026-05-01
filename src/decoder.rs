@@ -1,4 +1,12 @@
-//! CELT decoder — 48 kHz, 960 samples/frame, LM=3, FB.
+//! CELT decoder — 48 kHz, full-band, 20 ms (LM=3, 960 samples) or 10 ms
+//! (LM=2, 480 samples) frames.
+//!
+//! Default constructor [`CeltDecoder::new`] selects the historical 20 ms
+//! / LM=3 path. Pair it with the matching encoder constructor —
+//! [`crate::encoder::CeltEncoder::new`]. For the 10 ms path used by
+//! Opus 10 ms Hybrid (RFC 6716 Table 2 configs 6/8/10), use
+//! [`CeltDecoder::new_with_frame_samples`] with `480` and
+//! [`crate::encoder::CeltEncoder::new_with_frame_samples`] in lock-step.
 //!
 //! Scope matches what the in-crate encoder emits (RFC 6716 §4.3): mono or
 //! dual-stereo, both long and short (transient) blocks, with comb-filter
@@ -31,17 +39,24 @@ use crate::tables::{
     SPREAD_NORMAL, TF_SELECT_TABLE, TRIM_ICDF,
 };
 
+/// Default CELT frame length (LM=3): 960 samples = 20 ms at 48 kHz.
+/// 10 ms (LM=2, 480 samples) is also supported via
+/// [`CeltDecoder::new_with_frame_samples`]; this constant remains the
+/// historical default for callers using [`CeltDecoder::new`].
 pub const FRAME_SAMPLES: usize = 960;
 pub const SAMPLE_RATE: u32 = 48_000;
 const OVERLAP: usize = 120;
-/// Internal MDCT coefficient count: `EBAND_5MS[21] * M = 100 * 8 = 800` at
-/// LM=3. The long-block IMDCT produces 2N=1600 time-domain samples; the
-/// remaining 2*(FRAME_SAMPLES - CODED_N) = 320 at the far edges of the true
-/// 1920-sample long window are zero-filled and contribute nothing, matching
-/// the encoder's convention.
+/// Internal MDCT coefficient count at the default LM=3:
+/// `EBAND_5MS[21] * M = 100 * 8 = 800`. The long-block IMDCT produces
+/// 2N=1600 time-domain samples; the remaining `2*(FRAME_SAMPLES - CODED_N)
+/// = 320` at the far edges of the true 1920-sample long window are
+/// zero-filled and contribute nothing, matching the encoder's convention.
+/// At LM=2 the equivalent is `100 * 4 = 400` (computed per-instance).
 const CODED_N: usize = 800;
-/// Short sub-block coefficient count at LM=3, i.e. `CODED_N / M = 800 / 8`.
-/// Each short sub-block runs a 200→100 MDCT with a 100-sample cosine window.
+/// Short sub-block coefficient count at the default LM=3, i.e.
+/// `CODED_N / M = 800 / 8`. Each short sub-block runs a 200→100 MDCT with
+/// a 100-sample cosine window. LM=2 produces the same value
+/// (`400 / 4 = 100`).
 const SHORT_N: usize = 100;
 
 /// Build the CELT-style short-block cosine window of length `len`. Uses the
@@ -89,6 +104,17 @@ const WINDOW_120: [f32; 120] = [
 pub struct CeltDecoder {
     params: CodecParameters,
     channels: usize,
+    /// Per-instance CELT frame size in 48 kHz samples (480 or 960). Drives
+    /// the IMDCT length, coded bin count and short-block sub-MDCT layout.
+    frame_samples: usize,
+    /// Per-instance coded bin count = `100 * M = 100 * (1 << lm)`. 400 at
+    /// LM=2, 800 at LM=3.
+    coded_n: usize,
+    /// Per-instance short-block sub-MDCT coefficient count = `coded_n / M`
+    /// = 100 at both supported LMs.
+    short_n: usize,
+    /// Per-instance LM = `log2(frame_samples / 120)`. 2 or 3.
+    lm: i32,
     old_band_e: Vec<f32>,
     /// Two frames of prior quantised log-energy, used by §4.3.5 anti-collapse.
     /// Layout: `channels * NB_EBANDS` per slot.
@@ -117,7 +143,22 @@ pub struct CeltDecoder {
 }
 
 impl CeltDecoder {
+    /// Construct a default-frame-size (LM=3, 960-sample / 20 ms) CELT
+    /// decoder. Equivalent to
+    /// [`CeltDecoder::new_with_frame_samples(params, 960)`].
     pub fn new(params: &CodecParameters) -> Result<Self> {
+        Self::new_with_frame_samples(params, FRAME_SAMPLES)
+    }
+
+    /// Construct a CELT decoder for an explicit frame size. Supported
+    /// values are `960` (LM=3, 20 ms) and `480` (LM=2, 10 ms). All other
+    /// sizes return [`Error::unsupported`]. Pair this with the matching
+    /// encoder constructor —
+    /// [`crate::encoder::CeltEncoder::new_with_frame_samples`] — and feed
+    /// the decoder packets emitted by an encoder of the same frame size.
+    /// The 10 ms path is the CELT-MDCT length used by the Opus 10 ms
+    /// Hybrid configuration (RFC 6716 Table 2 configs 6/8/10).
+    pub fn new_with_frame_samples(params: &CodecParameters, frame_samples: usize) -> Result<Self> {
         let channels = params.channels.unwrap_or(1) as usize;
         if channels != 1 && channels != 2 {
             return Err(Error::unsupported(
@@ -128,6 +169,14 @@ impl CeltDecoder {
         if sr != SAMPLE_RATE {
             return Err(Error::unsupported("CELT decoder: only 48 kHz is supported"));
         }
+        if frame_samples != 960 && frame_samples != 480 {
+            return Err(Error::unsupported(
+                "CELT decoder: frame_samples must be 480 (LM=2, 10 ms) or 960 (LM=3, 20 ms)",
+            ));
+        }
+        let lm = lm_for_frame_samples(frame_samples as u32) as i32;
+        let coded_n = 100usize << (lm as usize);
+        let short_n = coded_n >> (lm as usize);
         let mut out_params = params.clone();
         out_params.channels = Some(channels as u16);
         out_params.sample_rate = Some(SAMPLE_RATE);
@@ -135,6 +184,10 @@ impl CeltDecoder {
         Ok(Self {
             params: out_params,
             channels,
+            frame_samples,
+            coded_n,
+            short_n,
+            lm,
             old_band_e: vec![0.0; NB_EBANDS * 2],
             prev1_log_e: vec![0.0; NB_EBANDS * 2],
             prev2_log_e: vec![0.0; NB_EBANDS * 2],
@@ -142,7 +195,7 @@ impl CeltDecoder {
             rng: 0,
             output: VecDeque::new(),
             pts_counter: 0,
-            short_window: build_short_window(SHORT_N),
+            short_window: build_short_window(short_n),
             pf_period_old: vec![0; channels],
             pf_gain_old: vec![0.0; channels],
             pf_tapset_old: vec![0; channels],
@@ -151,9 +204,15 @@ impl CeltDecoder {
         })
     }
 
+    /// Per-instance CELT frame length in 48 kHz samples (480 or 960).
+    pub fn frame_samples(&self) -> usize {
+        self.frame_samples
+    }
+
     fn decode_frame_mono(&mut self, bytes: &[u8]) -> Result<Vec<f32>> {
         let mut rc = RangeDecoder::new(bytes);
-        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+        let lm = self.lm;
+        let frame_samples = self.frame_samples;
         let end_band = NB_EBANDS;
         let start_band = 0usize;
 
@@ -171,9 +230,9 @@ impl CeltDecoder {
                 // Silence still ages the post-filter state: no new params,
                 // next frame treats this frame's silent tail as history. We
                 // keep `pf_*_old` (which govern this frame's crossfade) and
-                // slide the comb-filter history forward by one FRAME_SAMPLES
+                // slide the comb-filter history forward by one frame
                 // of zeros. Deemphasis state decays to zero naturally.
-                let zeros = vec![0.0f32; FRAME_SAMPLES];
+                let zeros = vec![0.0f32; frame_samples];
                 let mut out = zeros.clone();
                 self.run_postfilter_and_deemph(0, &mut out, 0, 0.0, 0);
                 return Ok(out);
@@ -394,9 +453,9 @@ impl CeltDecoder {
         );
 
         let sub_n = n;
-        let mut raw = vec![0f32; 2 * FRAME_SAMPLES];
+        let mut raw = vec![0f32; 2 * frame_samples];
         if transient {
-            // 8 × short_n-point IMDCTs interleaved into `freq`, then OLA
+            // M × short_n-point IMDCTs interleaved into `freq`, then OLA
             // across the M sub-blocks into `raw`. The caller-side front
             // and back overlap with the previous/next frame uses the long
             // window (120 taps).
@@ -415,17 +474,17 @@ impl CeltDecoder {
             raw[..2 * sub_n].copy_from_slice(&raw_coded);
         }
 
-        let mut out = vec![0f32; FRAME_SAMPLES];
+        let mut out = vec![0f32; frame_samples];
         for i in 0..OVERLAP {
             let w = WINDOW_120[i];
             out[i] = self.prev_tail[0][i] + w * raw[i];
         }
-        for i in OVERLAP..FRAME_SAMPLES {
+        for i in OVERLAP..frame_samples {
             out[i] = raw[i];
         }
         for i in 0..OVERLAP {
             let w = WINDOW_120[OVERLAP - 1 - i];
-            self.prev_tail[0][i] = w * raw[FRAME_SAMPLES + i];
+            self.prev_tail[0][i] = w * raw[frame_samples + i];
         }
         // Post-filter (RFC §4.3.7.1) + de-emphasis (§4.3.7.2), and roll
         // comb-filter history + deemph state.
@@ -438,7 +497,8 @@ impl CeltDecoder {
 
     fn decode_frame_stereo(&mut self, bytes: &[u8]) -> Result<(Vec<f32>, Vec<f32>)> {
         let mut rc = RangeDecoder::new(bytes);
-        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+        let lm = self.lm;
+        let frame_samples = self.frame_samples;
         let end_band = NB_EBANDS;
         let start_band = 0usize;
         let channels = 2usize;
@@ -457,8 +517,8 @@ impl CeltDecoder {
                 // Silence path: still age the post-filter history + deemph
                 // state by running an all-zero frame through them (see the
                 // mono silence path for rationale).
-                let mut zl = vec![0.0f32; FRAME_SAMPLES];
-                let mut zr = vec![0.0f32; FRAME_SAMPLES];
+                let mut zl = vec![0.0f32; frame_samples];
+                let mut zr = vec![0.0f32; frame_samples];
                 self.run_postfilter_and_deemph(0, &mut zl, 0, 0.0, 0);
                 self.run_postfilter_and_deemph(1, &mut zr, 0, 0.0, 0);
                 return Ok((zl, zr));
@@ -695,10 +755,10 @@ impl CeltDecoder {
         );
 
         let sub_n = n;
-        let mut out_l = vec![0f32; FRAME_SAMPLES];
-        let mut out_r = vec![0f32; FRAME_SAMPLES];
+        let mut out_l = vec![0f32; frame_samples];
+        let mut out_r = vec![0f32; frame_samples];
         for (ch, freq, out) in [(0usize, &freq_l, &mut out_l), (1usize, &freq_r, &mut out_r)] {
-            let mut raw = vec![0f32; 2 * FRAME_SAMPLES];
+            let mut raw = vec![0f32; 2 * frame_samples];
             if transient {
                 let mut raw_coded = vec![0f32; 2 * sub_n];
                 imdct_sub_short(freq, &mut raw_coded, sub_n, lm as usize, &self.short_window);
@@ -712,12 +772,12 @@ impl CeltDecoder {
                 let w = WINDOW_120[i];
                 out[i] = self.prev_tail[ch][i] + w * raw[i];
             }
-            for i in OVERLAP..FRAME_SAMPLES {
+            for i in OVERLAP..frame_samples {
                 out[i] = raw[i];
             }
             for i in 0..OVERLAP {
                 let w = WINDOW_120[OVERLAP - 1 - i];
-                self.prev_tail[ch][i] = w * raw[FRAME_SAMPLES + i];
+                self.prev_tail[ch][i] = w * raw[frame_samples + i];
             }
         }
         // Post-filter + de-emphasis on each channel. Both channels share the
@@ -814,18 +874,19 @@ impl Decoder for CeltDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
+        let frame_samples = self.frame_samples;
         if self.channels == 1 {
             let pcm = self.decode_frame_mono(&packet.data)?;
-            let frame = self.build_audio_frame(pcm, FRAME_SAMPLES);
+            let frame = self.build_audio_frame(pcm, frame_samples);
             self.output.push_back(frame);
         } else {
             let (l, r) = self.decode_frame_stereo(&packet.data)?;
-            let mut interleaved = Vec::with_capacity(FRAME_SAMPLES * 2);
-            for i in 0..FRAME_SAMPLES {
+            let mut interleaved = Vec::with_capacity(frame_samples * 2);
+            for i in 0..frame_samples {
                 interleaved.push(l[i]);
                 interleaved.push(r[i]);
             }
-            let frame = self.build_audio_frame(interleaved, FRAME_SAMPLES);
+            let frame = self.build_audio_frame(interleaved, frame_samples);
             self.output.push_back(frame);
         }
         Ok(())
