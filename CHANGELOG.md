@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- encoder: extend `encode_hybrid_body_mono` + `encode_hybrid_body_stereo` to honour the per-instance `self.frame_samples` / `self.coded_n` / `self.lm` so the LM=2 (480-sample / 10 ms) hybrid path now lights up alongside the LM=3 (960-sample / 20 ms) one — same band selection, MDCT plumbing, and bit-budget logic, just driven off the per-instance frame size. Required for Opus 10 ms Hybrid (configs 12 / 14) wiring in `oxideav-opus`.
 - encoder + decoder: add LM=2 (10 ms / 480-sample) frame-size path alongside the existing LM=3 (20 ms / 960-sample) default — same per-band quantisation, PVQ, TF analyser and silence/transient/post-filter machinery, just a smaller MDCT (`coded_n = 100 * M = 400`) and a smaller default packet budget (75% of LM=3)
 - expose `CeltEncoder::new_with_frame_samples` + `CeltDecoder::new_with_frame_samples` constructors and per-instance `frame_samples()` accessors; `new()` continues to default to LM=3 for back-compat
 - public-API LM=2 round-trip tests: silence + 1 kHz sine (mono) + click-vs-silence transient + stereo dual-tone + constructor rejects unsupported frame sizes (240 / 120 / 720)

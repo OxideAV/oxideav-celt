@@ -419,11 +419,12 @@ impl CeltEncoder {
     /// 6716 §4.4) into the caller-provided `RangeEncoder`. This is the
     /// encoder-side mirror of `decode_celt_body` with `start_band=17`.
     ///
-    /// * `pcm_in` — 960 samples (20 ms) of mono 48 kHz PCM. Only the
-    ///   high-band content is meaningful — bands 0..17 (0..8 kHz) are
-    ///   skipped so the caller is responsible for filtering / SILK-
-    ///   covering that region. We still take the full-band PCM since
-    ///   the MDCT operates on it before the band-energy split.
+    /// * `pcm_in` — `self.frame_samples` samples (480 for LM=2 / 10 ms,
+    ///   960 for LM=3 / 20 ms) of mono 48 kHz PCM. Only the high-band
+    ///   content is meaningful — bands 0..17 (0..8 kHz) are skipped so
+    ///   the caller is responsible for filtering / SILK-covering that
+    ///   region. We still take the full-band PCM since the MDCT
+    ///   operates on it before the band-energy split.
     /// * `enc` — in-flight range encoder shared with the SILK low band.
     ///   Must already contain the SILK frame body. The CELT body is
     ///   appended in place; callers call `enc.done()` after this returns.
@@ -436,8 +437,12 @@ impl CeltEncoder {
     /// State (`old_band_e`, `prev_tail`, `preemph_state`, `first_frame`)
     /// is updated as in [`Self::encode_frame`] — bands below `start_band`
     /// are kept at their previous value (we only touch `start_band..end_band`,
-    /// matching the decoder's behaviour). Frame size is 20 ms only;
-    /// 10 ms hybrid (configs 12, 14) is a tracked follow-up.
+    /// matching the decoder's behaviour). Frame size follows the encoder
+    /// instance: 960 samples / 20 ms (LM=3) for encoders built via
+    /// [`CeltEncoder::new`] or [`CeltEncoder::new_with_frame_samples(_,
+    /// 960)`], 480 samples / 10 ms (LM=2) when built via
+    /// [`CeltEncoder::new_with_frame_samples(_, 480)`] (configs 12 / 14
+    /// hybrid).
     pub fn encode_hybrid_body_mono(
         &mut self,
         pcm_in: &[f32],
@@ -446,9 +451,9 @@ impl CeltEncoder {
         end_band: usize,
         bytes_remaining_budget: usize,
     ) -> Result<()> {
-        if pcm_in.len() != FRAME_SAMPLES {
+        if pcm_in.len() != self.frame_samples {
             return Err(Error::invalid(
-                "CELT hybrid encoder: only 20 ms (960 samples) frames are supported today",
+                "CELT hybrid encoder: pcm_in length must match self.frame_samples (480 or 960)",
             ));
         }
         if !(start_band < end_band && end_band <= NB_EBANDS) {
@@ -461,12 +466,13 @@ impl CeltEncoder {
                 "CELT hybrid encoder: stereo CELT high-band not implemented",
             ));
         }
-        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+        let lm = self.lm;
+        let frame_samples = self.frame_samples;
 
         // Pre-emphasis — same filter the CELT-only path uses, since the
         // decoder applies the same de-emphasis on the summed Hybrid output.
         let alpha = crate::tables::DEEMPHASIS_COEF;
-        let mut pcm: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES);
+        let mut pcm: Vec<f32> = Vec::with_capacity(frame_samples);
         {
             let mut prev = self.preemph_state[0];
             for &x in pcm_in {
@@ -480,7 +486,7 @@ impl CeltEncoder {
         // Hybrid never emits the silence fast path — the SILK body has
         // already committed to a non-silent frame. Skip the peak gate.
 
-        let n = CODED_N;
+        let n = self.coded_n;
         // Hybrid frames never go transient — the SILK low band carries
         // the speech onset; CELT high band stays long. This keeps the
         // bit budget simple.
@@ -490,7 +496,7 @@ impl CeltEncoder {
         raw[..OVERLAP].copy_from_slice(&self.prev_tail[0]);
         let take = n.min(pcm.len());
         raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm[..take]);
-        self.prev_tail[0].copy_from_slice(&pcm[FRAME_SAMPLES - OVERLAP..]);
+        self.prev_tail[0].copy_from_slice(&pcm[frame_samples - OVERLAP..]);
 
         crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
 
@@ -701,9 +707,10 @@ impl CeltEncoder {
     /// the caller-provided `RangeEncoder`. Mirrors the `decode_celt_body`
     /// path with `channels = 2` and `start_band = 17`.
     ///
-    /// `pcm_in` is **interleaved L,R,L,R...** (length = `2 * FRAME_SAMPLES`).
-    /// The encoder must have been constructed with `channels = 2` so that
-    /// `prev_tail` and `preemph_state` carry per-channel state.
+    /// `pcm_in` is **interleaved L,R,L,R...** (length =
+    /// `2 * self.frame_samples` — 1920 for LM=3 / 20 ms, 960 for LM=2 /
+    /// 10 ms). The encoder must have been constructed with `channels = 2`
+    /// so that `prev_tail` and `preemph_state` carry per-channel state.
     ///
     /// Layout of the emitted bits matches the decoder's hybrid stereo path:
     /// header → coarse energy (both channels) → tf_decode → spread → dynalloc
@@ -722,9 +729,9 @@ impl CeltEncoder {
         end_band: usize,
         bytes_remaining_budget: usize,
     ) -> Result<()> {
-        if pcm_in.len() != 2 * FRAME_SAMPLES {
+        if pcm_in.len() != 2 * self.frame_samples {
             return Err(Error::invalid(
-                "CELT hybrid encoder: stereo path needs 2 * 960 (interleaved) samples",
+                "CELT hybrid encoder: stereo path needs 2 * frame_samples (interleaved) samples",
             ));
         }
         if !(start_band < end_band && end_band <= NB_EBANDS) {
@@ -737,15 +744,16 @@ impl CeltEncoder {
                 "CELT hybrid encoder: stereo path requires channels=2 encoder",
             ));
         }
-        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+        let lm = self.lm;
+        let frame_samples = self.frame_samples;
         let channels = 2usize;
 
         // De-interleave into L and R, applying per-channel pre-emphasis to
         // match the decoder's per-channel de-emphasis on the summed Hybrid
         // output.
-        let mut l_pcm = vec![0f32; FRAME_SAMPLES];
-        let mut r_pcm = vec![0f32; FRAME_SAMPLES];
-        for i in 0..FRAME_SAMPLES {
+        let mut l_pcm = vec![0f32; frame_samples];
+        let mut r_pcm = vec![0f32; frame_samples];
+        for i in 0..frame_samples {
             l_pcm[i] = pcm_in[2 * i];
             r_pcm[i] = pcm_in[2 * i + 1];
         }
@@ -772,7 +780,7 @@ impl CeltEncoder {
         // Hybrid never emits the silence fast path — the SILK body has
         // already committed to a non-silent frame. Skip the peak gate.
 
-        let n = CODED_N;
+        let n = self.coded_n;
         // Hybrid frames never go transient — long blocks only.
         let transient = false;
 
@@ -787,7 +795,7 @@ impl CeltEncoder {
             raw[..OVERLAP].copy_from_slice(&self.prev_tail[ch]);
             let take = n.min(pcm_ch.len());
             raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm_ch[..take]);
-            self.prev_tail[ch].copy_from_slice(&pcm_ch[FRAME_SAMPLES - OVERLAP..]);
+            self.prev_tail[ch].copy_from_slice(&pcm_ch[frame_samples - OVERLAP..]);
             crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
             forward_mdct(&raw, coeffs);
         }
