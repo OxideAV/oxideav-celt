@@ -1,12 +1,15 @@
 //! CELT decoder — 48 kHz, 960 samples/frame, LM=3, FB.
 //!
 //! Scope matches what the in-crate encoder emits (RFC 6716 §4.3): mono or
-//! dual-stereo long-block, non-transient, no post-filter. A packet produced
-//! by a full libopus CELT encoder may exercise paths the decoder here does
-//! not yet cover (transients / short blocks, intensity stereo, post-filter,
-//! band boosts other than zero). Those paths assert on unexpected header
-//! flags so callers see a clear `Error::unsupported` instead of silently
-//! producing garbage.
+//! dual-stereo, both long and short (transient) blocks, with comb-filter
+//! post-filter parsing on packets that carry it. A libopus-produced
+//! CELT packet may still exercise paths this decoder does not yet cover
+//! (intensity stereo, dynalloc band boosts other than zero, sample rates
+//! other than 48 kHz). Those paths take libopus' "decode whatever the
+//! header says" approach but the dispatch assumes the encoder's profile;
+//! mismatches surface as drifted band-energy state rather than a hard
+//! error, which callers can detect via the `peer-was-libopus` flags
+//! upstream.
 //!
 //! For the full Opus decoder (SILK + CELT + hybrid + range-coder framing),
 //! use the `oxideav-opus` crate, which dispatches into these same modules.
@@ -14,9 +17,7 @@
 use std::collections::VecDeque;
 
 use oxideav_core::Decoder;
-use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result,
-};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result};
 
 use crate::bands::{anti_collapse, denormalise_bands, quant_all_bands};
 use crate::header::decode_header;

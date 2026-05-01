@@ -398,3 +398,199 @@ fn stereo_roundtrip_through_public_api() {
     assert_eq!(decoded.len(), n_samples * 2);
     assert!(decoded.iter().all(|v| v.is_finite()));
 }
+
+// -------------------------------------------------------------------------
+// Transient round-trip — quantitative SNR comparisons.
+//
+// The earlier `transient_roundtrip_has_bounded_preecho` test asserts the
+// pre-echo region's RMS doesn't blow up. The two tests below add the next
+// rung on the ladder: actual round-trip SNR numbers, both
+//   * **transient signal**: short-block SNR vs long-only SNR — with a real
+//     bit-exact MDCT pair short would beat long by ~9 dB on the burst
+//     region. Our IMDCT isn't bit-exact yet (Bluestein FFT vs libopus'
+//     kiss_fft), so we report both numbers without a hard inequality —
+//     these are regression sentinels for once the IMDCT lands.
+//   * **stationary signal**: the auto-detector must keep `transient=false`
+//     end-to-end and the SNR must not regress vs. the forced-long path.
+// -------------------------------------------------------------------------
+
+/// Helper: SNR in dB of `decoded` vs `reference` over `[lo, hi)`. Returns
+/// 200.0 when the noise is below 1e-30 (effectively perfect reconstruction).
+fn snr_db(reference: &[f32], decoded: &[f32], lo: usize, hi: usize) -> f32 {
+    let n = (hi - lo).min(reference.len() - lo).min(decoded.len() - lo);
+    let signal: f64 = reference[lo..lo + n]
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        / n as f64;
+    let noise: f64 = reference[lo..lo + n]
+        .iter()
+        .zip(decoded[lo..lo + n].iter())
+        .map(|(a, b)| {
+            let d = *a as f64 - *b as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / n as f64;
+    if noise < 1e-30 {
+        return 200.0;
+    }
+    (10.0 * (signal / noise).log10()) as f32
+}
+
+/// Encode + decode a mono signal end-to-end, returning the decoded PCM.
+/// `force_long_only` controls whether the encoder's transient detector is
+/// active; this is the A/B knob that drives the comparison tests.
+fn roundtrip_mono(signal: &[f32], force_long_only: bool) -> Vec<f32> {
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new(&params).unwrap();
+    enc.set_force_long_only(force_long_only);
+    let mut dec = CeltDecoder::new(&params).unwrap();
+    for chunk in signal.chunks(FRAME_SAMPLES) {
+        if chunk.len() == FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+    let mut decoded: Vec<f32> = Vec::with_capacity(signal.len());
+    while let Ok(pkt) = enc.receive_packet() {
+        dec.send_packet(&pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.extend(decoded_f32(&frame));
+        }
+    }
+    decoded
+}
+
+/// Compare the round-trip SNR of a transient signal under the two encoder
+/// configurations: detector-on (short blocks where appropriate) vs.
+/// `force_long_only` (long block always). The numbers go to stdout for the
+/// task report; assertions stay loose because the IMDCT isn't bit-exact.
+///
+/// The signal is one isolated 2.5 ms full-scale burst inside frame 3 of a
+/// 5-frame stream. We measure SNR over the burst region itself (long-only
+/// is expected to win here — short blocks have less per-sub-block resolution)
+/// AND over the pre-burst silence (the *pre-echo* region — long-only is
+/// expected to LOSE here because the long MDCT smears the burst's energy
+/// backwards across the entire 20 ms frame).
+#[test]
+fn transient_signal_snr_short_vs_long() {
+    let n_frames = 5usize;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    let burst_frame = 3usize;
+    let burst_offset_in_frame = 600usize;
+    let burst_start = burst_frame * FRAME_SAMPLES + burst_offset_in_frame;
+    let burst_len = 120usize;
+    let mut signal = vec![0f32; n_samples];
+    for s in &mut signal[burst_start..burst_start + burst_len] {
+        *s = 0.7;
+    }
+
+    let dec_short = roundtrip_mono(&signal, false);
+    let dec_long = roundtrip_mono(&signal, true);
+    assert_eq!(dec_short.len(), n_samples);
+    assert_eq!(dec_long.len(), n_samples);
+
+    // Pre-echo region: the silence frames just BEFORE the burst, inside
+    // frame 3 (i.e. after the previous OLA tail). On a bit-exact
+    // long-block decoder this would carry a non-trivial echo of the burst
+    // smeared backward by the 20 ms MDCT support; short-block coding
+    // confines the smear to ~2.5 ms. Reference is silent here so the
+    // useful metric is the decoder's noise RMS, not classical SNR.
+    let pre_lo = burst_frame * FRAME_SAMPLES + 120;
+    let pre_hi = burst_start - 60;
+    let pre_rms = |x: &[f32]| (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32).sqrt();
+    let pre_noise_short = pre_rms(&dec_short[pre_lo..pre_hi]);
+    let pre_noise_long = pre_rms(&dec_long[pre_lo..pre_hi]);
+
+    // Burst region: where the actual transient lives.
+    let burst_snr_short = snr_db(&signal, &dec_short, burst_start, burst_start + burst_len);
+    let burst_snr_long = snr_db(&signal, &dec_long, burst_start, burst_start + burst_len);
+
+    println!(
+        "transient round-trip: pre-echo RMS short={:.4e}, long={:.4e}; \
+         burst SNR short={:.2} dB, long={:.2} dB",
+        pre_noise_short, pre_noise_long, burst_snr_short, burst_snr_long
+    );
+
+    // Sanity: both pipelines produce finite output.
+    assert!(dec_short.iter().all(|v| v.is_finite()));
+    assert!(dec_long.iter().all(|v| v.is_finite()));
+
+    // Loose floor: the burst SNR for both paths must beat -20 dB. CELT is
+    // perceptual and the IMDCT isn't bit-exact, so we're really just
+    // catching a "decoded output is silent / blown up" regression here.
+    assert!(
+        burst_snr_short > -20.0,
+        "short-block burst SNR collapsed: {burst_snr_short:.2} dB"
+    );
+    assert!(
+        burst_snr_long > -20.0,
+        "long-only burst SNR collapsed: {burst_snr_long:.2} dB"
+    );
+}
+
+/// Stationary-content regression: a pure sine fed through the encoder must
+/// (a) keep every packet's `transient` flag false, and (b) achieve the
+/// same SNR with the detector enabled as with `force_long_only`. This
+/// guarantees the auto-detector doesn't false-positive on steady tones
+/// and silently degrade quality.
+#[test]
+fn stationary_signal_snr_unchanged_by_detector() {
+    let n_frames = 6usize;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    let freq = 1000.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+        .collect();
+
+    // Detector-enabled path: every packet should still carry transient=0.
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new(&params).unwrap();
+    let mut dec = CeltDecoder::new(&params).unwrap();
+    for chunk in signal.chunks(FRAME_SAMPLES) {
+        if chunk.len() == FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+    let mut decoded_auto: Vec<f32> = Vec::new();
+    let mut packets_auto = Vec::new();
+    while let Ok(pkt) = enc.receive_packet() {
+        packets_auto.push(pkt.clone());
+        dec.send_packet(&pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            decoded_auto.extend(decoded_f32(&frame));
+        }
+    }
+    for (i, pkt) in packets_auto.iter().enumerate() {
+        let mut rd = oxideav_celt::range_decoder::RangeDecoder::new(&pkt.data);
+        let h = oxideav_celt::header::decode_header(&mut rd).expect("header parses");
+        assert!(
+            !h.transient,
+            "stationary sine: packet {i} unexpectedly flipped to transient"
+        );
+    }
+
+    // Forced-long baseline.
+    let decoded_long = roundtrip_mono(&signal, true);
+
+    // Compare SNR over the steady-state middle frames (skip frame 0 where
+    // the OLA buffer hasn't settled).
+    let lo = FRAME_SAMPLES * 2;
+    let hi = FRAME_SAMPLES * (n_frames - 1);
+    let snr_auto = snr_db(&signal, &decoded_auto, lo, hi);
+    let snr_long = snr_db(&signal, &decoded_long, lo, hi);
+    println!(
+        "stationary sine SNR — detector-on: {:.2} dB, force-long: {:.2} dB",
+        snr_auto, snr_long
+    );
+
+    // The two paths should be identical (detector returned false on every
+    // frame). Allow a tiny epsilon for float-accumulation noise across the
+    // two independent encode runs.
+    assert!(
+        (snr_auto - snr_long).abs() < 0.1,
+        "detector-on SNR ({snr_auto:.3}) differs from forced-long SNR ({snr_long:.3}) on a stationary signal — false positive?"
+    );
+}

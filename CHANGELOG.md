@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- detect_transient: switch peak/min ratio to peak/median for slow-envelope robustness (fade-in no longer false-positives)
+- expose `detect_transient` + `detect_transient_with_threshold` + `DEFAULT_TRANSIENT_THRESHOLD_DB` for callers that want to pin the operating point
+- add encoder unit tests pinning detector behaviour on silence / sine / fade-in / click / white noise / threshold parameter
+- add encoder→header tests pinning `transient` flag on click vs steady-sine end-to-end + `force_long_only` override
+- add public-API quantitative SNR tests: pre-echo RMS short vs long and burst SNR short vs long + stationary-signal regression check (detector-on equals force-long on a pure sine)
+- refresh stale module-level docstrings on encoder.rs / decoder.rs that still claimed transient was unimplemented
+
 ## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.0...v0.2.0) - 2026-04-25
 
 ### Other

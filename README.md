@@ -130,9 +130,14 @@ Following the RFC 6716 §4.3 section numbers:
 - §4.3.7 MDCT — forward (encoder) and inverse (decoder) via pre-twiddle
   + length-N/4 Bluestein FFT + post-twiddle. Transient frames run
   8 × 200→100 short sub-MDCTs with a 100-tap sin² window, interleaved
-  at stride M into the 800-bin coefficient buffer. Encoder ships a
-  simple energy-ratio `transient_analysis` surrogate that flips
-  `transient=true` on percussive onsets.
+  at stride M into the 800-bin coefficient buffer. The encoder ships a
+  `detect_transient` surrogate for libopus' `transient_analysis`: it
+  splits the frame into 8 sub-blocks (one per LM=3 short-block window),
+  computes per-block energy, and flips `transient=true` when the peak
+  exceeds the **median** by `DEFAULT_TRANSIENT_THRESHOLD_DB` (15 dB).
+  The peak/median ratio (rather than peak/min) is robust against
+  fade-in / fade-out envelopes that would otherwise false-positive a
+  silent edge sub-block as a transient.
 - §4.3.8 comb pitch post-filter — decoder path (the encoder does not
   emit post-filter taps).
 

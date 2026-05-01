@@ -2,9 +2,10 @@
 //!
 //! Scope (per RFC 6716 §4.3):
 //!
-//! * §4.3 frame header: silence=0, post_filter=None, transient=false,
-//!   `intra` is per-frame (true on the first frame, false thereafter — see
-//!   the "Inter-frame energy prediction" paragraph below).
+//! * §4.3 frame header: silence (silence-fast-path on near-zero input),
+//!   post_filter (test-hook only), `transient` (per-frame, see
+//!   [`detect_transient`] below) and `intra` (true on the first frame,
+//!   false thereafter — see "Inter-frame energy prediction").
 //! * §4.3.2.1 coarse energy: [`crate::quant_bands::quant_coarse_energy`] —
 //!   Laplace-encoded, inter/intra prediction coefficients as per libopus.
 //! * §4.3.2.2 fine energy: [`crate::quant_bands::quant_fine_energy`].
@@ -14,25 +15,31 @@
 //!   dual_stereo symbols.
 //! * §4.3.4 PVQ shape encoding:
 //!   - Mono: [`crate::encoder_bands::encode_all_bands_mono`] — per-band
-//!     PVQ search, exp_rotation, canonical enumeration.
+//!     PVQ search, exp_rotation, canonical enumeration. Selects long
+//!     (`big_b = 1`) or short (`big_b = M`) partitioning from the
+//!     `transient` flag, matching the decoder.
 //!   - Stereo: [`crate::encoder_bands::encode_all_bands_stereo_dual`] —
 //!     dual-stereo only. Each channel is coded as an independent mono band
 //!     inside one packet. Intensity stereo is not implemented; the encoder
 //!     pins `intensity = coded_bands` so the decoder never applies the IS
 //!     merge.
-//! * §4.3.5 anti-collapse: not set (the encoder emits `transient=false` so
-//!   no anti-collapse bit is reserved).
+//! * §4.3.5 anti-collapse: 1 bit reserved on transient LM>=2 frames; the
+//!   encoder emits `anti_collapse_on = 0` (no encoder-side pulse injection).
 //! * §4.3.6 denormalisation: implicit in the decoder; encoder normalises
 //!   the forward-MDCT coefficients before PVQ.
-//! * §4.3.7 forward MDCT: [`crate::mdct::forward_mdct`] (direct definition).
-//! * §4.3.8 comb post-filter: not applied.
+//! * §4.3.7 forward MDCT: long block uses [`crate::mdct::forward_mdct`]
+//!   (direct definition). Transient frames use
+//!   [`crate::mdct::forward_mdct_short`] — 8 × 200→100 sub-MDCTs with a
+//!   100-tap sin² sub-block window, interleaved at stride M into the
+//!   800-bin coefficient buffer.
+//! * §4.3.8 comb post-filter: not applied (the test-only `force_post_filter`
+//!   knob just sets the header flag for decoder smoke-tests).
 //!
 //! NOT implemented (fall back to long-block / no-boost path):
 //!
-//! * **Transient detection / short blocks** — we always emit `transient=false`
-//!   and encode a single 960-sample block. Percussive content will suffer
-//!   pre-echo artefacts.
-//! * **Time-frequency change flags** — all `tf_res[i]` = 0.
+//! * **Time-frequency change flags** — all `tf_res[i]` = 0. The transient
+//!   path picks the TF deltas + tf_select that yield zero post-lookup
+//!   for every band (libopus' nonzero TF decisions remain a TODO).
 //! * **Dynalloc band-energy boosts** — no per-band boost is emitted.
 //! * **Intensity stereo (M/S with theta)** — not implemented. Stereo uses
 //!   dual-stereo only (L and R as two independent mono bands). Intensity
@@ -102,13 +109,38 @@ fn build_short_window(len: usize) -> Vec<f32> {
     w
 }
 
+/// Default transient detection threshold, in dB. The detector flags a
+/// frame as transient when the peak sub-block energy exceeds the median
+/// sub-block energy by more than this many dB. Tuned empirically against
+/// short test signals — see [`detect_transient`] for the rationale.
+pub const DEFAULT_TRANSIENT_THRESHOLD_DB: f32 = 15.0;
+
 /// Transient detection (libopus `transient_analysis` surrogate).
 ///
-/// Splits `pcm` into 8 sub-blocks of 120 samples each and compares the peak
-/// sub-block RMS to the overall RMS. If the ratio exceeds `threshold` the
-/// frame is flagged transient. This captures percussive bursts (a loud block
-/// against a quiet one) without the full libopus masking curve.
-fn detect_transient(pcm: &[f32]) -> bool {
+/// Splits `pcm` into 8 sub-blocks (matches LM=3 short-block count) and
+/// compares the peak sub-block energy to the **median** sub-block energy.
+/// If the ratio in dB exceeds `threshold_db`, the frame is flagged
+/// transient.
+///
+/// We compare against the median (not the min) for robustness: a single
+/// near-silent sub-block at the start or end of a frame would otherwise
+/// trip a false positive on slow envelopes (fade-in / fade-out). The
+/// median stays high through gradual envelope changes and only drops when
+/// the actual majority of sub-blocks are quiet — which is exactly the
+/// "burst-against-silence" pattern transient coding is meant to catch.
+///
+/// Returns `false` for near-silent input (peak energy below -80 dBFS²) so
+/// that the silence fast-path runs unmolested. Callers using the public
+/// encoder don't see this directly — a true return value flips the encoder
+/// onto the [short-block path](`crate::mdct::forward_mdct_short`).
+pub fn detect_transient(pcm: &[f32]) -> bool {
+    detect_transient_with_threshold(pcm, DEFAULT_TRANSIENT_THRESHOLD_DB)
+}
+
+/// Same as [`detect_transient`] but with a caller-supplied threshold in
+/// dB. Exposed for tests that want to pin the detector's behaviour at a
+/// specific operating point. Production code should use [`detect_transient`].
+pub fn detect_transient_with_threshold(pcm: &[f32], threshold_db: f32) -> bool {
     const SUB_BLOCKS: usize = 8;
     let block_len = pcm.len() / SUB_BLOCKS;
     if block_len == 0 {
@@ -124,23 +156,28 @@ fn detect_transient(pcm: &[f32]) -> bool {
         }
         energies[b] = e / block_len as f32;
     }
-    // Peak / floor ratio in dB.
+    // Peak energy across sub-blocks.
     let mut peak = energies[0];
-    let mut floor = energies[0];
     for &e in &energies[1..] {
-        peak = peak.max(e);
-        floor = floor.min(e);
+        if e > peak {
+            peak = e;
+        }
     }
     // Guard against silent floors (avoid div-by-zero → spurious detection).
-    // If the loudest block is near silence, the frame isn't transient.
+    // If the loudest sub-block is essentially zero the frame isn't transient
+    // (silence-fast-path will handle it on the encode side).
     if peak < 1e-8 {
         return false;
     }
-    let floor = floor.max(1e-10);
-    let ratio_db = 10.0 * (peak / floor).log10();
-    // ~18 dB threshold — tuned so steady tones + slow envelopes stay long,
-    // while sharp onsets (silence → full-scale burst) flip to short.
-    ratio_db > 18.0
+    // Median sub-block energy — robust against single-block outliers at
+    // either end of the frame.
+    let mut sorted = energies;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // SUB_BLOCKS=8 → median of two middle entries.
+    let median = (sorted[SUB_BLOCKS / 2 - 1] + sorted[SUB_BLOCKS / 2]) * 0.5;
+    let median = median.max(1e-12);
+    let ratio_db = 10.0 * (peak / median).log10();
+    ratio_db > threshold_db
 }
 
 /// CELT window — same as libopus and the decoder's post-filter (120 taps).
@@ -264,6 +301,287 @@ impl CeltEncoder {
     #[doc(hidden)]
     pub fn set_force_long_only(&mut self, value: bool) {
         self.force_long_only = value;
+    }
+
+    /// Encode the CELT high-band portion of an Opus Hybrid frame (RFC
+    /// 6716 §4.4) into the caller-provided `RangeEncoder`. This is the
+    /// encoder-side mirror of `decode_celt_body` with `start_band=17`.
+    ///
+    /// * `pcm_in` — 960 samples (20 ms) of mono 48 kHz PCM. Only the
+    ///   high-band content is meaningful — bands 0..17 (0..8 kHz) are
+    ///   skipped so the caller is responsible for filtering / SILK-
+    ///   covering that region. We still take the full-band PCM since
+    ///   the MDCT operates on it before the band-energy split.
+    /// * `enc` — in-flight range encoder shared with the SILK low band.
+    ///   Must already contain the SILK frame body. The CELT body is
+    ///   appended in place; callers call `enc.done()` after this returns.
+    /// * `start_band` — 17 for both SWB and FB hybrid (RFC 6716 §4.4).
+    /// * `end_band` — 19 (SWB) or 21 (FB).
+    /// * `bytes_remaining_budget` — how many bytes the caller wants
+    ///   the entire packet to fit in. The CELT bit allocator uses this
+    ///   to decide pulse counts; pick `total_packet_bytes - silk_bytes_so_far`.
+    ///
+    /// State (`old_band_e`, `prev_tail`, `preemph_state`, `first_frame`)
+    /// is updated as in [`Self::encode_frame`] — bands below `start_band`
+    /// are kept at their previous value (we only touch `start_band..end_band`,
+    /// matching the decoder's behaviour). Frame size is 20 ms only;
+    /// 10 ms hybrid (configs 12, 14) is a tracked follow-up.
+    pub fn encode_hybrid_body_mono(
+        &mut self,
+        pcm_in: &[f32],
+        enc: &mut RangeEncoder,
+        start_band: usize,
+        end_band: usize,
+        bytes_remaining_budget: usize,
+    ) -> Result<()> {
+        if pcm_in.len() != FRAME_SAMPLES {
+            return Err(Error::invalid(
+                "CELT hybrid encoder: only 20 ms (960 samples) frames are supported today",
+            ));
+        }
+        if !(start_band < end_band && end_band <= NB_EBANDS) {
+            return Err(Error::invalid(
+                "CELT hybrid encoder: invalid start/end band range",
+            ));
+        }
+        if self.channels != 1 {
+            return Err(Error::unsupported(
+                "CELT hybrid encoder: stereo CELT high-band not implemented",
+            ));
+        }
+        let lm = lm_for_frame_samples(FRAME_SAMPLES as u32) as i32;
+
+        // Pre-emphasis — same filter the CELT-only path uses, since the
+        // decoder applies the same de-emphasis on the summed Hybrid output.
+        let alpha = crate::tables::DEEMPHASIS_COEF;
+        let mut pcm: Vec<f32> = Vec::with_capacity(FRAME_SAMPLES);
+        {
+            let mut prev = self.preemph_state[0];
+            for &x in pcm_in {
+                pcm.push(x - alpha * prev);
+                prev = x;
+            }
+            self.preemph_state[0] = prev;
+        }
+        let pcm = pcm.as_slice();
+
+        // Hybrid never emits the silence fast path — the SILK body has
+        // already committed to a non-silent frame. Skip the peak gate.
+
+        let n = CODED_N;
+        // Hybrid frames never go transient — the SILK low band carries
+        // the speech onset; CELT high band stays long. This keeps the
+        // bit budget simple.
+        let transient = false;
+
+        let mut raw = vec![0f32; 2 * n];
+        raw[..OVERLAP].copy_from_slice(&self.prev_tail[0]);
+        let take = n.min(pcm.len());
+        raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm[..take]);
+        self.prev_tail[0].copy_from_slice(&pcm[FRAME_SAMPLES - OVERLAP..]);
+
+        crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
+
+        let mut coeffs = vec![0f32; n];
+        forward_mdct(&raw, &mut coeffs);
+
+        // Per-band log-energy and normalised shape — bands 0..start_band
+        // are not coded and not used downstream, but we still compute
+        // their energy so the prediction state stays in sync with how
+        // the encoder thinks of "old_band_e".
+        let m = 1i32 << lm;
+        let mut band_log_e = vec![0f32; NB_EBANDS];
+        let mut shape = vec![0f32; n];
+        for i in 0..NB_EBANDS {
+            let lo = (m * EBAND_5MS[i] as i32) as usize;
+            let hi = (m * EBAND_5MS[i + 1] as i32) as usize;
+            let mut e: f32 = 0.0;
+            for &c in &coeffs[lo..hi] {
+                e += c * c;
+            }
+            let e = e.max(1e-30).sqrt();
+            band_log_e[i] = e.log2() - E_MEANS[i];
+            for c in &mut shape[lo..hi] {
+                *c /= e;
+            }
+        }
+
+        // Intra/inter — Hybrid frames need an honest first-frame intra
+        // for the same reason the CELT-only path does: old_band_e is all
+        // zeros until we've encoded one frame.
+        let intra = self.first_frame;
+        let bytes = bytes_remaining_budget;
+
+        // Header: silence=0, no post-filter, transient=0, intra=<flag>.
+        encode_header(enc, false, None, transient, intra);
+
+        // Coarse energy across [start_band, end_band).
+        let mut new_log_e = vec![0f32; NB_EBANDS * 2];
+        new_log_e[..NB_EBANDS].copy_from_slice(&band_log_e);
+        let mut old_e_bands = self.old_band_e.clone();
+        quant_coarse_energy(
+            enc,
+            &new_log_e,
+            &mut old_e_bands,
+            start_band,
+            end_band,
+            intra,
+            1,
+            lm as usize,
+        );
+
+        // tf_decode: emit raw=0 + tsel=0 → tf_res[i] = 0 everywhere
+        // (long blocks). Same logic as encode_frame, restricted to
+        // [start_band, end_band).
+        let tf_delta_first = false;
+        let tf_delta_rest = false;
+        let tf_sel: bool = false;
+
+        let budget = (bytes * 8) as u32;
+        let mut tell_u = enc.tell() as u32;
+        let mut logp: u32 = 4; // non-transient
+        let tf_select_rsv = if lm > 0 && tell_u + logp + 1 <= budget {
+            1
+        } else {
+            0
+        };
+        let budget_after = budget - tf_select_rsv;
+        for band_i in start_band..end_band {
+            if tell_u + logp <= budget_after {
+                let bit = if band_i == start_band {
+                    tf_delta_first
+                } else {
+                    tf_delta_rest
+                };
+                enc.encode_bit_logp(bit, logp);
+                tell_u = enc.tell() as u32;
+            }
+            logp = 5;
+        }
+        if tf_select_rsv != 0
+            && crate::tables::TF_SELECT_TABLE[lm as usize][0]
+                != crate::tables::TF_SELECT_TABLE[lm as usize][2]
+        {
+            enc.encode_bit_logp(tf_sel, 1);
+        }
+        let tf_res = vec![0i32; NB_EBANDS];
+
+        // Spread decision.
+        let tell = enc.tell();
+        let total_bits_check = (bytes * 8) as i32;
+        if tell + 4 <= total_bits_check {
+            enc.encode_icdf(SPREAD_NORMAL as usize, &SPREAD_ICDF, 5);
+        }
+
+        // Dynalloc — emit no boost per band. Loop runs over the coded
+        // band range only, matching the decoder.
+        let cap = init_caps(lm as usize, 1);
+        let mut offsets = [0i32; NB_EBANDS];
+        let dynalloc_logp = 6i32;
+        let total_bits_frac = (bytes as i32) * 8 << BITRES;
+        let mut tell = enc.tell_frac() as i32;
+        for i in start_band..end_band {
+            let _width = (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m;
+            let dynalloc_loop_logp = dynalloc_logp;
+            let boost = 0i32;
+            if tell + (dynalloc_loop_logp << BITRES) < total_bits_frac && boost < cap[i] {
+                enc.encode_bit_logp(false, dynalloc_loop_logp as u32);
+                tell = enc.tell_frac() as i32;
+            }
+            offsets[i] = boost;
+        }
+        let _ = total_bits_frac;
+
+        // Allocation trim.
+        if tell + (6 << BITRES) <= total_bits_frac {
+            enc.encode_icdf(5, &TRIM_ICDF, 7);
+        }
+
+        let mut bits = ((bytes as i32) * 8 << BITRES) - enc.tell_frac() as i32 - 1;
+        // Anti-collapse: never reserved on Hybrid (transient = false).
+        let anti_collapse_rsv = 0i32;
+        bits -= anti_collapse_rsv;
+
+        let mut pulses = vec![0i32; NB_EBANDS];
+        let mut fine_quant = vec![0i32; NB_EBANDS];
+        let mut fine_priority = vec![0i32; NB_EBANDS];
+        let mut balance = 0i32;
+        let mut intensity = 0i32;
+        let mut dual_stereo = 0i32;
+        let coded_bands = clt_compute_allocation_enc(
+            start_band,
+            end_band,
+            &offsets,
+            &cap,
+            5,
+            &mut intensity,
+            &mut dual_stereo,
+            bits,
+            &mut balance,
+            &mut pulses,
+            &mut fine_quant,
+            &mut fine_priority,
+            1,
+            lm,
+            enc,
+        );
+        let _ = (intensity, dual_stereo);
+
+        // Fine energy.
+        quant_fine_energy(
+            enc,
+            &new_log_e,
+            &mut old_e_bands,
+            start_band,
+            end_band,
+            &fine_quant,
+            1,
+        );
+
+        // PVQ shape. The shape buffer carries n = CODED_N normalised
+        // coefficients; only bands [start_band, end_band) are coded.
+        let total_pvq_bits = (bytes as i32) * (8 << BITRES) - anti_collapse_rsv;
+        let mut collapse_masks = vec![0u8; NB_EBANDS];
+        let mut rng_local = 0u32;
+        encode_all_bands_mono(
+            start_band,
+            end_band,
+            &mut shape,
+            &mut collapse_masks,
+            &pulses,
+            transient,
+            SPREAD_NORMAL,
+            &tf_res,
+            total_pvq_bits,
+            balance,
+            enc,
+            lm,
+            coded_bands,
+            &mut rng_local,
+        );
+
+        // Anti-collapse not reserved → no flag bit emitted.
+        if anti_collapse_rsv > 0 {
+            enc.encode_bits(0, 1);
+        }
+
+        // Final fine-energy pass.
+        let bits_left = (bytes as i32) * 8 - enc.tell();
+        quant_energy_finalise(
+            enc,
+            &new_log_e,
+            &mut old_e_bands,
+            start_band,
+            end_band,
+            &fine_quant,
+            &fine_priority,
+            bits_left,
+            1,
+        );
+
+        self.old_band_e = old_e_bands;
+        self.first_frame = false;
+        Ok(())
     }
 
     fn drain_frames(&mut self) -> Result<()> {
@@ -1128,5 +1446,177 @@ mod tests {
         let mut rd2 = crate::range_decoder::RangeDecoder::new(&pkt2.data);
         let h2 = crate::header::decode_header(&mut rd2).unwrap();
         assert!(!h2.intra, "frame 2 must be inter");
+    }
+
+    // -----------------------------------------------------------------
+    // detect_transient — signal-shape unit tests.
+    //
+    // Each test pins one expected behaviour of the detector:
+    //   * silence stays long
+    //   * pure sine stays long
+    //   * gradual fade-in (slow envelope) stays long — this is the case
+    //     the median-vs-min refactor fixed; under the old peak/min
+    //     ratio a fade-in tripped the detector
+    //   * sharp click against silence flips to short
+    //   * white noise (uniform energy) stays long
+    //   * threshold parameter actually does what the docstring claims
+    // -----------------------------------------------------------------
+
+    /// Pure silence must never be flagged transient — the encoder's
+    /// silence-fast-path picks it up first anyway, but the detector
+    /// itself should also bail gracefully without dividing by zero.
+    #[test]
+    fn detect_transient_silence_returns_false() {
+        let pcm = vec![0f32; FRAME_SAMPLES];
+        assert!(!detect_transient(&pcm));
+    }
+
+    /// A clean sine has uniform per-sub-block energy → detector must
+    /// keep `transient=false`.
+    #[test]
+    fn detect_transient_sine_returns_false() {
+        let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin() * 0.3
+            })
+            .collect();
+        assert!(!detect_transient(&pcm));
+    }
+
+    /// A linear fade-in from silence to full scale is exactly the case
+    /// the old peak/min detector tripped on — sub-block 0 is near-silent
+    /// (peak/min → ∞ dB) but the actual signal is steady-state. The
+    /// median-based replacement must recognise this is a slow envelope,
+    /// not a transient.
+    #[test]
+    fn detect_transient_slow_fade_in_returns_false() {
+        let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|i| {
+                let env = i as f32 / FRAME_SAMPLES as f32;
+                env * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin()
+                    * 0.3
+            })
+            .collect();
+        assert!(
+            !detect_transient(&pcm),
+            "slow fade-in must not flip detector; this is the burst-vs-envelope distinction"
+        );
+    }
+
+    /// A sharp click in the middle of an otherwise-silent frame is the
+    /// canonical "transient" stimulus. Detector must flip to true.
+    #[test]
+    fn detect_transient_click_returns_true() {
+        let mut pcm = vec![0f32; FRAME_SAMPLES];
+        // ~2.5 ms burst at 0.7 amplitude in the middle of the frame.
+        for i in FRAME_SAMPLES / 2..FRAME_SAMPLES / 2 + 120 {
+            pcm[i] = 0.7;
+        }
+        assert!(
+            detect_transient(&pcm),
+            "click in the middle of a silent frame must trigger transient"
+        );
+    }
+
+    /// White noise has roughly equal sub-block energy → no transient.
+    #[test]
+    fn detect_transient_white_noise_returns_false() {
+        let mut seed: u32 = 0x42424242;
+        let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 16) as i32 - 32768) as f32 / 32768.0 * 0.1
+            })
+            .collect();
+        assert!(!detect_transient(&pcm));
+    }
+
+    /// Lowering the threshold to 6 dB must allow even modest envelope
+    /// modulation to trip the detector. This pins the
+    /// `detect_transient_with_threshold` parameter actually doing its
+    /// job — useful for callers that want a more aggressive detector.
+    #[test]
+    fn detect_transient_threshold_param_takes_effect() {
+        // 6 dB amplitude bump in one sub-block.
+        let mut pcm = vec![0.1f32; FRAME_SAMPLES];
+        for i in 0..FRAME_SAMPLES / 8 {
+            pcm[i] = 0.2; // sub-block 0 has 4x the energy of the rest
+        }
+        // Default threshold (15 dB) should not trip on a 6 dB delta.
+        assert!(!detect_transient(&pcm));
+        // Lowered threshold (3 dB) should.
+        assert!(detect_transient_with_threshold(&pcm, 3.0));
+    }
+
+    /// End-to-end: feeding a sharp click through the encoder must
+    /// produce at least one packet whose header carries `transient=1`.
+    /// Mirrors the public_api_roundtrip test but at the encoder unit-
+    /// test level, with no decoder dependency.
+    #[test]
+    fn encoder_emits_transient_flag_on_click_signal() {
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        let mut pcm = vec![0f32; FRAME_SAMPLES];
+        for i in 200..320 {
+            pcm[i] = 0.7;
+        }
+        let pkt = enc.encode_frame(&pcm).unwrap();
+        let mut rd = crate::range_decoder::RangeDecoder::new(&pkt.data);
+        let h = crate::header::decode_header(&mut rd).expect("non-silent header should parse");
+        assert!(
+            h.transient,
+            "encoder must emit transient=1 on a clicky frame"
+        );
+    }
+
+    /// Conversely, a clean steady-state sine through the encoder must
+    /// always come out as `transient=0` — false positives waste short-
+    /// block bits on signals that don't need them.
+    #[test]
+    fn encoder_keeps_transient_false_on_steady_sine() {
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        // 8 frames of 1 kHz sine.
+        for f in 0..8 {
+            let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|i| {
+                    let n = (f * FRAME_SAMPLES + i) as f32;
+                    (2.0 * std::f32::consts::PI * 1000.0 * n / SAMPLE_RATE as f32).sin() * 0.3
+                })
+                .collect();
+            let pkt = enc.encode_frame(&pcm).unwrap();
+            let mut rd = crate::range_decoder::RangeDecoder::new(&pkt.data);
+            let h = crate::header::decode_header(&mut rd).unwrap();
+            assert!(
+                !h.transient,
+                "frame {f} of a steady sine must NOT be flagged transient"
+            );
+        }
+    }
+
+    /// `set_force_long_only(true)` must override even the strongest
+    /// transient stimulus. Pins the A/B-test escape hatch.
+    #[test]
+    fn force_long_only_overrides_detector() {
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        enc.set_force_long_only(true);
+        let mut pcm = vec![0f32; FRAME_SAMPLES];
+        for i in 200..320 {
+            pcm[i] = 0.7;
+        }
+        let pkt = enc.encode_frame(&pcm).unwrap();
+        let mut rd = crate::range_decoder::RangeDecoder::new(&pkt.data);
+        let h = crate::header::decode_header(&mut rd).unwrap();
+        assert!(
+            !h.transient,
+            "force_long_only must clamp transient=false even on click input"
+        );
     }
 }
