@@ -13,7 +13,7 @@
 //! `big_b = M = 1 << lm`) block coding are supported — the caller selects
 //! which via the `short_blocks` argument.
 
-use crate::bands::{deinterleave_hadamard, interleave_hadamard};
+use crate::bands::{deinterleave_hadamard, haar1, interleave_hadamard};
 use crate::cwrs::{encode_pulses, pvq_search};
 use crate::range_encoder::{RangeEncoder, BITRES};
 use crate::tables::{
@@ -766,8 +766,17 @@ pub fn encode_all_bands_stereo_dual(
 /// time-stripes (decoder's transient path in `quant_all_bands`). The
 /// encoder wraps `quant_partition_enc` with `deinterleave_hadamard` on the
 /// input and `interleave_hadamard` on the output, mirroring the decoder's
-/// `quant_band` — tf_change is assumed zero so the haar / time_divide
-/// stacks drop out.
+/// `quant_band`.
+///
+/// Per-band TF resolution adjustments (RFC 6716 §4.3.4.5, see
+/// [`crate::tf_analysis::tf_analysis`]) are honoured for **non-transient
+/// long-block frames**: when `tf_res[i] != 0` the band's shape is haar1-
+/// transformed before / after the PVQ shape coder so the decoder's
+/// resynth-side haar1 chain (`bands::quant_band`) recovers the original
+/// MDCT-domain shape. For `short_blocks = true` (transient) and `b0 > 1`
+/// stereo paths the analyser is currently constrained to emit
+/// `tf_res[i] = 0` for every band — the recombine + Hadamard interaction
+/// in those modes isn't yet wired through `quant_partition_enc`.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_all_bands_mono(
     start: usize,
@@ -849,16 +858,56 @@ pub fn encode_all_bands_mono(
         if n == 1 {
             cm = quant_band_n1_enc(&mut ctx, rc, &mut x_buf);
         } else {
-            // Mirror `quant_band`. tf_change assumed zero so the recombine /
-            // time_divide stacks drop out; the remaining `big_b > 1` case
-            // swaps the input between stride-M and Hadamard layout.
-            let long_blocks = big_b == 1;
-            let n_b = n / big_b;
+            // Mirror `quant_band`. The `big_b > 1` Hadamard wrap and the
+            // tf_change recombine / time_divide haar1 stacks live here;
+            // `quant_partition_enc` itself sees the band already in
+            // partition-domain.
             let mut lowband_transformed = lowband_x.clone();
-            if big_b > 1 {
-                deinterleave_hadamard(&mut x_buf, n_b, big_b, long_blocks);
+            let mut n_b = n / big_b;
+            let mut big_b_cur = big_b;
+            // Recombine pre-loop (tf_change > 0): apply haar1 levels on
+            // x_buf and lowband. After the loop, big_b_cur shrinks and
+            // n_b grows. Mirrors `bands::quant_band` lines ~636-661.
+            let recombine = if tf_change > 0 { tf_change } else { 0 };
+            for k in 0..recombine {
+                haar1(&mut x_buf, n >> k, 1 << k);
                 if let Some(lb) = lowband_transformed.as_mut() {
-                    deinterleave_hadamard(lb, n_b, big_b, long_blocks);
+                    haar1(lb, n >> k, 1 << k);
+                }
+            }
+            big_b_cur >>= recombine;
+            n_b <<= recombine;
+            // Time-divide pre-loop (tf_change < 0): haar1 the band INTO
+            // partition-domain. The decoder's `quant_band` only haar1-s
+            // lowband_buf here (x is zero pre-quant on the decode side);
+            // for the encoder we additionally haar1 x_buf so
+            // quant_partition_enc sees the same view as the decoder will
+            // after its post-quant haar1 chain (which inverts back to
+            // MDCT-domain). We track `time_divide` to match the post-loop
+            // resynth ordering.
+            let mut time_divide = 0i32;
+            while (n_b & 1) == 0 && tf_change < 0 {
+                haar1(&mut x_buf, n_b, big_b_cur);
+                if let Some(lb) = lowband_transformed.as_mut() {
+                    haar1(lb, n_b, big_b_cur);
+                }
+                big_b_cur <<= 1;
+                n_b >>= 1;
+                time_divide += 1;
+                if time_divide > 4 {
+                    break;
+                }
+            }
+            // After-recombine / after-time-divide deinterleave_hadamard if
+            // the effective stride is > 1 — short blocks (`big_b_cur > 1`).
+            let long_blocks = big_b == 1;
+            let n_b_pre_h = n_b;
+            let big_b_pre_h = big_b_cur;
+            let post_recombine_n_b = n / big_b_pre_h;
+            if big_b_pre_h > 1 {
+                deinterleave_hadamard(&mut x_buf, post_recombine_n_b, big_b_pre_h, long_blocks);
+                if let Some(lb) = lowband_transformed.as_mut() {
+                    deinterleave_hadamard(lb, post_recombine_n_b, big_b_pre_h, long_blocks);
                 }
             }
             cm = quant_partition_enc(
@@ -867,15 +916,31 @@ pub fn encode_all_bands_mono(
                 &mut x_buf,
                 n,
                 b,
-                big_b,
+                big_b_pre_h,
                 lowband_transformed.as_deref(),
                 lm,
                 Q15_ONE,
-                mask_for(big_b) as i32,
+                mask_for(big_b_pre_h) as i32,
             );
-            if big_b > 1 {
-                interleave_hadamard(&mut x_buf, n_b, big_b, long_blocks);
+            if big_b_pre_h > 1 {
+                interleave_hadamard(&mut x_buf, post_recombine_n_b, big_b_pre_h, long_blocks);
             }
+            // Time-divide post-loop: undo the time_divide haar1 chain.
+            let mut n_b_local = n_b_pre_h;
+            let mut big_b_local = big_b_pre_h;
+            for _ in 0..time_divide {
+                big_b_local >>= 1;
+                n_b_local <<= 1;
+                haar1(&mut x_buf, n_b_local, big_b_local);
+            }
+            // Recombine post-loop: undo the recombine haar1 chain, in the
+            // same order the decoder uses (k = 0..recombine, with stride
+            // `1 << k` and length `n0 >> k`). haar1 is self-inverse so
+            // this matches the decoder's resynth output.
+            for k in 0..recombine {
+                haar1(&mut x_buf, n >> k, 1 << k);
+            }
+            let _ = n_b_local;
         }
         x[band_off..band_off + band_len].copy_from_slice(&x_buf);
         // Update the norm buffer with the (resynthesised) band shape.

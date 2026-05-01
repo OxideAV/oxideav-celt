@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- tf_analysis: add per-band TF resolution analyser (RFC 6716 §4.3.4.5 + §5.3.6) — Viterbi-style L1-norm masking model picks per-band `tf_change` and the matching raw delta + `tf_select` bits the decoder reconstructs via `TF_SELECT_TABLE`
+- encoder_bands: wire haar1 recombine + time-divide wrapping through `encode_all_bands_mono` so non-zero `tf_change` from the analyser actually applies to the shape vector before / after `quant_partition_enc` — encoder + decoder stay in sync
+- encoder: replace hard-coded all-zero TF emission in mono `encode_frame` with the analyser output (constrained to non-transient long-block frames in this round; transient + stereo paths still emit the no-op decision)
+- expose `set_force_tf_off` test hook + add A/B PSNR round-trip test on multi-tone + envelope-noise fixtures
 - detect_transient: switch peak/min ratio to peak/median for slow-envelope robustness (fade-in no longer false-positives)
 - expose `detect_transient` + `detect_transient_with_threshold` + `DEFAULT_TRANSIENT_THRESHOLD_DB` for callers that want to pin the operating point
 - add encoder unit tests pinning detector behaviour on silence / sine / fade-in / click / white noise / threshold parameter

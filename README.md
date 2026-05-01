@@ -153,11 +153,18 @@ These paths are partially or fully missing. The codec runs end-to-end
 without them, but bit-for-bit parity with libopus requires closing
 every gap below.
 
-- **Time-frequency change flags.** `tf_res[i] = 0` on the encode side
-  after the TF_SELECT_TABLE lookup; the encoder picks raw TF deltas
-  and `tf_select` so the lookup yields zero per band. A libopus-style
-  per-band TF decision that actually chooses non-zero tf_res values
-  is not yet implemented.
+- **Time-frequency change flags.** Per-band TF analysis (RFC §4.3.4.5 +
+  §5.3.6) is implemented in `tf_analysis::tf_analysis`: a Viterbi-style
+  search picks per-band `tf_change` values to minimise the L1-norm
+  distortion proxy from the masking model, and emits the matching raw
+  delta + `tf_select` bits the decoder reconstructs through
+  `TF_SELECT_TABLE`. The non-transient mono long-block path applies the
+  picked values end-to-end via the haar1 wrapping in
+  `encoder_bands::encode_all_bands_mono`. **Scope still limited:**
+  transient frames (short blocks), stereo, and the hybrid path emit the
+  no-op decision (every band gets `tf_change = 0`) until the
+  recombine + Hadamard interaction in those modes is wired through
+  `quant_partition_enc`.
 - **Dynalloc band-energy boosts.** No per-band boost is emitted.
 - **Intensity stereo.** Stereo uses dual-stereo only — L and R coded as
   two independent mono bands in one packet. Intensity stereo would buy

@@ -115,6 +115,7 @@ pub mod range_decoder;
 pub mod range_encoder;
 pub mod rate;
 pub mod tables;
+pub mod tf_analysis;
 
 use oxideav_core::{CodecCapabilities, CodecId, CodecParameters, Result};
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};

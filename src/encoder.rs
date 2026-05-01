@@ -233,6 +233,12 @@ pub struct CeltEncoder {
     /// Intended for A/B testing short-block vs long-only reconstruction
     /// quality; production users shouldn't set this.
     force_long_only: bool,
+    /// When true, force the per-band TF analyser
+    /// ([`crate::tf_analysis::tf_analysis`]) into the no-op decision —
+    /// every band gets `tf_change = 0` regardless of the masking model.
+    /// Used by the round-trip A/B tests to measure the TF analyser's
+    /// quality contribution against the baseline that pre-dated it.
+    force_tf_off: bool,
     /// Pre-emphasis filter state (`x[n-1]` of the raw PCM, per channel).
     /// Applied as `y[n] = x[n] - alpha_p * x[n-1]` before MDCT. Pairs with
     /// the decoder's post-IMDCT de-emphasis so a full encode→decode chain
@@ -280,6 +286,7 @@ impl CeltEncoder {
             pts_counter: 0,
             short_window: build_short_window(SHORT_N),
             force_long_only: false,
+            force_tf_off: false,
             preemph_state: vec![0.0; channels],
             force_post_filter: None,
         })
@@ -301,6 +308,18 @@ impl CeltEncoder {
     #[doc(hidden)]
     pub fn set_force_long_only(&mut self, value: bool) {
         self.force_long_only = value;
+    }
+
+    /// Force the encoder's per-band TF analyser
+    /// ([`crate::tf_analysis::tf_analysis`]) into the no-op decision —
+    /// every band ends up with `tf_change = 0`. Used by the round-trip
+    /// tests to measure the TF picks' contribution to reconstruction
+    /// quality against the pre-TF baseline. Production callers should
+    /// leave this at the default (false) so the analyser drives the
+    /// per-band decisions.
+    #[doc(hidden)]
+    pub fn set_force_tf_off(&mut self, value: bool) {
+        self.force_tf_off = value;
     }
 
     /// Encode the CELT high-band portion of an Opus Hybrid frame (RFC
@@ -1029,28 +1048,29 @@ impl CeltEncoder {
             lm as usize,
         );
 
-        // tf_decode: pick per-band raw deltas + tf_select so that the
-        // decoder's `TF_SELECT_TABLE` lookup produces `tf_res[i] = 0` for
-        // every band. With `tf_res = 0` across the board, `quant_all_bands`
-        // runs its "no tf_change" path — stride-M partitioning (short blocks)
-        // for transient frames, stride-1 for long. No haar recombine.
+        // tf_decode (RFC 6716 §4.3.4.5): pick per-band TF resolution
+        // adjustments via the L1-norm masking model in
+        // [`crate::tf_analysis::tf_analysis`]. The analyser returns
+        // - the per-band post-lookup `tf_res[i]` values,
+        // - the matching raw delta bits + `tf_select` flag the decoder
+        //   needs to reconstruct them via cumulative XOR through
+        //   `TF_SELECT_TABLE`.
         //
-        // TF_SELECT_TABLE row layout: `[raw=0|tsel=0, raw=1|tsel=0, raw=0|
-        // tsel=1, raw=1|tsel=1]` for non-transient, and the same at offset 4
-        // for transient. LM=3:
-        //   non-transient = [0, -1, 0, -1]  (all entries equal 0 when raw=0)
-        //   transient     = [3,  0, 1, -1]  (entry with value 0 is raw=1, tsel=0)
-        // so:
-        //   * non-transient → raw=0, tsel=0, no emission needed for tsel.
-        //   * transient → raw=1 for every band, tsel=0 → table emits 0.
-        // The range-coder output depends on the cumulative XOR; raw[i]=1
-        // for all i maps to delta bit = 1 at band 0, 0 for bands 1..20.
-        let (tf_delta_first, tf_delta_rest) = if transient {
-            (true, false)
+        // The encoder pipeline currently honours `tf_res[i] != 0` only in
+        // the mono long-block (non-transient) path via the haar1 wrapping
+        // in `encoder_bands::encode_all_bands_mono`. Transient frames fall
+        // back to the no-op decision so the encoder + decoder stay in
+        // sync; see `tf_analysis::tf_decision_no_op` for the bit pattern.
+        let tf_decision = if transient || self.force_tf_off {
+            crate::tf_analysis::tf_decision_no_op(transient, 0, NB_EBANDS)
         } else {
-            (false, false)
+            let raw_dec = crate::tf_analysis::tf_analysis(&coeffs, transient, lm, 0, NB_EBANDS);
+            if raw_dec.apply_in_pipeline {
+                raw_dec
+            } else {
+                crate::tf_analysis::tf_decision_no_op(transient, 0, NB_EBANDS)
+            }
         };
-        let tf_sel: bool = false; // always 0 — we want post-lookup = 0.
 
         let budget = (bytes * 8) as u32;
         let mut tell_u = rc.tell() as u32;
@@ -1061,27 +1081,39 @@ impl CeltEncoder {
             0
         };
         let budget_after = budget - tf_select_rsv;
+        // Track which bands actually carried a delta bit (matches the
+        // decoder's `tell_u + logp <= budget_after` gate). Bands skipped
+        // due to budget exhaustion don't contribute to the cumulative XOR
+        // on either side — but the analyser already includes them in the
+        // raw stream so the cumulative XOR matches.
+        let mut emitted_changed = 0i32;
+        let mut curr_chk = 0i32;
         for band_i in 0..NB_EBANDS {
             if tell_u + logp <= budget_after {
-                let bit = if band_i == 0 {
-                    tf_delta_first
-                } else {
-                    tf_delta_rest
-                };
+                let bit = tf_decision.raw_per_band[band_i];
                 rc.encode_bit_logp(bit, logp);
                 tell_u = rc.tell() as u32;
+                curr_chk ^= bit as i32;
+                emitted_changed |= curr_chk;
             }
             logp = if transient { 4 } else { 5 };
         }
+        // Match the decoder's `tf_select` reservation gate: it depends on
+        // the cumulative-XOR `tf_changed` value (which can be 0 or 1)
+        // produced while reading the raw delta bits, not just the seed.
+        // `emitted_changed = OR of curr_chk over all coded bands`.
         if tf_select_rsv != 0
-            && crate::tables::TF_SELECT_TABLE[lm as usize][4 * transient as usize]
-                != crate::tables::TF_SELECT_TABLE[lm as usize][4 * transient as usize + 2]
+            && crate::tables::TF_SELECT_TABLE[lm as usize]
+                [4 * transient as usize + emitted_changed as usize]
+                != crate::tables::TF_SELECT_TABLE[lm as usize]
+                    [4 * transient as usize + 2 + emitted_changed as usize]
         {
-            rc.encode_bit_logp(tf_sel, 1);
+            rc.encode_bit_logp(tf_decision.tf_select, 1);
         }
-        // After the decoder's cumulative-XOR + lookup, `tf_res[i] = 0`
-        // everywhere — verified by construction above.
-        let tf_res = vec![0i32; NB_EBANDS];
+        // Per-band post-lookup TF changes (RFC §4.3.4.5). Drives the
+        // haar1 chain in `encoder_bands::encode_all_bands_mono` for
+        // non-transient frames where the analyser opted for ≠ 0 entries.
+        let tf_res = tf_decision.tf_res.clone();
 
         // Spread decision.
         let mut tell = rc.tell();
