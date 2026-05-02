@@ -708,6 +708,122 @@ fn stationary_signal_snr_unchanged_by_detector() {
     );
 }
 
+/// RFC 6716 §4.3.7.1 pitch pre-filter A/B. On a tonal fixture (220 Hz +
+/// 4 harmonics, the canonical "ringy" signal that motivates the
+/// post-filter), the encoder-side pre-filter analyser should drop the
+/// MDCT residual energy enough to reduce round-trip error vs the same
+/// pipeline with the pre-filter disabled.
+///
+/// We measure RMS reconstruction error over the steady-state middle
+/// frames and confirm pre-filter-on yields a smaller (or no worse)
+/// error than pre-filter-off. The improvement isn't huge — at 64
+/// kbit/s mono the MDCT already represents the harmonic series well —
+/// but it's measurable and consistent on this fixture.
+///
+/// Also asserts the pre-filter-on path actually emits a non-zero
+/// post-filter flag in at least one packet (the analyser shouldn't
+/// silently no-op on a clean tonal input).
+#[test]
+fn prefilter_tonal_signal_snr_a_b() {
+    // 220 Hz fundamental + 4 harmonics. 6 frames @ 20 ms → 120 ms signal.
+    let n_frames = 6usize;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    let sr = SAMPLE_RATE as f32;
+    let f0 = 220.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| {
+            let t = i as f32 / sr;
+            let mut s = 0.0f32;
+            for k in 1..=5 {
+                let amp = 0.25 / k as f32;
+                s += amp * (2.0 * std::f32::consts::PI * f0 * k as f32 * t).sin();
+            }
+            s
+        })
+        .collect();
+
+    fn roundtrip_with_prefilter(
+        signal: &[f32],
+        enable: bool,
+    ) -> (Vec<f32>, Vec<oxideav_core::Packet>) {
+        let params = build_params(1);
+        let mut enc = CeltEncoder::new(&params).unwrap();
+        enc.set_enable_prefilter(enable);
+        let mut dec = CeltDecoder::new(&params).unwrap();
+        for chunk in signal.chunks(FRAME_SAMPLES) {
+            if chunk.len() == FRAME_SAMPLES {
+                enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+            }
+        }
+        enc.flush().unwrap();
+        let mut decoded: Vec<f32> = Vec::new();
+        let mut packets: Vec<oxideav_core::Packet> = Vec::new();
+        while let Ok(pkt) = enc.receive_packet() {
+            packets.push(pkt.clone());
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(frame) = dec.receive_frame() {
+                decoded.extend(decoded_f32(&frame));
+            }
+        }
+        (decoded, packets)
+    }
+
+    let (dec_pre_on, pkts_pre_on) = roundtrip_with_prefilter(&signal, true);
+    let (dec_pre_off, _) = roundtrip_with_prefilter(&signal, false);
+
+    // The pre-filter-on path must have flipped the post-filter flag on
+    // at least one packet — otherwise the analyser silently no-op'd on
+    // a clean tonal input, which would defeat the point.
+    let mut pf_on_count = 0usize;
+    for pkt in &pkts_pre_on {
+        let mut rd = oxideav_celt::range_decoder::RangeDecoder::new(&pkt.data);
+        if let Some(h) = oxideav_celt::header::decode_header(&mut rd) {
+            if h.post_filter.is_some() {
+                pf_on_count += 1;
+            }
+        }
+    }
+    assert!(
+        pf_on_count > 0,
+        "pre-filter analyser produced no post-filter flags on a 220 Hz harmonic fixture (pkts={})",
+        pkts_pre_on.len()
+    );
+
+    // Compare RMS error in the steady-state middle. Skip the first 2
+    // frames (cold-start state) and the last frame (tail OLA window).
+    let lo = FRAME_SAMPLES * 2;
+    let hi = FRAME_SAMPLES * (n_frames - 1);
+    let snr_pre_on = snr_db(&signal, &dec_pre_on, lo, hi);
+    let snr_pre_off = snr_db(&signal, &dec_pre_off, lo, hi);
+    println!(
+        "tonal pre-filter A/B (220 Hz + 4 harmonics): SNR pre-on={:.2} dB, pre-off={:.2} dB, \
+         post-filter packets {}/{}",
+        snr_pre_on,
+        snr_pre_off,
+        pf_on_count,
+        pkts_pre_on.len()
+    );
+
+    // Sanity: both pipelines must produce finite, non-collapsed output.
+    assert!(dec_pre_on.iter().all(|v| v.is_finite()));
+    assert!(dec_pre_off.iter().all(|v| v.is_finite()));
+    assert!(snr_pre_on > -10.0, "pre-on SNR collapsed: {snr_pre_on:.2}");
+    assert!(
+        snr_pre_off > -10.0,
+        "pre-off SNR collapsed: {snr_pre_off:.2}"
+    );
+
+    // Pre-filter on must be at least as good as pre-filter off. Allow
+    // a small tolerance (-0.5 dB) for noise-introduction by the
+    // crossfade region between two adjacent frames where the pitch
+    // analyser picked slightly different params — the steady-state
+    // body of each frame still benefits, the boundary doesn't.
+    assert!(
+        snr_pre_on >= snr_pre_off - 0.5,
+        "pre-filter regressed SNR: on={snr_pre_on:.2} dB vs off={snr_pre_off:.2} dB"
+    );
+}
+
 // -------------------------------------------------------------------------
 // LM=2 (10 ms / 480-sample) round-trip — RFC 6716 §4.3 frame-size dispatch.
 //

@@ -281,6 +281,12 @@ fn encode_signal_to_packets(signal: &[f32]) -> Vec<Packet> {
     p.sample_rate = Some(SAMPLE_RATE);
     p.sample_format = Some(oxideav_core::SampleFormat::F32);
     let mut enc = CeltEncoder::new(&p).unwrap();
+    // The local `decode_celt_frame` above asserts no post-filter; we
+    // disable the encoder-side pre-filter analyser (RFC §4.3.7.1) so
+    // every packet keeps the post-filter flag at zero. The pre-filter's
+    // own A/B coverage lives in `tests/public_api_roundtrip.rs` where
+    // the production decoder handles the post-filter side.
+    enc.set_enable_prefilter(false);
 
     let mut packets = Vec::new();
     for chunk in signal.chunks(FRAME_SAMPLES) {
@@ -771,6 +777,9 @@ fn encode_stereo_signal_to_packets(l_r_interleaved: &[f32]) -> Vec<Packet> {
     p.sample_rate = Some(SAMPLE_RATE);
     p.sample_format = Some(oxideav_core::SampleFormat::F32);
     let mut enc = CeltEncoder::new(&p).unwrap();
+    // Same rationale as the mono path: this test's local decoder asserts
+    // no post-filter, so we disable the encoder-side pre-filter here.
+    enc.set_enable_prefilter(false);
 
     let mut packets = Vec::new();
     let frame_len = FRAME_SAMPLES * 2;

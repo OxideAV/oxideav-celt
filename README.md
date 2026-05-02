@@ -140,8 +140,14 @@ Following the RFC 6716 §4.3 section numbers:
   The peak/median ratio (rather than peak/min) is robust against
   fade-in / fade-out envelopes that would otherwise false-positive a
   silent edge sub-block as a transient.
-- §4.3.8 comb pitch post-filter — decoder path (the encoder does not
-  emit post-filter taps).
+- §4.3.7.1 comb pitch pre-/post-filter — both sides:
+  - decoder runs `comb_filter` on the IMDCT+OLA output (with the
+    crossfade between previous-frame and current-frame parameters);
+  - encoder runs the matching pre-filter analyser (NCC autocorrelation
+    pitch search + best-of-three tapset selection) and applies the
+    in-place `comb_filter` with negated gains on the pre-emphasized
+    PCM before MDCT, emitting the post-filter header for the decoder
+    to invert. See `pitch_analysis::analyse_pitch`.
 
 Static tables (transcribed from libopus `static_modes_float.h`):
 `EBAND_5MS`, `E_PROB_MODEL`, `PRED_COEF` / `BETA_COEF` / `BETA_INTRA`,
@@ -172,9 +178,6 @@ every gap below.
   two independent mono bands in one packet. Intensity stereo would buy
   extra HF bits on low bit-rate stereo; at 102 kbit/s the dual path
   produces well-separated L/R output.
-- **Comb post-filter on the encoder.** The §4.3.8 pitch post-filter is
-  implemented on the decoder side but the encoder never emits a
-  non-zero post-filter flag.
 - **IMDCT bit-exactness.** The current N/4 FFT uses Bluestein instead
   of libopus' bespoke mixed-radix kiss_fft (15·8 split at LM=3). The
   output has comparable RMS but the spectral peak is not yet bit-exact

@@ -40,8 +40,17 @@
 //!   [`crate::mdct::forward_mdct_short`] — 8 × 200→100 sub-MDCTs with a
 //!   100-tap sin² sub-block window, interleaved at stride M into the
 //!   800-bin coefficient buffer.
-//! * §4.3.8 comb post-filter: not applied (the test-only `force_post_filter`
-//!   knob just sets the header flag for decoder smoke-tests).
+//! * §4.3.7.1 comb pitch pre-filter: applied. The
+//!   `pitch_analysis::analyse_pitch` analyser picks `(period T, gain G,
+//!   tapset)` from the pre-emphasized PCM, the in-place `comb_filter`
+//!   call applies the inverse (negated-gain) IIR before MDCT, and the
+//!   matching `(octave, fine_pitch, gain_idx, tapset)` ride in the
+//!   frame header so the decoder's post-filter cancels the pre-filter
+//!   sample-for-sample (modulo MDCT quantisation). Per-channel state
+//!   (`pf_in_history`, `pf_*_old`) tracks the equivalent decoder state.
+//!   The `force_post_filter` test hook still overrides the analyser's
+//!   pick; `set_enable_prefilter(false)` disables both analysis and
+//!   filter application.
 //!
 //! NOT implemented (fall back to long-block / no-boost path):
 //!
@@ -310,6 +319,30 @@ pub struct CeltEncoder {
     /// the decoded output will not be the original signal. Purely a smoke
     /// test that the decoder's post-filter path does not panic / error.
     force_post_filter: Option<crate::header::PostFilter>,
+    /// When false, suppress the encoder-side pitch pre-filter analyser
+    /// (RFC 6716 §4.3.7.1). The encoder still emits a `post_filter = 0`
+    /// header but skips the `analyse_pitch` call and the in-place
+    /// `comb_filter` application — used by the A/B tests to compare
+    /// pre-filter-on vs pre-filter-off reconstruction quality on the same
+    /// tonal input. Defaults to `true` (analyser enabled).
+    enable_prefilter: bool,
+    /// Pre-filter history per channel: the last `COMB_FILTER_MAXPERIOD + 2`
+    /// samples of pre-emphasized + pre-filtered output from the previous
+    /// frame. Indexed so that `pf_in_history[c][len - 1]` is the sample
+    /// immediately before this frame's first sample. The pre-filter
+    /// `comb_filter` IIR uses this for `y[n - T]` lookbacks at frame
+    /// boundaries. Mirrors what the decoder builds in `pf_history` from
+    /// its own post-filter output — the two stay in sync because the
+    /// decoder's post-filter is the exact inverse of the encoder's
+    /// pre-filter.
+    pf_in_history: Vec<Vec<f32>>,
+    /// Previous-frame pitch period per channel (matches the decoder's
+    /// `pf_period_old`). 0 when the previous frame had no pre-filter.
+    pf_period_old: Vec<i32>,
+    /// Previous-frame pitch gain per channel.
+    pf_gain_old: Vec<f32>,
+    /// Previous-frame tap shape per channel.
+    pf_tapset_old: Vec<usize>,
 }
 
 impl CeltEncoder {
@@ -377,6 +410,14 @@ impl CeltEncoder {
             force_tf_off: false,
             preemph_state: vec![0.0; channels],
             force_post_filter: None,
+            enable_prefilter: true,
+            pf_in_history: vec![
+                vec![0.0; crate::tables::COMB_FILTER_MAXPERIOD as usize + 2];
+                channels
+            ],
+            pf_period_old: vec![0; channels],
+            pf_gain_old: vec![0.0; channels],
+            pf_tapset_old: vec![0; channels],
         })
     }
 
@@ -401,6 +442,17 @@ impl CeltEncoder {
     #[doc(hidden)]
     pub fn set_force_long_only(&mut self, value: bool) {
         self.force_long_only = value;
+    }
+
+    /// Toggle the encoder-side pitch pre-filter (RFC 6716 §4.3.7.1) on /
+    /// off. When disabled the encoder skips both the pitch analyser and
+    /// the in-place pre-filter `comb_filter` — packets are emitted with
+    /// `post_filter = 0`. Used by the A/B round-trip tests to measure
+    /// the pre-filter's quality contribution against the baseline.
+    /// Production callers should leave this at the default (true).
+    #[doc(hidden)]
+    pub fn set_enable_prefilter(&mut self, value: bool) {
+        self.enable_prefilter = value;
     }
 
     /// Force the encoder's per-band TF analyser
@@ -1032,7 +1084,9 @@ impl CeltEncoder {
             }
             self.preemph_state[0] = prev;
         }
-        let pcm = pcm.as_slice();
+        // `pcm` stays mutable so the pre-filter (RFC 6716 §4.3.7.1) can
+        // run in-place below. Downstream MDCT, transient detection, etc.
+        // see the (possibly pre-filtered) `&pcm` slice.
 
         // Silence-flag fast path. If the input frame is below a hard -90 dBFS
         // floor (peak |s| < 1e-5), emit a silence-only packet: the decoder
@@ -1055,6 +1109,14 @@ impl CeltEncoder {
             for v in &mut self.prev_tail[0] {
                 *v = 0.0;
             }
+            // Pre-filter state ages: silence wipes the history too (the
+            // next frame can't pre-filter against absent prior content).
+            for v in &mut self.pf_in_history[0] {
+                *v = 0.0;
+            }
+            self.pf_period_old[0] = 0;
+            self.pf_gain_old[0] = 0.0;
+            self.pf_tapset_old[0] = 0;
             self.first_frame = false;
             let buf = rc.done()?;
             let tb = TimeBase::new(1, SAMPLE_RATE as i64);
@@ -1072,6 +1134,82 @@ impl CeltEncoder {
         // but keeps the encoder's MDCT coefficient count consistent with
         // what the decoder expects (`n = m * EBAND_5MS[NB_EBANDS]`).
         let n = self.coded_n;
+
+        // RFC 6716 §4.3.7.1 pitch pre-filter analysis. Applied here, on
+        // the pre-emphasized PCM before any MDCT machinery, so the
+        // decoder's matching post-filter (which runs on the IMDCT+OLA
+        // output, before de-emphasis) is the exact inverse.
+        //
+        // The test-only `force_post_filter` hook takes priority: if set,
+        // we use those parameters verbatim (no analysis), but still apply
+        // the pre-filter so the round-trip stays sensible. Otherwise we
+        // run `analyse_pitch` and the filter is applied iff a periodic
+        // structure was detected.
+        let analysed_pf = if self.enable_prefilter && self.force_post_filter.is_none() {
+            crate::pitch_analysis::analyse_pitch(&pcm, &self.pf_in_history[0])
+        } else {
+            None
+        };
+        let pf_header: Option<crate::header::PostFilter> =
+            match (self.force_post_filter, analysed_pf) {
+                (Some(pf), _) => Some(pf),
+                (None, Some(p)) => Some(crate::header::PostFilter {
+                    octave: p.octave,
+                    period: p.fine_pitch,
+                    gain: p.gain_idx,
+                    tapset: p.tapset,
+                }),
+                (None, None) => None,
+            };
+        // Apply the in-place pre-filter (negated gain) when we have
+        // current-frame parameters or the previous-frame parameters were
+        // non-zero (the crossfade region still runs in that case).
+        let (pf_t1, pf_g1, pf_tapset1) = match pf_header {
+            Some(pf) => (
+                crate::post_filter::decode_pitch_period(pf.octave, pf.period) as i32,
+                crate::post_filter::decode_pitch_gain(pf.gain),
+                pf.tapset as usize,
+            ),
+            None => (0i32, 0.0f32, 0usize),
+        };
+        if pf_g1 != 0.0 || self.pf_gain_old[0] != 0.0 {
+            // Negated gains so this `comb_filter` call inverts the
+            // decoder's post-filter. The crossfade between previous-
+            // frame and current-frame params runs over the first OVERLAP
+            // samples — same shape the decoder uses, so the two cancel
+            // sample-for-sample (modulo MDCT quantisation).
+            crate::post_filter::comb_filter(
+                &mut pcm,
+                &self.pf_in_history[0],
+                self.pf_period_old[0],
+                pf_t1,
+                frame_samples,
+                -self.pf_gain_old[0],
+                -pf_g1,
+                self.pf_tapset_old[0],
+                pf_tapset1,
+                &WINDOW_120,
+                OVERLAP,
+            );
+        }
+        // Update pre-filter history from the (possibly pre-filtered)
+        // PCM tail. This is the input to the next frame's pre-filter
+        // crossfade, mirroring what the decoder's `pf_history` carries.
+        let hist_len = self.pf_in_history[0].len();
+        if frame_samples >= hist_len {
+            let start = frame_samples - hist_len;
+            self.pf_in_history[0].copy_from_slice(&pcm[start..]);
+        } else {
+            let keep = hist_len - frame_samples;
+            self.pf_in_history[0].copy_within(hist_len - keep.., 0);
+            self.pf_in_history[0][keep..].copy_from_slice(&pcm);
+        }
+        // Rotate the pre-filter parameter state.
+        self.pf_period_old[0] = pf_t1;
+        self.pf_gain_old[0] = pf_g1;
+        self.pf_tapset_old[0] = pf_tapset1;
+
+        let pcm: &[f32] = &pcm;
 
         // Transient detection: run BEFORE assembling the windowed MDCT
         // input, on the raw PCM so the sub-block energies reflect actual
@@ -1130,9 +1268,9 @@ impl CeltEncoder {
         let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, optional post-filter (test-only hook),
-        // transient=<flag>, intra=<flag>.
-        encode_header(&mut rc, false, self.force_post_filter, transient, intra);
+        // Header: silence=0, optional post-filter (from analyser or test
+        // hook), transient=<flag>, intra=<flag>.
+        encode_header(&mut rc, false, pf_header, transient, intra);
 
         // Coarse energy.
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];
@@ -1377,6 +1515,16 @@ impl CeltEncoder {
                     *v = 0.0;
                 }
             }
+            // Reset pre-filter state on silence (next frame can't carry
+            // pitch lookbacks from absent prior content).
+            for ch in 0..channels {
+                for v in &mut self.pf_in_history[ch] {
+                    *v = 0.0;
+                }
+                self.pf_period_old[ch] = 0;
+                self.pf_gain_old[ch] = 0.0;
+                self.pf_tapset_old[ch] = 0;
+            }
             self.first_frame = false;
             let buf = rc.done()?;
             let tb = TimeBase::new(1, SAMPLE_RATE as i64);
@@ -1414,6 +1562,74 @@ impl CeltEncoder {
                 prev = x;
             }
             self.preemph_state[1] = prev;
+        }
+
+        // RFC 6716 §4.3.7.1 pitch pre-filter analysis (stereo). Both
+        // channels share a single post-filter parameter set per packet,
+        // so we analyse each channel and pick the one with the higher
+        // peak NCC. Pre-filter is then applied to BOTH channels with the
+        // shared params — the decoder will run its post-filter the same
+        // way on both sides.
+        let analysed_pf = if self.enable_prefilter && self.force_post_filter.is_none() {
+            let l_p = crate::pitch_analysis::analyse_pitch(&l_pcm, &self.pf_in_history[0]);
+            let r_p = crate::pitch_analysis::analyse_pitch(&r_pcm, &self.pf_in_history[1]);
+            match (l_p, r_p) {
+                (Some(l), Some(r)) => Some(if l.correlation >= r.correlation { l } else { r }),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        } else {
+            None
+        };
+        let pf_header: Option<crate::header::PostFilter> =
+            match (self.force_post_filter, analysed_pf) {
+                (Some(pf), _) => Some(pf),
+                (None, Some(p)) => Some(crate::header::PostFilter {
+                    octave: p.octave,
+                    period: p.fine_pitch,
+                    gain: p.gain_idx,
+                    tapset: p.tapset,
+                }),
+                (None, None) => None,
+            };
+        let (pf_t1, pf_g1, pf_tapset1) = match pf_header {
+            Some(pf) => (
+                crate::post_filter::decode_pitch_period(pf.octave, pf.period) as i32,
+                crate::post_filter::decode_pitch_gain(pf.gain),
+                pf.tapset as usize,
+            ),
+            None => (0i32, 0.0f32, 0usize),
+        };
+        for (ch, pcm_ch) in [(0usize, &mut l_pcm), (1usize, &mut r_pcm)] {
+            if pf_g1 != 0.0 || self.pf_gain_old[ch] != 0.0 {
+                crate::post_filter::comb_filter(
+                    pcm_ch,
+                    &self.pf_in_history[ch],
+                    self.pf_period_old[ch],
+                    pf_t1,
+                    frame_samples,
+                    -self.pf_gain_old[ch],
+                    -pf_g1,
+                    self.pf_tapset_old[ch],
+                    pf_tapset1,
+                    &WINDOW_120,
+                    OVERLAP,
+                );
+            }
+            // Update per-channel pre-filter history.
+            let hist_len = self.pf_in_history[ch].len();
+            if frame_samples >= hist_len {
+                let start = frame_samples - hist_len;
+                self.pf_in_history[ch].copy_from_slice(&pcm_ch[start..]);
+            } else {
+                let keep = hist_len - frame_samples;
+                self.pf_in_history[ch].copy_within(hist_len - keep.., 0);
+                self.pf_in_history[ch][keep..].copy_from_slice(pcm_ch);
+            }
+            self.pf_period_old[ch] = pf_t1;
+            self.pf_gain_old[ch] = pf_g1;
+            self.pf_tapset_old[ch] = pf_tapset1;
         }
 
         // Transient detection: flag if either channel has percussive onset.
@@ -1472,9 +1688,9 @@ impl CeltEncoder {
         let intra = self.first_frame;
         let bytes = self.bytes_per_frame;
         let mut rc = RangeEncoder::new(bytes as u32);
-        // Header: silence=0, optional post-filter (test-only hook),
-        // transient=<flag>, intra=<flag>.
-        encode_header(&mut rc, false, self.force_post_filter, transient, intra);
+        // Header: silence=0, optional post-filter (analyser or test
+        // hook), transient=<flag>, intra=<flag>.
+        encode_header(&mut rc, false, pf_header, transient, intra);
 
         // Coarse energy (both channels).
         let mut new_log_e = vec![0f32; NB_EBANDS * 2];

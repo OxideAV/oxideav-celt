@@ -30,7 +30,12 @@
 //!   → mirror, plus window + overlap-add in the opus crate.
 //! * §4.3.7.1 comb pitch post-filter (`post_filter::comb_filter`) — wired
 //!   into the decoder's per-channel state (history + old-params rotation
-//!   + crossfade across the 120-sample overlap).
+//!   + crossfade across the 120-sample overlap), AND the matching
+//!   encoder-side pre-filter (`pitch_analysis::analyse_pitch` +
+//!   in-place `comb_filter` with negated gains) so tonal content
+//!   takes the post-filter ride. Mono and stereo are both wired; stereo
+//!   picks one shared parameter set from the channel with the higher
+//!   peak NCC.
 //! * §4.3.7.2 single-pole de-emphasis + matching encoder-side pre-emphasis
 //!   (`post_filter::deemphasis`, `alpha_p = 0.8500061035`).
 //!
@@ -109,6 +114,7 @@ pub mod encoder_rate;
 pub mod header;
 pub mod laplace;
 pub mod mdct;
+pub mod pitch_analysis;
 pub mod post_filter;
 pub mod quant_bands;
 pub mod range_decoder;
