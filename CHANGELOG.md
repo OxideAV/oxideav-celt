@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/OxideAV/oxideav-celt/compare/v0.1.1...v0.1.2) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- add comb pitch pre-filter (RFC 6716 §4.3.7.1)
+- parametric encode_hybrid_body_{mono,stereo} for LM=2 + LM=3
+- encoder + decoder: add LM=2 (10 ms / 480-sample) frame-size path
+- per-band TF resolution analyser (RFC §4.3.4.5 + §5.3.6)
+- add encode_hybrid_body_stereo for Hybrid stereo high-band
+- harden transient detector + quantitative SNR tests
+- adopt slim VideoFrame/AudioFrame shape
+
 ### Other
 
 - pitch_analysis: add encoder-side comb pre-filter analyser (RFC 6716 §4.3.7.1) — Hann-windowed normalised autocorrelation pitch search over τ ∈ [15, 1022] with first-significant-local-max picking + sub-multiple guard, 3-bit gain mapping from peak NCC, and best-of-three tapset selection by post-pre-filter residual energy. Returns the encoded `(octave, fine_pitch, gain_idx)` syntax fields directly.
