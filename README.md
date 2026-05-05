@@ -56,8 +56,9 @@ while let Ok(pkt) = enc.receive_packet() {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The codec is also discoverable through the `CodecRegistry` via
-`oxideav_celt::register(&mut registry)`.
+The codec is also discoverable through the `RuntimeContext` via
+`oxideav_celt::register(&mut ctx)` (or, if you only have a bare
+`CodecRegistry`, `oxideav_celt::register_codecs(&mut registry)`).
 
 ## Supported configuration
 
