@@ -1124,7 +1124,10 @@ fn lm0_sine_roundtrip_audible_tone() {
         }
     }
     assert_eq!(decoded.len(), n_samples);
-    assert!(decoded.iter().all(|v| v.is_finite()), "LM=0 decoded non-finite");
+    assert!(
+        decoded.iter().all(|v| v.is_finite()),
+        "LM=0 decoded non-finite"
+    );
     let mid_start = LM0_FRAME_SAMPLES * 8;
     let mid_end = mid_start + LM0_FRAME_SAMPLES * 4;
     let e: f32 = decoded[mid_start..mid_end]
@@ -1168,7 +1171,10 @@ fn lm1_sine_roundtrip_audible_tone() {
         }
     }
     assert_eq!(decoded.len(), n_samples);
-    assert!(decoded.iter().all(|v| v.is_finite()), "LM=1 decoded non-finite");
+    assert!(
+        decoded.iter().all(|v| v.is_finite()),
+        "LM=1 decoded non-finite"
+    );
     let mid_start = LM1_FRAME_SAMPLES * 4;
     let mid_end = mid_start + LM1_FRAME_SAMPLES * 2;
     let e: f32 = decoded[mid_start..mid_end]
@@ -1208,15 +1214,9 @@ fn select_lm_for_pcm_picks_smaller_lm_on_burst() {
     // Sharp burst (castanets-style): near-zero for 7/8 of the frame, then
     // a loud hit for 1/8 → many sub-blocks carry the onset.
     let mut burst = vec![0.0f32; n];
-    for i in (n / 8)..(n / 4) {
-        burst[i] = 0.8;
-    }
-    for i in (n / 2)..(5 * n / 8) {
-        burst[i] = 0.6;
-    }
-    for i in (7 * n / 8)..n {
-        burst[i] = 0.9;
-    }
+    burst[(n / 8)..(n / 4)].fill(0.8);
+    burst[(n / 2)..(5 * n / 8)].fill(0.6);
+    burst[(7 * n / 8)..n].fill(0.9);
     let lm_burst = CeltEncoder::select_lm_for_pcm(&burst, 15.0);
     // Burst has many onsets, should select shorter frame (240 or 120).
     assert!(
@@ -1265,11 +1265,9 @@ fn lm_sine_psnr(frame_samples: usize) -> (f32, usize) {
             Err(_) => break,
         }
     }
-    let avg_bytes = if packet_count > 0 {
-        total_bytes / packet_count
-    } else {
-        bytes_per_frame
-    };
+    let avg_bytes = total_bytes
+        .checked_div(packet_count)
+        .unwrap_or(bytes_per_frame);
     // SNR on the middle 50% of frames (skip first 25% settling).
     let lo = n_samples / 4;
     let hi = lo + n_samples / 2;
@@ -1297,9 +1295,9 @@ fn per_lm_sine_tone_dominance() {
     let goertzel = |samples: &[f32], f: f32| -> f32 {
         let w = 2.0 * std::f32::consts::PI * f / SAMPLE_RATE as f32;
         let cw = w.cos();
-        let (mut s0, mut s1, mut s2) = (0f32, 0f32, 0f32);
+        let (mut s1, mut s2) = (0f32, 0f32);
         for &x in samples {
-            s0 = 2.0 * cw * s1 - s2 + x;
+            let s0 = 2.0 * cw * s1 - s2 + x;
             s2 = s1;
             s1 = s0;
         }
@@ -1318,7 +1316,9 @@ fn per_lm_sine_tone_dominance() {
         let n_samples = fs * n_frames;
         let freq = 1000.0f32;
         let signal: Vec<f32> = (0..n_samples)
-            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3
+            })
             .collect();
         for chunk in signal.chunks(fs) {
             if chunk.len() == fs {
@@ -1409,7 +1409,12 @@ fn per_lm_noise_roundtrip() {
                 Err(_) => break,
             }
         }
-        assert_eq!(decoded.len(), n_samples, "LM={}: wrong output length", lm_for_frame_samples_test(fs));
+        assert_eq!(
+            decoded.len(),
+            n_samples,
+            "LM={}: wrong output length",
+            lm_for_frame_samples_test(fs)
+        );
         assert!(
             decoded.iter().all(|v| v.is_finite()),
             "LM={}: decoded output contains non-finite value",
@@ -1424,7 +1429,12 @@ fn per_lm_noise_roundtrip() {
             lm_for_frame_samples_test(fs),
             fs,
         );
-        println!("LM={} frame={} noise roundtrip OK (e={:.2e})", lm_for_frame_samples_test(fs), fs, e);
+        println!(
+            "LM={} frame={} noise roundtrip OK (e={:.2e})",
+            lm_for_frame_samples_test(fs),
+            fs,
+            e
+        );
     }
 }
 
@@ -1446,10 +1456,8 @@ fn anti_collapse_flag_emitted_on_transient() {
     let mut signal = vec![0.0f32; n_samples];
     for f in 0..n_frames {
         let onset = f * FRAME_SAMPLES + FRAME_SAMPLES / 8;
-        for s in onset..onset + 20 {
-            if s < n_samples {
-                signal[s] = 0.9;
-            }
+        for sample in signal.iter_mut().skip(onset).take(20) {
+            *sample = 0.9;
         }
     }
     for chunk in signal.chunks(FRAME_SAMPLES) {
@@ -1477,7 +1485,7 @@ fn anti_collapse_flag_emitted_on_transient() {
     // At least one packet must be transient.
     let saw_transient = packets.iter().any(|pkt| {
         let mut rd = RangeDecoder::new(&pkt.data);
-        decode_header(&mut rd).map_or(false, |h| h.transient)
+        decode_header(&mut rd).is_some_and(|h| h.transient)
     });
     assert!(
         saw_transient,
