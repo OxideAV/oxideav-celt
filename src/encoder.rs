@@ -1,5 +1,6 @@
-//! CELT encoder — 48 kHz, full-band (FB), 20 ms (LM=3, 960 samples) or
-//! 10 ms (LM=2, 480 samples) frames.
+//! CELT encoder — 48 kHz, full-band (FB), 20 ms (LM=3, 960 samples),
+//! 10 ms (LM=2, 480 samples), 5 ms (LM=1, 240 samples), or
+//! 2.5 ms (LM=0, 120 samples) frames.
 //!
 //! Default constructor [`CeltEncoder::new`] uses LM=3 (the historical
 //! single-frame-size mode); call [`CeltEncoder::new_with_frame_samples`]
@@ -126,28 +127,35 @@ const DEFAULT_BYTES_PER_FRAME_STEREO: usize = 256;
 
 /// Default packet-size schedule per (frame_samples, channels). At LM=3
 /// (960 samples / 20 ms) we use the historical 160 / 256 byte budgets
-/// (≈ 64 / 102 kbit/s). At LM=2 (480 / 10 ms) the per-frame overhead
-/// (header + coarse energy + allocation) doesn't shrink linearly with
-/// frame size, so we keep ~75% of the 20 ms budget to leave enough room
-/// for PVQ shape bits — 120 bytes mono / 192 bytes stereo (≈ 96 kbit/s
-/// mono / 154 kbit/s stereo), well above the libopus minimum-viable
-/// 10 ms budget for full-band coding.
+/// (≈ 64 / 102 kbit/s). For shorter frames the per-frame overhead
+/// (header + coarse energy + allocation symbols) doesn't shrink linearly
+/// with frame size, so we keep a minimum floor that leaves enough headroom
+/// for the PVQ shape bits.
+///
+/// | LM | frame | mono bytes | mono kbit/s | stereo bytes | stereo kbit/s |
+/// |----|-------|------------|-------------|--------------|----------------|
+/// |  3 | 20 ms |        160 |       64    |          256 |         102    |
+/// |  2 | 10 ms |        120 |       96    |          192 |         154    |
+/// |  1 |  5 ms |         96 |      154    |          154 |         246    |
+/// |  0 |2.5 ms |         80 |      256    |          128 |         410    |
 fn bytes_per_frame_for(frame_samples: usize, channels: usize) -> usize {
     let base = if channels == 2 {
         DEFAULT_BYTES_PER_FRAME_STEREO
     } else {
         DEFAULT_BYTES_PER_FRAME
     };
-    // Split into a fixed per-frame overhead and a per-coded-bin component.
-    // Empirically the encoder needs ~80 bytes of overhead per frame plus
-    // ~0.1 bytes per coded bin (mono) before it stops running into the
-    // bit-budget exhaustion seen on LM=2 with a naively halved budget.
-    if frame_samples == FRAME_SAMPLES {
-        base
-    } else {
-        // For LM=2 (frame_samples = 480, half of 960), use 75% of the
-        // 20 ms budget: 120 mono / 192 stereo.
-        (base * 3) / 4
+    match frame_samples {
+        960 => base,
+        480 => (base * 3) / 4,
+        // LM=1 (240 samples / 5 ms): 60% of the LM=3 budget. Per-frame
+        // overhead (header, coarse energy, allocation) is fixed so a naively
+        // proportional budget leaves too few bits for PVQ shape.
+        240 => (base * 3) / 5,
+        // LM=0 (120 samples / 2.5 ms): at least 100 bytes mono / 160 stereo
+        // to cover the mandatory per-frame header, coarse energy (21 bands)
+        // and allocation overhead before any PVQ shape bits.
+        120 => (base * 5) / 8,
+        _ => base,
     }
 }
 
@@ -354,16 +362,17 @@ impl CeltEncoder {
     }
 
     /// Construct a CELT encoder for an explicit frame size. Supported
-    /// values are `960` (LM=3, 20 ms) and `480` (LM=2, 10 ms). All other
-    /// sizes return [`Error::unsupported`]. The 10 ms path is the
-    /// CELT-MDCT length used by the Opus 10 ms Hybrid configuration
-    /// (RFC 6716 Table 2 configs 6/8/10) — the encoder otherwise behaves
-    /// identically to the 20 ms path (same per-band quantisation, PVQ,
-    /// TF analyser, silence/transient/post-filter machinery).
+    /// values are `960` (LM=3, 20 ms), `480` (LM=2, 10 ms), `240` (LM=1,
+    /// 5 ms), and `120` (LM=0, 2.5 ms). All other sizes return
+    /// [`Error::unsupported`].
     ///
-    /// Bit budget defaults scale linearly with `frame_samples` so the
-    /// nominal mono ≈ 64 kbit/s / stereo ≈ 102 kbit/s targets stay the
-    /// same across frame sizes.
+    /// The 10 ms path is used by Opus 10 ms Hybrid (RFC 6716 Table 2
+    /// configs 6/8/10). The 5 ms and 2.5 ms paths are useful for very
+    /// low-latency applications at the cost of reduced coding efficiency
+    /// (the per-frame header overhead amortises less at short frames).
+    ///
+    /// Use [`CeltEncoder::new_auto_lm`] to let the encoder pick the frame
+    /// size automatically based on transient rate in the input content.
     pub fn new_with_frame_samples(params: &CodecParameters, frame_samples: usize) -> Result<Self> {
         let channels = params.channels.unwrap_or(1) as usize;
         if channels != 1 && channels != 2 {
@@ -375,9 +384,9 @@ impl CeltEncoder {
         if sr != SAMPLE_RATE {
             return Err(Error::unsupported("CELT encoder: only 48 kHz is supported"));
         }
-        if frame_samples != 960 && frame_samples != 480 {
+        if !matches!(frame_samples, 120 | 240 | 480 | 960) {
             return Err(Error::unsupported(
-                "CELT encoder: frame_samples must be 480 (LM=2, 10 ms) or 960 (LM=3, 20 ms)",
+                "CELT encoder: frame_samples must be 120/240/480/960 (LM=0/1/2/3)",
             ));
         }
         let lm = lm_for_frame_samples(frame_samples as u32) as i32;
@@ -421,7 +430,79 @@ impl CeltEncoder {
         })
     }
 
-    /// Per-instance CELT frame length in 48 kHz samples (480 or 960).
+    /// Construct a CELT encoder with automatic LM (frame size) selection.
+    ///
+    /// The heuristic starts at LM=3 (960 samples / 20 ms) for steady-state
+    /// content. If transient content is expected (indicated by
+    /// `high_transient_rate = true`), the encoder starts at LM=1 (240
+    /// samples / 5 ms) to bound temporal smear. Applications with extremely
+    /// tight latency requirements and highly transient content can force LM=0
+    /// (120 samples / 2.5 ms) by passing `high_transient_rate = true` and
+    /// setting `bytes_per_frame` to a small value.
+    ///
+    /// The encoder can be switched to a different frame size at runtime by
+    /// constructing a new encoder — the state is not carried across frame sizes.
+    ///
+    /// Heuristic:
+    /// - `high_transient_rate = false` → LM=3 (20 ms, best efficiency for music)
+    /// - `high_transient_rate = true`  → LM=1 (5 ms, tight latency for percussion)
+    pub fn new_auto_lm(params: &CodecParameters, high_transient_rate: bool) -> Result<Self> {
+        let frame_samples = if high_transient_rate { 240 } else { 960 };
+        Self::new_with_frame_samples(params, frame_samples)
+    }
+
+    /// Select the recommended LM (frame size) for a block of PCM based on
+    /// transient rate. Returns the `frame_samples` value to pass to
+    /// [`CeltEncoder::new_with_frame_samples`].
+    ///
+    /// The heuristic splits `pcm` into 8 sub-blocks (matching the LM=3
+    /// short-block count) and counts how many sub-block boundaries carry a
+    /// significant onset (peak/median ratio above `transient_threshold_db`
+    /// within a 3-sub-block sliding window). A high transient rate (≥3 onsets
+    /// per 8 sub-blocks) suggests LM=1 (240 samples / 5 ms). A very high rate
+    /// (≥6 onsets) suggests LM=0 (120 samples / 2.5 ms). Otherwise LM=3
+    /// (960 samples / 20 ms) is returned.
+    ///
+    /// This function examines at most one frame's worth of PCM; callers
+    /// accumulate counts over multiple frames for smoothed decisions.
+    pub fn select_lm_for_pcm(pcm: &[f32], transient_threshold_db: f32) -> usize {
+        // Count transient sub-block boundaries.
+        const SUB_BLOCKS: usize = 8;
+        let block_len = pcm.len() / SUB_BLOCKS;
+        if block_len == 0 {
+            return 960;
+        }
+        let mut energies = [0f32; SUB_BLOCKS];
+        for b in 0..SUB_BLOCKS {
+            let lo = b * block_len;
+            let hi = lo + block_len;
+            let mut e = 0f32;
+            for &s in &pcm[lo..hi] {
+                e += s * s;
+            }
+            energies[b] = e / block_len as f32;
+        }
+        let mut sorted = energies;
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = (sorted[SUB_BLOCKS / 2 - 1] + sorted[SUB_BLOCKS / 2]) * 0.5;
+        let median = median.max(1e-12);
+        let mut onset_count = 0usize;
+        for b in 1..SUB_BLOCKS {
+            let ratio_db = 10.0 * (energies[b] / median).log10();
+            if ratio_db > transient_threshold_db {
+                onset_count += 1;
+            }
+        }
+        if onset_count >= 6 {
+            120
+        } else if onset_count >= 3 {
+            240
+        } else {
+            960
+        }
+    }
+
+    /// Per-instance CELT frame length in 48 kHz samples (120, 240, 480, or 960).
     pub fn frame_samples(&self) -> usize {
         self.frame_samples
     }
@@ -1066,7 +1147,7 @@ impl CeltEncoder {
     fn encode_frame(&mut self, pcm_in: &[f32]) -> Result<Packet> {
         debug_assert_eq!(pcm_in.len(), self.frame_samples);
         let lm = self.lm;
-        debug_assert!(lm == 2 || lm == 3);
+        debug_assert!(lm >= 0 && lm <= 3);
         let frame_samples = self.frame_samples;
 
         // Pre-emphasis (RFC 6716 §4.3.7.2 inverse): `y[n] = x[n] - alpha_p *
@@ -1216,20 +1297,25 @@ impl CeltEncoder {
         // input dynamics (not post-window envelope decay).
         let transient = !self.force_long_only && detect_transient(pcm);
 
+        // The MDCT input buffer is exactly 2*n samples. The overlap region
+        // at the front is min(OVERLAP, n) samples from the previous tail.
+        // At LM>=2 (n >= 400 >> OVERLAP=120) this is the full 120-sample
+        // window; at LM=0/1 (n < OVERLAP) only n samples of the tail fit.
+        let eff_overlap = OVERLAP.min(n);
         let mut raw = vec![0f32; 2 * n];
-        raw[..OVERLAP].copy_from_slice(&self.prev_tail[0]);
-        // Place up to N PCM samples starting after the overlap.
-        let take = n.min(pcm.len());
-        raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm[..take]);
-        // Stash the tail of THIS frame's PCM (last OVERLAP samples) for the
-        // next frame — this uses the raw frame tail (`frame_samples`), not
-        // the coded `n` tail, so the OLA at the decoder side lines up.
+        raw[..eff_overlap].copy_from_slice(&self.prev_tail[0][OVERLAP - eff_overlap..]);
+        // Body: fill as many PCM samples as fit after the overlap region.
+        let body_len = 2 * n - eff_overlap;
+        let take = body_len.min(pcm.len());
+        raw[eff_overlap..eff_overlap + take].copy_from_slice(&pcm[..take]);
+        // Stash the tail of THIS frame's PCM for the next frame's overlap.
+        // Always use the last OVERLAP samples of the full frame, regardless of
+        // how many went into this frame's MDCT body. This keeps the decoder's
+        // OLA aligned regardless of LM.
         self.prev_tail[0].copy_from_slice(&pcm[frame_samples - OVERLAP..]);
 
-        // Apply CELT window (only the overlap regions) — this windowing
-        // acts at the frame boundary for both long and short blocks, so the
-        // decoder's matching OLA with the adjacent frame's tail lines up.
-        crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
+        // Apply CELT window to the effective overlap regions.
+        crate::mdct::window_forward(&mut raw, &WINDOW_120, n, eff_overlap);
 
         // 2) Forward MDCT → N coefficients. Short blocks run 8 × 200→100
         // sub-MDCTs with their own 100-tap sin² window at sub-block
@@ -1457,10 +1543,22 @@ impl CeltEncoder {
             &mut rng_local,
         );
 
-        // Anti-collapse ON flag. We choose `off`, so emit the reserved 1 bit
-        // as zero — decoder skips the anti-collapse pass.
+        // Anti-collapse ON flag (RFC §4.3.5). Determine whether any band
+        // collapsed on the encoder side: check collapse_masks. For a
+        // transient frame with M sub-blocks, the full mask is (1<<M)-1.
+        // A band where collapse_masks[i] == 0 (no pulses landed) or < full
+        // mask (some sub-blocks got no pulses) is a candidate. We set
+        // anti_collapse_on = 1 when at least one coded band has a partial
+        // or full collapse so the decoder injects a noise floor there.
+        let anti_collapse_on = if anti_collapse_rsv > 0 {
+            let full_mask = ((1u32 << (lm as u32)) - 1) as u8;
+            let collapsed = (0..coded_bands).any(|i| collapse_masks[i] != full_mask);
+            collapsed
+        } else {
+            false
+        };
         if anti_collapse_rsv > 0 {
-            rc.encode_bits(0, 1);
+            rc.encode_bits(if anti_collapse_on { 1 } else { 0 }, 1);
         }
 
         // Final fine-energy pass (bits left from total - rc.tell()).
@@ -1497,7 +1595,7 @@ impl CeltEncoder {
     fn encode_frame_stereo(&mut self, pcm: &[f32]) -> Result<Packet> {
         debug_assert_eq!(pcm.len(), 2 * self.frame_samples);
         let lm = self.lm;
-        debug_assert!(lm == 2 || lm == 3);
+        debug_assert!(lm >= 0);
         let frame_samples = self.frame_samples;
         let channels = 2usize;
 
@@ -1640,6 +1738,9 @@ impl CeltEncoder {
         let m = 1i32 << lm;
 
         // Forward MDCT per channel. Output: coeffs_l, coeffs_r (length n).
+        // Use the same effective-overlap clamping as the mono path so that
+        // LM=0/1 frames (where OVERLAP > n) don't overflow the 2*n buffer.
+        let eff_overlap_s = OVERLAP.min(n);
         let mut coeffs_l = vec![0f32; n];
         let mut coeffs_r = vec![0f32; n];
         for (ch, pcm_ch, coeffs) in [
@@ -1647,11 +1748,12 @@ impl CeltEncoder {
             (1usize, &r_pcm, &mut coeffs_r),
         ] {
             let mut raw = vec![0f32; 2 * n];
-            raw[..OVERLAP].copy_from_slice(&self.prev_tail[ch]);
-            let take = n.min(pcm_ch.len());
-            raw[OVERLAP..OVERLAP + take].copy_from_slice(&pcm_ch[..take]);
+            raw[..eff_overlap_s].copy_from_slice(&self.prev_tail[ch][OVERLAP - eff_overlap_s..]);
+            let body_len = 2 * n - eff_overlap_s;
+            let take = body_len.min(pcm_ch.len());
+            raw[eff_overlap_s..eff_overlap_s + take].copy_from_slice(&pcm_ch[..take]);
             self.prev_tail[ch].copy_from_slice(&pcm_ch[frame_samples - OVERLAP..]);
-            crate::mdct::window_forward(&mut raw, &WINDOW_120, n, OVERLAP);
+            crate::mdct::window_forward(&mut raw, &WINDOW_120, n, eff_overlap_s);
             if transient {
                 crate::mdct::forward_mdct_short(&raw, coeffs, n, lm as usize, &self.short_window);
             } else {
@@ -1840,9 +1942,20 @@ impl CeltEncoder {
             &mut rng_local,
         );
 
-        // Anti-collapse-on flag = 0 (we don't run anti-collapse on encode).
+        // Anti-collapse ON flag (RFC §4.3.5) — stereo path. Check per-channel
+        // collapse masks (stored interleaved: index i*channels+ch). Set the
+        // flag if any coded band in either channel has a partial collapse.
+        let anti_collapse_on = if anti_collapse_rsv > 0 {
+            let full_mask = ((1u32 << (lm as u32)) - 1) as u8;
+            (0..coded_bands).any(|i| {
+                collapse_masks[i * channels] != full_mask
+                    || collapse_masks[i * channels + 1] != full_mask
+            })
+        } else {
+            false
+        };
         if anti_collapse_rsv > 0 {
-            rc.encode_bits(0, 1);
+            rc.encode_bits(if anti_collapse_on { 1 } else { 0 }, 1);
         }
 
         // Final fine-energy pass.

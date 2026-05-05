@@ -151,13 +151,12 @@ impl CeltDecoder {
     }
 
     /// Construct a CELT decoder for an explicit frame size. Supported
-    /// values are `960` (LM=3, 20 ms) and `480` (LM=2, 10 ms). All other
-    /// sizes return [`Error::unsupported`]. Pair this with the matching
-    /// encoder constructor —
-    /// [`crate::encoder::CeltEncoder::new_with_frame_samples`] — and feed
-    /// the decoder packets emitted by an encoder of the same frame size.
-    /// The 10 ms path is the CELT-MDCT length used by the Opus 10 ms
-    /// Hybrid configuration (RFC 6716 Table 2 configs 6/8/10).
+    /// values are `960` (LM=3, 20 ms), `480` (LM=2, 10 ms), `240` (LM=1,
+    /// 5 ms), and `120` (LM=0, 2.5 ms). All other sizes return
+    /// [`Error::unsupported`]. Pair this with the matching encoder
+    /// constructor — [`crate::encoder::CeltEncoder::new_with_frame_samples`]
+    /// — and feed the decoder packets emitted by an encoder of the same
+    /// frame size.
     pub fn new_with_frame_samples(params: &CodecParameters, frame_samples: usize) -> Result<Self> {
         let channels = params.channels.unwrap_or(1) as usize;
         if channels != 1 && channels != 2 {
@@ -169,9 +168,9 @@ impl CeltDecoder {
         if sr != SAMPLE_RATE {
             return Err(Error::unsupported("CELT decoder: only 48 kHz is supported"));
         }
-        if frame_samples != 960 && frame_samples != 480 {
+        if !matches!(frame_samples, 120 | 240 | 480 | 960) {
             return Err(Error::unsupported(
-                "CELT decoder: frame_samples must be 480 (LM=2, 10 ms) or 960 (LM=3, 20 ms)",
+                "CELT decoder: frame_samples must be 120/240/480/960 (LM=0/1/2/3)",
             ));
         }
         let lm = lm_for_frame_samples(frame_samples as u32) as i32;

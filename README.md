@@ -63,20 +63,28 @@ The codec is also discoverable through the `RuntimeContext` via
 ## Supported configuration
 
 This crate targets the fullband subset of CELT — the same profile an
-Opus encoder picks for "music" content. Both 20 ms (LM=3, default) and
-10 ms (LM=2, opt-in via `*_with_frame_samples(_, 480)`) frame sizes
-ship; the 10 ms path is the CELT-MDCT length used by Opus 10 ms Hybrid
-(RFC 6716 Table 2 configs 6/8/10). Both long-block and short-block
-(transient) coding are supported at each frame size.
+Opus encoder picks for "music" content. All four RFC-valid frame sizes
+(LM=0..3) ship. Long-block and short-block (transient) coding are
+supported at each frame size. Use `new_auto_lm(params, high_transient)`
+to let the crate pick the optimal LM for your content.
 
-| Parameter      | Value                                 |
-|----------------|---------------------------------------|
-| Sample rate    | 48 kHz only                           |
-| Channels       | 1 (mono) or 2 (stereo, dual-stereo)   |
-| Frame size     | 960 samples (LM=3, 20 ms, default) or 480 samples (LM=2, 10 ms) |
-| Sample format  | `F32`, `F32P`, `S16`, `S16P` on input |
-| Output format  | `F32`, interleaved                    |
-| Bandwidth      | Fullband (NB_EBANDS=21 bands)         |
+| Parameter      | Value                                                     |
+|----------------|-----------------------------------------------------------|
+| Sample rate    | 48 kHz only                                               |
+| Channels       | 1 (mono) or 2 (stereo, dual-stereo)                       |
+| Frame size     | 960 (LM=3, 20 ms, default), 480 (LM=2, 10 ms), 240 (LM=1, 5 ms), 120 (LM=0, 2.5 ms) |
+| Sample format  | `F32`, `F32P`, `S16`, `S16P` on input                    |
+| Output format  | `F32`, interleaved                                        |
+| Bandwidth      | Fullband (NB_EBANDS=21 bands)                             |
+
+### Frame-size / bitrate guide
+
+| LM | Frame   | Default mono | Default stereo | Use case                          |
+|----|---------|--------------|----------------|-----------------------------------|
+| 3  | 20 ms   | 64 kbit/s    | 102 kbit/s     | Music, speech — best efficiency   |
+| 2  | 10 ms   | 96 kbit/s    | 154 kbit/s     | Low-latency voice / Opus Hybrid   |
+| 1  |  5 ms   | 154 kbit/s   | 246 kbit/s     | Percussion, highly transient      |
+| 0  | 2.5 ms  | 320 kbit/s   | 512 kbit/s     | Ultra-low-latency, live effects   |
 
 The decoder accepts any packet that matches the encoder's profile, plus
 the RFC 6716 §4.3 silence flag (packets with the silence bit set decode
@@ -127,8 +135,11 @@ Following the RFC 6716 §4.3 section numbers:
   (`cwrs`), `exp_rotation`, collapse-mask extraction. Long AND short
   (`big_b = M`) block partitioning via Hadamard deinterleave / interleave.
 - §4.3.5 anti-collapse — reserved and parsed on transient frames;
-  the encoder currently emits `anti_collapse_on = 0`, the decoder
-  runs the pulse-injection fix-up when the flag is set.
+  the encoder inspects the per-band `collapse_masks` after PVQ shape
+  coding and emits `anti_collapse_on = 1` when at least one coded band
+  has a partial or full collapse (some short-block sub-windows received
+  no pulses). The decoder runs the noise-floor injection when the flag
+  is set.
 - §4.3.6 denormalisation.
 - §4.3.7 MDCT — forward (encoder) and inverse (decoder) via pre-twiddle
   + length-N/4 Bluestein FFT + post-twiddle. Transient frames run
@@ -183,14 +194,15 @@ every gap below.
   of libopus' bespoke mixed-radix kiss_fft (15·8 split at LM=3). The
   output has comparable RMS but the spectral peak is not yet bit-exact
   with libopus.
-- **Sample rates other than 48 kHz and frame sizes other than 20 ms.**
-  CELT itself supports 8/12/16/24/48 kHz and LM=0..3; this crate
-  currently pins LM=3 / 48 kHz.
+- **Sample rates other than 48 kHz.** CELT itself supports 8/12/16/24/48
+  kHz; this crate pins 48 kHz. All four RFC-valid LM values (0..3) now
+  ship.
 
 ## Codec id
 
-- `"celt"`. Audio. `SampleFormat::F32` output, 48 kHz, 1 or 2 channels,
-  960 samples per frame.
+- `"celt"`. Audio. `SampleFormat::F32` output, 48 kHz, 1 or 2 channels.
+  Default frame size 960 samples (LM=3); use `new_with_frame_samples` for
+  120 / 240 / 480 / 960 frame sizes.
 
 ## License
 

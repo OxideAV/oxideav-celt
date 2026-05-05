@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **LM=0 (120 samples / 2.5 ms) and LM=1 (240 samples / 5 ms) frame
+  sizes** — `CeltEncoder::new_with_frame_samples` and
+  `CeltDecoder::new_with_frame_samples` now accept 120 and 240 in
+  addition to the existing 480 / 960. All four RFC-valid CELT LM values
+  are supported. The LM=0/1 paths use the same per-band quantisation,
+  PVQ, TF analyser, silence/transient and post-filter machinery as LM=2/3,
+  with an effective-overlap clamp (`eff_overlap = min(OVERLAP, coded_n)`)
+  so the 2*N MDCT buffer is never overflowed at small frame sizes.
+- **LM-selection heuristic** — `CeltEncoder::new_auto_lm(params,
+  high_transient_rate)` constructs an encoder with the recommended frame
+  size (LM=3 for music, LM=1 for highly percussive content).
+  `CeltEncoder::select_lm_for_pcm(pcm, threshold_db)` is a standalone
+  heuristic that counts per-sub-block onset rate and returns the
+  recommended `frame_samples` value (120 / 240 / 960).
+- **Anti-collapse encoder-side flag** (RFC §4.3.5) — the encoder now
+  inspects `collapse_masks` after `encode_all_bands_{mono,stereo_dual}`
+  and emits `anti_collapse_on = 1` when at least one coded band has a
+  partial or full collapse (i.e. some short-block sub-windows received no
+  pulses). Previously the flag was always emitted as 0 (off). The decoder
+  has always handled the flag correctly; this change makes the encoder
+  trigger the decoder's noise-floor injection on actual collapses.
+- **Per-LM regression tests** — `per_lm_sine_tone_dominance` verifies
+  1 kHz tone dominance (≥2× vs 5 kHz) at all four frame sizes;
+  `per_lm_noise_roundtrip` verifies white-noise energy is non-trivially
+  reconstructed at each LM; `anti_collapse_flag_emitted_on_transient`
+  verifies the encoder + decoder handle a bursty castanets-style signal
+  without error.
+
 ### Changed
 
 - **`register` entry point unified on `RuntimeContext`** (task #502).
@@ -15,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   oxideav_core::RuntimeContext)` calls it internally. Breaking change
   for direct callers passing a `CodecRegistry`; switch to either the
   new `RuntimeContext` entry or the explicit `register_codecs` name.
+- **Byte budget schedule for short frames** — updated for LM=0/1: LM=0
+  gets 62.5% of the LM=3 mono budget (100 bytes / 160 bytes stereo,
+  ≈ 320 / 512 kbps) to cover the mandatory per-frame overhead; LM=1
+  gets 60% (96 / 154 bytes, ≈ 154 / 246 kbps). The LM=2 budget (75%)
+  is unchanged.
 
 ## [0.1.2](https://github.com/OxideAV/oxideav-celt/compare/v0.1.1...v0.1.2) - 2026-05-03
 

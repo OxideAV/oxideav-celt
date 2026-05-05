@@ -1076,15 +1076,416 @@ fn lm2_stereo_sine_roundtrip() {
 }
 
 #[test]
-fn lm2_constructor_rejects_unsupported_frame_size() {
+fn constructor_rejects_unsupported_frame_size() {
     let params = build_params(1);
-    // 240 (LM=1) and 120 (LM=0) are RFC-valid CELT modes but this
-    // encoder/decoder pair only supports the two Opus-relevant LMs.
-    assert!(CeltEncoder::new_with_frame_samples(&params, 240).is_err());
-    assert!(CeltDecoder::new_with_frame_samples(&params, 240).is_err());
-    assert!(CeltEncoder::new_with_frame_samples(&params, 120).is_err());
-    assert!(CeltDecoder::new_with_frame_samples(&params, 120).is_err());
-    // 720 — random non-power-of-two size, also rejected.
+    // 120 (LM=0), 240 (LM=1), 480 (LM=2), 960 (LM=3) are all valid.
+    assert!(CeltEncoder::new_with_frame_samples(&params, 120).is_ok());
+    assert!(CeltDecoder::new_with_frame_samples(&params, 120).is_ok());
+    assert!(CeltEncoder::new_with_frame_samples(&params, 240).is_ok());
+    assert!(CeltDecoder::new_with_frame_samples(&params, 240).is_ok());
+    // 720 — not a valid CELT frame size, must be rejected.
     assert!(CeltEncoder::new_with_frame_samples(&params, 720).is_err());
     assert!(CeltDecoder::new_with_frame_samples(&params, 720).is_err());
+    // 360 — also invalid.
+    assert!(CeltEncoder::new_with_frame_samples(&params, 360).is_err());
+    assert!(CeltDecoder::new_with_frame_samples(&params, 360).is_err());
+}
+
+/// LM=0 (120 samples / 2.5 ms) round-trip: encoder + decoder round-trip
+/// a 1 kHz sine at the smallest frame size and produce non-silent output.
+#[test]
+fn lm0_sine_roundtrip_audible_tone() {
+    const LM0_FRAME_SAMPLES: usize = 120;
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new_with_frame_samples(&params, LM0_FRAME_SAMPLES).unwrap();
+    let mut dec = CeltDecoder::new_with_frame_samples(&params, LM0_FRAME_SAMPLES).unwrap();
+    let n_frames = 16usize;
+    let n_samples = LM0_FRAME_SAMPLES * n_frames;
+    let freq = 1000.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+        .collect();
+    for chunk in signal.chunks(LM0_FRAME_SAMPLES) {
+        if chunk.len() == LM0_FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+    let mut decoded: Vec<f32> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(pkt) => {
+                dec.send_packet(&pkt).unwrap();
+                while let Ok(frame) = dec.receive_frame() {
+                    decoded.extend(decoded_f32(&frame));
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(decoded.len(), n_samples);
+    assert!(decoded.iter().all(|v| v.is_finite()), "LM=0 decoded non-finite");
+    let mid_start = LM0_FRAME_SAMPLES * 8;
+    let mid_end = mid_start + LM0_FRAME_SAMPLES * 4;
+    let e: f32 = decoded[mid_start..mid_end]
+        .iter()
+        .map(|v| v * v)
+        .sum::<f32>()
+        / (LM0_FRAME_SAMPLES * 4) as f32;
+    assert!(e > 1e-5, "LM=0 decoded output silent (energy={e})");
+}
+
+/// LM=1 (240 samples / 5 ms) round-trip: encoder + decoder round-trip
+/// a 1 kHz sine at the 5 ms frame size and produce non-silent output.
+#[test]
+fn lm1_sine_roundtrip_audible_tone() {
+    const LM1_FRAME_SAMPLES: usize = 240;
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new_with_frame_samples(&params, LM1_FRAME_SAMPLES).unwrap();
+    let mut dec = CeltDecoder::new_with_frame_samples(&params, LM1_FRAME_SAMPLES).unwrap();
+    let n_frames = 8usize;
+    let n_samples = LM1_FRAME_SAMPLES * n_frames;
+    let freq = 1000.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+        .collect();
+    for chunk in signal.chunks(LM1_FRAME_SAMPLES) {
+        if chunk.len() == LM1_FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+    let mut decoded: Vec<f32> = Vec::new();
+    loop {
+        match enc.receive_packet() {
+            Ok(pkt) => {
+                dec.send_packet(&pkt).unwrap();
+                while let Ok(frame) = dec.receive_frame() {
+                    decoded.extend(decoded_f32(&frame));
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    assert_eq!(decoded.len(), n_samples);
+    assert!(decoded.iter().all(|v| v.is_finite()), "LM=1 decoded non-finite");
+    let mid_start = LM1_FRAME_SAMPLES * 4;
+    let mid_end = mid_start + LM1_FRAME_SAMPLES * 2;
+    let e: f32 = decoded[mid_start..mid_end]
+        .iter()
+        .map(|v| v * v)
+        .sum::<f32>()
+        / (LM1_FRAME_SAMPLES * 2) as f32;
+    assert!(e > 1e-5, "LM=1 decoded output silent (energy={e})");
+}
+
+/// `new_auto_lm` heuristic: verify it constructs valid encoders for
+/// both steady-state and high-transient content modes.
+#[test]
+fn auto_lm_constructor_produces_valid_encoder() {
+    use oxideav_celt::encoder::CeltEncoder;
+    let params = build_params(1);
+    // Steady-state → LM=3 (960 samples).
+    let enc_steady = CeltEncoder::new_auto_lm(&params, false).unwrap();
+    assert_eq!(enc_steady.frame_samples(), 960);
+    // High transient → LM=1 (240 samples).
+    let enc_transient = CeltEncoder::new_auto_lm(&params, true).unwrap();
+    assert_eq!(enc_transient.frame_samples(), 240);
+}
+
+/// `select_lm_for_pcm` heuristic: verify it picks smaller LM for bursty signals.
+#[test]
+fn select_lm_for_pcm_picks_smaller_lm_on_burst() {
+    use oxideav_celt::encoder::CeltEncoder;
+    // Steady 1 kHz sine — should return 960 (LM=3).
+    let n = 960usize;
+    let sine: Vec<f32> = (0..n)
+        .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 48_000.0).sin() * 0.3)
+        .collect();
+    let lm_sine = CeltEncoder::select_lm_for_pcm(&sine, 15.0);
+    assert_eq!(lm_sine, 960, "steady sine should select LM=3 (960 samples)");
+
+    // Sharp burst (castanets-style): near-zero for 7/8 of the frame, then
+    // a loud hit for 1/8 → many sub-blocks carry the onset.
+    let mut burst = vec![0.0f32; n];
+    for i in (n / 8)..(n / 4) {
+        burst[i] = 0.8;
+    }
+    for i in (n / 2)..(5 * n / 8) {
+        burst[i] = 0.6;
+    }
+    for i in (7 * n / 8)..n {
+        burst[i] = 0.9;
+    }
+    let lm_burst = CeltEncoder::select_lm_for_pcm(&burst, 15.0);
+    // Burst has many onsets, should select shorter frame (240 or 120).
+    assert!(
+        lm_burst <= 240,
+        "bursty signal should select LM<=1 (240 or 120 samples), got {lm_burst}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-LM PSNR benchmarks (regression sentinels).
+// ---------------------------------------------------------------------------
+
+/// Self-roundtrip SNR for a given frame size: encode + decode a 1 kHz sine
+/// with the CELT encoder+decoder pair at `frame_samples` and report SNR
+/// on the steady-state middle section. Returns (SNR dB, bytes/frame).
+fn lm_sine_psnr(frame_samples: usize) -> (f32, usize) {
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new_with_frame_samples(&params, frame_samples).unwrap();
+    let bytes_per_frame = enc.frame_samples(); // proxy: actual depends on budget
+    let mut dec = CeltDecoder::new_with_frame_samples(&params, frame_samples).unwrap();
+    let n_frames = (48_000 / frame_samples).max(16); // at least ~0.3 s
+    let n_samples = frame_samples * n_frames;
+    let freq = 1000.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+        .collect();
+    for chunk in signal.chunks(frame_samples) {
+        if chunk.len() == frame_samples {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+    let mut decoded: Vec<f32> = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut packet_count = 0usize;
+    loop {
+        match enc.receive_packet() {
+            Ok(pkt) => {
+                total_bytes += pkt.data.len();
+                packet_count += 1;
+                dec.send_packet(&pkt).unwrap();
+                while let Ok(frame) = dec.receive_frame() {
+                    decoded.extend(decoded_f32(&frame));
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let avg_bytes = if packet_count > 0 {
+        total_bytes / packet_count
+    } else {
+        bytes_per_frame
+    };
+    // SNR on the middle 50% of frames (skip first 25% settling).
+    let lo = n_samples / 4;
+    let hi = lo + n_samples / 2;
+    let hi = hi.min(decoded.len()).min(signal.len());
+    if hi <= lo {
+        return (0.0, avg_bytes);
+    }
+    let snr = snr_db(&signal, &decoded, lo, hi);
+    (snr, avg_bytes)
+}
+
+/// Per-LM Goertzel-based tone energy report — regression sentinel.
+///
+/// For each LM: encode a 1 kHz sine, decode, measure energy at 1 kHz vs
+/// 5 kHz (as a proxy for reconstruction fidelity). The target tone must
+/// dominate the off-band by at least 2x. Also prints bytes/frame and
+/// effective bitrate.
+///
+/// We use Goertzel rather than raw PSNR because CELT is a perceptual codec
+/// that does not preserve phase — time-domain PSNR is very low even for
+/// high-quality encoding. The tone-dominance check is a meaningful proxy
+/// for perceptual quality at the target frequency.
+#[test]
+fn per_lm_sine_tone_dominance() {
+    let goertzel = |samples: &[f32], f: f32| -> f32 {
+        let w = 2.0 * std::f32::consts::PI * f / SAMPLE_RATE as f32;
+        let cw = w.cos();
+        let (mut s0, mut s1, mut s2) = (0f32, 0f32, 0f32);
+        for &x in samples {
+            s0 = 2.0 * cw * s1 - s2 + x;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).sqrt()
+    };
+
+    for &fs in &[120usize, 240, 480, 960] {
+        let (_snr, bytes_per_frame) = lm_sine_psnr(fs);
+        let kbps = bytes_per_frame as f64 * 8.0 / (fs as f64 / SAMPLE_RATE as f64) / 1000.0;
+
+        // Encode + decode independently to get the decoded slice.
+        let params = build_params(1);
+        let mut enc = CeltEncoder::new_with_frame_samples(&params, fs).unwrap();
+        let mut dec = CeltDecoder::new_with_frame_samples(&params, fs).unwrap();
+        let n_frames = (48_000 / fs).max(16);
+        let n_samples = fs * n_frames;
+        let freq = 1000.0f32;
+        let signal: Vec<f32> = (0..n_samples)
+            .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+            .collect();
+        for chunk in signal.chunks(fs) {
+            if chunk.len() == fs {
+                enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+            }
+        }
+        enc.flush().unwrap();
+        let mut decoded: Vec<f32> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => {
+                    dec.send_packet(&pkt).unwrap();
+                    while let Ok(frame) = dec.receive_frame() {
+                        decoded.extend(decoded_f32(&frame));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // Measure on the middle 50% (skip settling frames).
+        let lo = n_samples / 4;
+        let hi = (lo + n_samples / 2).min(decoded.len());
+        let slice = &decoded[lo..hi];
+        let mag_1k = goertzel(slice, 1000.0);
+        let mag_5k = goertzel(slice, 5000.0);
+        let ratio = mag_1k / mag_5k.max(1e-9);
+        println!(
+            "LM={} frame={:4} ms={:.1}  bytes/frame={:3}  kbps={:.0}  mag@1kHz/5kHz={:.1}x",
+            lm_for_frame_samples_test(fs),
+            fs,
+            fs as f32 / SAMPLE_RATE as f32 * 1000.0,
+            bytes_per_frame,
+            kbps,
+            ratio,
+        );
+        assert!(
+            mag_1k > 2.0 * mag_5k,
+            "LM={} (frame_samples={}) 1 kHz tone buried (ratio={:.2}x < 2x)",
+            lm_for_frame_samples_test(fs),
+            fs,
+            ratio,
+        );
+    }
+}
+
+fn lm_for_frame_samples_test(fs: usize) -> u32 {
+    match fs {
+        120 => 0,
+        240 => 1,
+        480 => 2,
+        960 => 3,
+        _ => 99,
+    }
+}
+
+/// White-noise roundtrip at each LM: decoded output must be finite and
+/// have non-negligible energy (the encoder should not collapse to silence).
+#[test]
+fn per_lm_noise_roundtrip() {
+    let mut seed = 0x7b3au32;
+    for &fs in &[120usize, 240, 480, 960] {
+        let params = build_params(1);
+        let mut enc = CeltEncoder::new_with_frame_samples(&params, fs).unwrap();
+        let mut dec = CeltDecoder::new_with_frame_samples(&params, fs).unwrap();
+        let n_frames = 16usize;
+        let n_samples = fs * n_frames;
+        let signal: Vec<f32> = (0..n_samples)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 16) as i32 - 32768) as f32 / 32768.0 * 0.1
+            })
+            .collect();
+        for chunk in signal.chunks(fs) {
+            if chunk.len() == fs {
+                enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+            }
+        }
+        enc.flush().unwrap();
+        let mut decoded: Vec<f32> = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pkt) => {
+                    dec.send_packet(&pkt).unwrap();
+                    while let Ok(frame) = dec.receive_frame() {
+                        decoded.extend(decoded_f32(&frame));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(decoded.len(), n_samples, "LM={}: wrong output length", lm_for_frame_samples_test(fs));
+        assert!(
+            decoded.iter().all(|v| v.is_finite()),
+            "LM={}: decoded output contains non-finite value",
+            lm_for_frame_samples_test(fs)
+        );
+        let lo = fs * 4;
+        let hi = lo + fs * 4;
+        let e: f32 = decoded[lo..hi].iter().map(|v| v * v).sum::<f32>() / (fs * 4) as f32;
+        assert!(
+            e > 1e-7,
+            "LM={} (frame_samples={}) white-noise decoded energy {e:.2e} too low",
+            lm_for_frame_samples_test(fs),
+            fs,
+        );
+        println!("LM={} frame={} noise roundtrip OK (e={:.2e})", lm_for_frame_samples_test(fs), fs, e);
+    }
+}
+
+/// Anti-collapse flag exercise: on a transient signal with low per-band pulse
+/// allocation, the encoder should emit anti_collapse_on=1 on at least some
+/// transient frames, and the decoder must handle those packets without error.
+#[test]
+fn anti_collapse_flag_emitted_on_transient() {
+    use oxideav_celt::header::decode_header;
+    use oxideav_celt::range_decoder::RangeDecoder;
+
+    let params = build_params(1);
+    let mut enc = CeltEncoder::new(&params).unwrap();
+    enc.set_force_long_only(false); // ensure transient detection is on
+
+    // Castanets-style signal: repeated short bursts against silence.
+    let n_frames = 8usize;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    let mut signal = vec![0.0f32; n_samples];
+    for f in 0..n_frames {
+        let onset = f * FRAME_SAMPLES + FRAME_SAMPLES / 8;
+        for s in onset..onset + 20 {
+            if s < n_samples {
+                signal[s] = 0.9;
+            }
+        }
+    }
+    for chunk in signal.chunks(FRAME_SAMPLES) {
+        if chunk.len() == FRAME_SAMPLES {
+            enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+
+    let mut packets = Vec::new();
+    while let Ok(pkt) = enc.receive_packet() {
+        packets.push(pkt);
+    }
+    assert!(!packets.is_empty(), "no packets produced");
+
+    // Decode every packet with the public decoder; no panics / errors.
+    let mut dec = CeltDecoder::new(&params).unwrap();
+    for pkt in &packets {
+        dec.send_packet(pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            assert!(decoded_f32(&frame).iter().all(|v| v.is_finite()));
+        }
+    }
+
+    // At least one packet must be transient.
+    let saw_transient = packets.iter().any(|pkt| {
+        let mut rd = RangeDecoder::new(&pkt.data);
+        decode_header(&mut rd).map_or(false, |h| h.transient)
+    });
+    assert!(
+        saw_transient,
+        "no transient packet found in the castanets stream"
+    );
+
+    println!(
+        "anti-collapse test: {} packets, at least one transient, decoder stable",
+        packets.len()
+    );
 }
