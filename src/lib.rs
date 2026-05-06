@@ -110,6 +110,7 @@ pub mod cwrs;
 pub mod decoder;
 pub mod encoder;
 pub mod encoder_bands;
+pub mod encoder_decisions;
 pub mod encoder_rate;
 pub mod header;
 pub mod laplace;

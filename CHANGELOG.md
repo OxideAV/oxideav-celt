@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Spread (rotation) parameter encoder** (RFC 6716 §4.3.4.4) —
+  `encoder_decisions::spread_decision` picks `SPREAD_NONE` / `LIGHT` /
+  `NORMAL` / `AGGRESSIVE` from a per-band peak-to-RMS tonality score on
+  the post-MDCT normalised shape. Tonal content (single-pulse-per-band)
+  suppresses rotation; noise-like content (white noise, dense partials)
+  selects `AGGRESSIVE`. Wired into both mono and stereo `encode_frame`.
+  Replaces the prior fixed `SPREAD_NORMAL` choice.
+- **Mono dynalloc band-energy boost** (RFC 6716 §4.3.3) —
+  `encoder_decisions::pick_dynalloc_boost_band` picks at most one
+  outlier band per frame whose log-energy exceeds the median by ~6 dB
+  and emits one quanta of extra pulse budget through the
+  `decode_bit_logp` boost loop. Stereo dynalloc remains all-zero
+  pending allocator-bisection adjustment for the dual-stereo
+  `(width * channels)` quanta doubling (the picker logic is in place).
 - **LM=0 (120 samples / 2.5 ms) and LM=1 (240 samples / 5 ms) frame
   sizes** — `CeltEncoder::new_with_frame_samples` and
   `CeltDecoder::new_with_frame_samples` now accept 120 and 240 in

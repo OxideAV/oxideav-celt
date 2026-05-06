@@ -55,14 +55,30 @@
 //!
 //! NOT implemented (fall back to long-block / no-boost path):
 //!
-//! * **Time-frequency change flags** — all `tf_res[i]` = 0. The transient
-//!   path picks the TF deltas + tf_select that yield zero post-lookup
-//!   for every band (libopus' nonzero TF decisions remain a TODO).
-//! * **Dynalloc band-energy boosts** — no per-band boost is emitted.
+//! * **Time-frequency change flags on transient frames** — `tf_res[i]` = 0
+//!   for the short-block / stereo / hybrid paths. The mono long-block path
+//!   honours the analyser's per-band picks (RFC §4.3.4.5).
+//! * **Stereo dynalloc band boosts** — the stereo path emits the cheap
+//!   "no boost" sequence on every band. The picker logic is wired (see
+//!   [`crate::encoder_decisions::pick_dynalloc_boost_band`]) but stays
+//!   disabled until the allocator's bisection accounts for the dual-stereo
+//!   `(width * channels)` quanta doubling.
 //! * **Intensity stereo (M/S with theta)** — not implemented. Stereo uses
 //!   dual-stereo only (L and R as two independent mono bands). Intensity
 //!   stereo would buy extra HF bits on low bit-rate stereo; at 64 kbit/s
 //!   the dual path produces well-separated L/R output.
+//!
+//! Perceptual decisions wired in this round:
+//!
+//! * **Spread (RFC §4.3.4.4)** — per-frame
+//!   [`crate::encoder_decisions::spread_decision`] picks SPREAD_NONE / LIGHT
+//!   / NORMAL / AGGRESSIVE based on a peak-to-RMS tonality score on the
+//!   normalised shape. Both mono and stereo paths run it.
+//! * **Mono dynalloc band boost (RFC §4.3.3)** —
+//!   [`crate::encoder_decisions::pick_dynalloc_boost_band`] picks at most
+//!   one outlier band per frame (>= 6 dB above median band energy) and
+//!   emits one quanta of extra pulse budget through the `decode_bit_logp`
+//!   boost loop. Wired into the mono `encode_frame` path only.
 //!
 //! Inter-frame energy prediction IS enabled (RFC 6716 §4.3.2.1): the first
 //! frame of the session is forced `intra=true` (no prior state), all
@@ -1441,33 +1457,67 @@ impl CeltEncoder {
         // non-transient frames where the analyser opted for ≠ 0 entries.
         let tf_res = tf_decision.tf_res.clone();
 
-        // Spread decision.
+        // Spread decision (RFC 6716 §4.3.4.4). Picks NONE / LIGHT / NORMAL /
+        // AGGRESSIVE from per-band peakiness via
+        // [`crate::encoder_decisions::spread_decision`]. The choice mostly
+        // affects [`crate::bands::exp_rotation`] inside the PVQ shape coder
+        // — tonal content benefits from less rotation, noise from more.
+        let spread = crate::encoder_decisions::spread_decision(&shape, lm, 0, NB_EBANDS);
         let mut tell = rc.tell();
         let total_bits_check = (bytes * 8) as i32;
         if tell + 4 <= total_bits_check {
-            rc.encode_icdf(SPREAD_NORMAL as usize, &SPREAD_ICDF, 5);
+            rc.encode_icdf(spread as usize, &SPREAD_ICDF, 5);
         }
 
-        // dynalloc offsets: emit ALL zeros. Dec loop emits `decode_bit_logp(dynalloc_logp)`
-        // until it gets back false. So we emit ONE false per band (no boosts).
+        // Dynalloc per-band boosts (RFC §4.3.3). Pick at most one peak band
+        // (heuristic in [`crate::encoder_decisions::pick_dynalloc_boost_band`])
+        // and emit one `true (logp=6)` followed by `false (logp=1)` to tag
+        // it for one quanta of extra pulse budget. Other bands emit the
+        // cheap `false (logp=6)` — one bit each, identical to the prior
+        // all-zero loop.
         let cap = init_caps(lm as usize, 1);
         let mut offsets = [0i32; NB_EBANDS];
+        let boost_band =
+            crate::encoder_decisions::pick_dynalloc_boost_band(&band_log_e, 0, NB_EBANDS);
         let mut dynalloc_logp = 6i32;
         let mut total_bits_frac = (bytes as i32) * 8 << BITRES;
         tell = rc.tell_frac() as i32;
         for i in 0..NB_EBANDS {
+            // width formula matches decoder's: (band_w * M * channels).
+            // Mono so channels = 1.
             let width = (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m;
             let quanta = (width << BITRES).min((6 << BITRES).max(width));
             let mut dynalloc_loop_logp = dynalloc_logp;
             let mut boost = 0i32;
+            // Emit dynalloc bits matching the decoder loop:
+            //   while (tell + (loop_logp<<BITRES) < total_bits_frac && boost<cap):
+            //     bit = decode_bit_logp(loop_logp)
+            //     if !bit: break
+            //     boost += quanta; total_bits_frac -= quanta;
+            //     loop_logp = 1
+            let want_boost = if Some(i) == boost_band { 1 } else { 0 };
+            let mut emitted = 0i32;
+            while emitted < want_boost
+                && tell + (dynalloc_loop_logp << BITRES) < total_bits_frac
+                && boost + quanta < cap[i]
+            {
+                rc.encode_bit_logp(true, dynalloc_loop_logp as u32);
+                tell = rc.tell_frac() as i32;
+                boost += quanta;
+                total_bits_frac -= quanta;
+                dynalloc_loop_logp = 1;
+                emitted += 1;
+            }
+            // Terminator (matches the decoder's `!flag` break) — only emit
+            // when the loop's gate would still let us through.
             if tell + (dynalloc_loop_logp << BITRES) < total_bits_frac && boost < cap[i] {
-                // Emit `false` = no boost. Decoder breaks out on `!flag`, so
-                // we only ever emit at most one.
                 rc.encode_bit_logp(false, dynalloc_loop_logp as u32);
                 tell = rc.tell_frac() as i32;
             }
             offsets[i] = boost;
-            // dynalloc_logp stays at 6 since we added no boost.
+            if boost > 0 {
+                dynalloc_logp = 2.max(dynalloc_logp - 1);
+            }
         }
         let _ = total_bits_frac;
 
@@ -1533,7 +1583,7 @@ impl CeltEncoder {
             &mut collapse_masks,
             &pulses,
             transient,
-            SPREAD_NORMAL,
+            spread,
             &tf_res,
             total_pvq_bits,
             balance,
@@ -1847,26 +1897,63 @@ impl CeltEncoder {
         }
         let tf_res = vec![0i32; NB_EBANDS];
 
-        // Spread decision.
+        // Spread decision (RFC §4.3.4.4) — stereo path. Use the LOUDER
+        // channel's normalised shape as the proxy for tonality. We could
+        // average the two but that's a strict downgrade for content with
+        // one tonal + one noisy channel; picking the loudest preserves the
+        // "is the dominant content tonal?" signal.
+        let l_e = band_log_e[..NB_EBANDS].iter().fold(0f32, |a, &b| a + b);
+        let r_e = band_log_e[NB_EBANDS..].iter().fold(0f32, |a, &b| a + b);
+        let dominant = if l_e >= r_e { &shape_l } else { &shape_r };
+        let spread = crate::encoder_decisions::spread_decision(dominant, lm, 0, NB_EBANDS);
         let mut tell = rc.tell();
         let total_bits_check = (bytes * 8) as i32;
         if tell + 4 <= total_bits_check {
-            rc.encode_icdf(SPREAD_NORMAL as usize, &SPREAD_ICDF, 5);
+            rc.encode_icdf(spread as usize, &SPREAD_ICDF, 5);
         }
 
-        // Dynalloc: emit all zeros.
+        // Dynalloc — stereo path. Mono boosts (single quanta on the peak
+        // band) are wired and tested. Stereo dynalloc remains disabled
+        // for now: stereo's `(width * channels)` quanta compounds with
+        // the dual-stereo PVQ partitioning to push the range coder over
+        // budget at LM<=2 byte-per-frame defaults. Re-enable once the
+        // allocator's bisection accounts for dual-stereo offset doubling
+        // — see [`crate::encoder_decisions::pick_dynalloc_boost_band`] for
+        // the picker that already runs (just left unused here).
         let cap = init_caps(lm as usize, channels);
-        let offsets = [0i32; NB_EBANDS];
-        let dynalloc_logp = 6i32;
-        let total_bits_frac = (bytes as i32) * 8 << BITRES;
+        let mut offsets = [0i32; NB_EBANDS];
+        let boost_band: Option<usize> = None;
+        let mut dynalloc_logp = 6i32;
+        let mut total_bits_frac = (bytes as i32) * 8 << BITRES;
         tell = rc.tell_frac() as i32;
         for i in 0..NB_EBANDS {
-            let _width = (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m;
-            let dynalloc_loop_logp = dynalloc_logp;
-            let boost = 0i32;
+            // Match the decoder's width formula: width = (band_w * M * c).
+            // Mono path (c=1) earlier in this file also has this constant;
+            // here channels=2 so we must include it.
+            let width = (EBAND_5MS[i + 1] - EBAND_5MS[i]) as i32 * m * channels as i32;
+            let quanta = (width << BITRES).min((6 << BITRES).max(width));
+            let mut dynalloc_loop_logp = dynalloc_logp;
+            let mut boost = 0i32;
+            let want_boost = if Some(i) == boost_band { 1 } else { 0 };
+            let mut emitted = 0i32;
+            while emitted < want_boost
+                && tell + (dynalloc_loop_logp << BITRES) < total_bits_frac
+                && boost + quanta < cap[i]
+            {
+                rc.encode_bit_logp(true, dynalloc_loop_logp as u32);
+                tell = rc.tell_frac() as i32;
+                boost += quanta;
+                total_bits_frac -= quanta;
+                dynalloc_loop_logp = 1;
+                emitted += 1;
+            }
             if tell + (dynalloc_loop_logp << BITRES) < total_bits_frac && boost < cap[i] {
                 rc.encode_bit_logp(false, dynalloc_loop_logp as u32);
                 tell = rc.tell_frac() as i32;
+            }
+            offsets[i] = boost;
+            if boost > 0 {
+                dynalloc_logp = 2.max(dynalloc_logp - 1);
             }
         }
 
@@ -1932,7 +2019,7 @@ impl CeltEncoder {
             &mut collapse_masks,
             &pulses,
             transient,
-            SPREAD_NORMAL,
+            spread,
             &tf_res,
             total_pvq_bits,
             balance,

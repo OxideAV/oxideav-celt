@@ -160,6 +160,18 @@ Following the RFC 6716 §4.3 section numbers:
     in-place `comb_filter` with negated gains on the pre-emphasized
     PCM before MDCT, emitting the post-filter header for the decoder
     to invert. See `pitch_analysis::analyse_pitch`.
+- §4.3.4.4 spread (rotation) parameter encoder
+  (`encoder_decisions::spread_decision`): per-frame peak-to-RMS tonality
+  score on the normalised shape picks `SPREAD_NONE` / `LIGHT` / `NORMAL`
+  / `AGGRESSIVE`. Tonal content suppresses rotation, noise-like content
+  (white noise, dense partials) maxes it out. Wired into both mono and
+  stereo `encode_frame` paths.
+- §4.3.3 dynalloc band boost (`encoder_decisions::pick_dynalloc_boost_band`):
+  per-frame outlier detector picks at most one band whose log-energy
+  exceeds the median by ~6 dB and emits one quanta of extra pulse budget
+  via the `decode_bit_logp` boost loop. Mono only — stereo dynalloc is
+  reserved (the picker still runs but stays unused) until the allocator
+  bisection accounts for the dual-stereo offset doubling.
 
 Static tables (transcribed from libopus `static_modes_float.h`):
 `EBAND_5MS`, `E_PROB_MODEL`, `PRED_COEF` / `BETA_COEF` / `BETA_INTRA`,
@@ -185,7 +197,8 @@ every gap below.
   no-op decision (every band gets `tf_change = 0`) until the
   recombine + Hadamard interaction in those modes is wired through
   `quant_partition_enc`.
-- **Dynalloc band-energy boosts.** No per-band boost is emitted.
+- **Dynalloc stereo path** still emits all-zero offsets; the mono path
+  picks one outlier band per frame.
 - **Intensity stereo.** Stereo uses dual-stereo only — L and R coded as
   two independent mono bands in one packet. Intensity stereo would buy
   extra HF bits on low bit-rate stereo; at 102 kbit/s the dual path
