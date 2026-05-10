@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-celt/compare/v0.1.2...v0.1.3) - 2026-05-06
+
+### Other
+
+- drop dead `linkme` dep
+- spread analyser + mono dynalloc band boost (RFC §4.3.3 + §4.3.4.4)
+- fix rustfmt + clippy violations in public_api_roundtrip
+- LM=0/1 frame sizes, anti-collapse flag, LM heuristic
+- auto-register via oxideav_core::register! macro (linkme distributed slice)
+- unify entry point on register(&mut RuntimeContext) ([#502](https://github.com/OxideAV/oxideav-celt/pull/502))
+
 ### Added
 
 - **Spread (rotation) parameter encoder** (RFC 6716 §4.3.4.4) —
