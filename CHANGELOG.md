@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/OxideAV/oxideav-celt/compare/v0.1.3...v0.1.4) - 2026-05-10
+
+### Other
+
+- cap extract_collapse_mask shift at 32 bits (RFC 6716 §4.3.4.5)
+
 ### Fixed
 
 - **Shift-overflow panic in `extract_collapse_mask`** (RFC 6716 §4.3.4.5)
