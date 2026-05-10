@@ -214,13 +214,23 @@ fn extract_collapse_mask(iy: &[i32], n: i32, b: i32) -> u32 {
     }
     let n0 = (n / b) as usize;
     let mut mask: u32 = 0;
-    for i in 0..b as usize {
+    // RFC 6716 §4.3.4.5 — the collapse mask has one bit per short-block
+    // sub-window (B = 2^LM, so at most 8). A malformed stream that drives
+    // the bit allocator into producing `b > 32` (or its callers feeding a
+    // pathological `big_b`) would otherwise overflow the `1 << i` shift.
+    // Cap the iteration at 32 bits and saturate the high bit defensively;
+    // the consumer truncates the mask to a `u8` (`collapse_masks[..]`)
+    // anyway, and the fuzzer-found inputs that triggered this all have
+    // `b` in the wild (>= 32) but `n0 == 0`, so the `tmp != 0` check
+    // never fires past the first few iterations in practice.
+    let bits = (b as usize).min(32);
+    for i in 0..bits {
         let mut tmp = 0i32;
         for j in 0..n0 {
             tmp |= iy[i * n0 + j];
         }
         if tmp != 0 {
-            mask |= 1 << i;
+            mask |= 1u32 << i;
         }
     }
     mask
@@ -1229,5 +1239,49 @@ mod tests {
         let bandlog = vec![0.0; NB_EBANDS];
         denormalise_bands(&x, &mut freq, &bandlog, 0, 21, 4, true);
         assert!(freq.iter().all(|&v| v == 0.0));
+    }
+
+    /// Pathological / malformed-stream input where the bit allocator
+    /// (or a fuzzed packet) drives `b` past 32. RFC 6716 §4.3.4.5 only
+    /// uses `B = 2^LM` (so `b <= 8`) for the collapse mask, so any
+    /// larger `b` is malformed; we must not panic with shift-overflow
+    /// (`1 << 32`) in debug builds. Found by `oxideav-opus` fuzz run
+    /// 25635976778 (`panic_free_decode`).
+    #[test]
+    fn extract_collapse_mask_does_not_panic_when_b_exceeds_32() {
+        // n0 = 0 in this case so the inner loop is empty; this still
+        // exercises the outer `1 << i` shift up to b - 1 = 63 in the
+        // pre-fix code, which would panic on i == 32.
+        let iy = vec![0i32; 16];
+        let mask = extract_collapse_mask(&iy, 16, 64);
+        assert_eq!(mask, 0);
+    }
+
+    /// Same overflow boundary, but with a non-zero `n0` so the inner
+    /// loop also runs. Confirms the cap doesn't accidentally drop
+    /// legitimate low bits.
+    #[test]
+    fn extract_collapse_mask_caps_at_32_bits_with_pulses() {
+        // b = 40, n = 80 -> n0 = 2; put a non-zero pulse in block 0
+        // (bit 0) and block 31 (bit 31). Bits >= 32 must not be set
+        // and must not panic.
+        let mut iy = vec![0i32; 80];
+        iy[0] = 1;
+        iy[31 * 2] = 1;
+        let mask = extract_collapse_mask(&iy, 80, 40);
+        assert_eq!(mask, (1u32 << 0) | (1u32 << 31));
+    }
+
+    /// Sanity: the canonical short-block case (B = 2^LM, LM = 3) still
+    /// behaves exactly as before — one bit set per non-empty block.
+    #[test]
+    fn extract_collapse_mask_short_blocks_lm3() {
+        // B = 8, n = 16, n0 = 2. Pulse in blocks 0, 3, 7.
+        let mut iy = vec![0i32; 16];
+        iy[0] = 1;
+        iy[3 * 2 + 1] = -1;
+        iy[7 * 2] = 2;
+        let mask = extract_collapse_mask(&iy, 16, 8);
+        assert_eq!(mask, 0b1000_1001);
     }
 }

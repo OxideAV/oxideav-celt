@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Shift-overflow panic in `extract_collapse_mask`** (RFC 6716 §4.3.4.5)
+  — when a malformed Opus stream (or fuzzer input) drives the per-band
+  block count `b` past 32, the `mask |= 1 << i` shift overflowed in
+  debug mode (and silently wrapped in release). The mask is bounded to
+  one bit per short-block sub-window (`B = 2^LM`, so `B <= 8` per the
+  RFC), so we now cap the loop at 32 iterations and saturate any
+  pathological high bits. Three regression tests pin the overflow
+  boundary, the saturated bit pattern, and the canonical LM=3 path.
+  Found by `oxideav-opus` fuzz run 25635976778 (`panic_free_decode` +
+  `opus_oracle_decode`).
+
 ## [0.1.3](https://github.com/OxideAV/oxideav-celt/compare/v0.1.2...v0.1.3) - 2026-05-06
 
 ### Other
