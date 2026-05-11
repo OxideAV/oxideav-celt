@@ -624,7 +624,10 @@ pub fn encode_all_bands_stereo_dual(
     let nb_ebands = NB_EBANDS;
     let c_count = 2usize;
     let norm_offset = (m * EBAND_5MS[start] as i32) as usize;
-    let norm_len = (m as usize * EBAND_5MS[nb_ebands - 1] as usize - norm_offset).max(1);
+    // Use the inclusive *upper* edge `EBAND_5MS[NB_EBANDS]` (= 100) so the
+    // top band has a write-back slot; mirrors the decoder fix in
+    // `bands::quant_all_bands`.
+    let norm_len = (m as usize * EBAND_5MS[nb_ebands] as usize - norm_offset).max(1);
     // norm[..norm_len] holds ch0 (L), norm[norm_len..] holds ch1 (R).
     let mut norm = vec![0f32; 2 * norm_len];
     let mut lowband_offset = 0usize;
@@ -798,7 +801,8 @@ pub fn encode_all_bands_mono(
     let big_b: i32 = if short_blocks { m } else { 1 };
     let nb_ebands = NB_EBANDS;
     let norm_offset = (m * EBAND_5MS[start] as i32) as usize;
-    let norm_len = (m as usize * EBAND_5MS[nb_ebands - 1] as usize - norm_offset).max(1);
+    // Inclusive upper-edge sizing — mirrors the decoder fix.
+    let norm_len = (m as usize * EBAND_5MS[nb_ebands] as usize - norm_offset).max(1);
     let mut norm = vec![0f32; norm_len];
     let mut lowband_offset = 0usize;
     let mut update_lowband = true;

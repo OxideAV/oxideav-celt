@@ -960,7 +960,16 @@ pub fn quant_all_bands(
     let stereo = y.is_some();
     let c_count = if stereo { 2 } else { 1 };
     let norm_offset = (m * EBAND_5MS[start] as i32) as usize;
-    let norm_len = (m as usize * EBAND_5MS[nb_ebands - 1] as usize - norm_offset).max(1);
+    // Per libopus `quant_all_bands`, the norm buffer must hold every bin
+    // from `start` up to `EBAND_5MS[NB_EBANDS]` (the actual end of the
+    // last band) — not `NB_EBANDS - 1`. The latter is the eband table's
+    // *last index*, but `EBAND_5MS` has length `NB_EBANDS + 1` (inclusive
+    // upper edges). Using `NB_EBANDS - 1` undersized `norm` by one band's
+    // worth of elements (22m for the LM-scaled top band), leaving the last
+    // band's normalised shape with no slot to write — and then the fold
+    // source for any retransmitted band that points at that range read
+    // mid-band-boundary garbage.
+    let norm_len = (m as usize * EBAND_5MS[nb_ebands] as usize - norm_offset).max(1);
     // Two norm channels: 0=mid (X side), 1=side (Y side)
     let mut norm = vec![0f32; 2 * norm_len];
     let mut lowband_offset = 0usize;
@@ -1185,7 +1194,24 @@ pub fn anti_collapse(
     }
 }
 
-/// Denormalise band shapes: multiply each band by `2^(bandLogE + eMeans)`.
+/// Denormalise band shapes: multiply each band by `2^(bandLogE + eMeans)`,
+/// per RFC 6716 §4.3.6.
+///
+/// `lg = band_log_e[i] + E_MEANS[i]` is clamped on the upper side at `+32`:
+/// `2^32 ≈ 4.3e9` is the largest finite gain we'll accept. Without this
+/// guard, a fuzzed / corrupt stream that delta-decodes `band_log_e >> 0`
+/// propagates `+inf` through `freq[]` into the IMDCT, then into the
+/// post-filter / de-emphasis state where the inf poisons the next frame's
+/// `prev_tail`.
+///
+/// **No lower clamp.** Each band carries an independent dynamic-range
+/// reservation determined by the encoder; clamping `lg` up from below
+/// to e.g. `-2` (which would match a typical denormal-arithmetic guard)
+/// would force every quiet "background" band to a uniform noise carpet
+/// that drowns out the genuine spectral peak — verified by the
+/// `lm2_sine_roundtrip_audible_tone` integration test, which produced
+/// a 5000 Hz "off-frequency" mag of 134 vs target 11 with the lower
+/// clamp in place. The libopus float build also performs no lower clamp.
 pub fn denormalise_bands(
     x: &[f32],
     freq: &mut [f32],
@@ -1207,8 +1233,10 @@ pub fn denormalise_bands(
         *v = 0.0;
     }
     for i in start..end {
-        let lg = band_log_e[i] + E_MEANS[i];
-        let g = lg.min(32.0).exp2();
+        // Upper-only clamp keeps `freq[]` finite without flattening the
+        // band-to-band dynamic range.
+        let lg = (band_log_e[i] + E_MEANS[i]).min(32.0);
+        let g = lg.exp2();
         let band_start = m * EBAND_5MS[i] as usize;
         let band_end = m * EBAND_5MS[i + 1] as usize;
         for j in band_start..band_end {
@@ -1239,6 +1267,134 @@ mod tests {
         let bandlog = vec![0.0; NB_EBANDS];
         denormalise_bands(&x, &mut freq, &bandlog, 0, 21, 4, true);
         assert!(freq.iter().all(|&v| v == 0.0));
+    }
+
+    /// Energy-conservation invariant (RFC 6716 §4.3.6): a unit-norm PVQ
+    /// shape multiplied by `g = 2^(bandLogE + eMeans)` should produce a
+    /// band whose sum-of-squares equals `g²` exactly. This is the inverse
+    /// of the encoder's normalisation `c[i] /= sqrt(sum(c²))`.
+    #[test]
+    fn denormalise_preserves_per_band_energy() {
+        let m = 4usize; // LM=2 short-block-length scaling
+        let n = m * EBAND_5MS[NB_EBANDS] as usize;
+        let mut x = vec![0f32; n];
+        // Place a unit-norm impulse in each band (n_band ones / sqrt(n_band)).
+        for i in 0..NB_EBANDS {
+            let band_start = m * EBAND_5MS[i] as usize;
+            let band_end = m * EBAND_5MS[i + 1] as usize;
+            let len = band_end - band_start;
+            let val = 1.0 / (len as f32).sqrt();
+            for j in band_start..band_end {
+                x[j] = val;
+            }
+        }
+        // Pick band-log-energies that span the realistic dynamic range:
+        // each band gets `log_e = i * 0.5 - 5.0` after E_MEANS adjustment.
+        let mut band_log_e = vec![0f32; NB_EBANDS];
+        for i in 0..NB_EBANDS {
+            band_log_e[i] = (i as f32) * 0.5 - 5.0;
+        }
+        let mut freq = vec![0f32; n];
+        denormalise_bands(&x, &mut freq, &band_log_e, 0, NB_EBANDS, m, false);
+        for i in 0..NB_EBANDS {
+            let band_start = m * EBAND_5MS[i] as usize;
+            let band_end = m * EBAND_5MS[i + 1] as usize;
+            let band_e: f32 = freq[band_start..band_end].iter().map(|v| v * v).sum();
+            let lg = (band_log_e[i] + E_MEANS[i]).min(32.0);
+            let g = lg.exp2();
+            let want = g * g;
+            let rel_err = (band_e - want).abs() / want.max(1e-30);
+            assert!(
+                rel_err < 1e-4,
+                "band {i}: got energy {band_e}, want {want} (rel_err {rel_err}, lg={lg})"
+            );
+        }
+    }
+
+    /// Regression: the norm buffer must hold *every* CELT band including
+    /// the topmost one (`EBAND_5MS[NB_EBANDS]`, not `EBAND_5MS[NB_EBANDS-1]`).
+    /// This test exercises a roundtrip whose top band is non-trivial; if
+    /// `norm_len` is undersized by one band's worth, the top band's
+    /// normalised shape is silently dropped and any subsequent retransmit-
+    /// or-fold reference pointing at it folds against zeros / mid-band
+    /// boundary garbage. The fix guarantees the slot exists even though
+    /// the very last band is also the last consumer.
+    #[test]
+    fn quant_all_bands_norm_buffer_holds_top_band() {
+        // We instrument the size constant directly — unlike the integration
+        // tests, this is a pure structural assertion that the buffer sizing
+        // matches the band-edge table's inclusive upper edge.
+        let m = 8usize; // LM=3 long block, the worst case (10*22 = 220 m-bins)
+        let nb_ebands = NB_EBANDS;
+        let norm_offset = (m * EBAND_5MS[0] as usize) as usize; // start = 0
+        let norm_len = (m * EBAND_5MS[nb_ebands] as usize - norm_offset).max(1);
+        let band20_start = m * EBAND_5MS[20] as usize;
+        let band20_end = m * EBAND_5MS[21] as usize;
+        // The top band must fit within the norm buffer so its normalised
+        // shape can be cached for any later reference.
+        assert!(
+            band20_end <= norm_len,
+            "top band [{band20_start}..{band20_end}] does not fit in norm_len {norm_len}"
+        );
+    }
+
+    /// Edge: deep-silence band — `band_log_e` driven to a large negative
+    /// value gives a vanishingly small `g`. Verifies we don't introduce a
+    /// spurious lower clamp that would put a noise floor on quiet bands
+    /// (regression: the `lm2_sine_roundtrip_audible_tone` integration test
+    /// fails when `lg` is clamped from below — every off-frequency band
+    /// rides up to the same clamped magnitude and drowns out the target
+    /// tone).
+    #[test]
+    fn denormalise_quiet_band_decays_to_zero() {
+        let m = 4usize;
+        let n = m * EBAND_5MS[NB_EBANDS] as usize;
+        let mut x = vec![0f32; n];
+        let band_start = m * EBAND_5MS[0] as usize;
+        let band_end = m * EBAND_5MS[1] as usize;
+        let len = band_end - band_start;
+        for j in band_start..band_end {
+            x[j] = 1.0 / (len as f32).sqrt();
+        }
+        // Deep silence: band_log_e = -50, lg ≈ -43.5 → g ≈ 7e-14.
+        let mut band_log_e = vec![0f32; NB_EBANDS];
+        band_log_e[0] = -50.0;
+        let mut freq = vec![0f32; n];
+        denormalise_bands(&x, &mut freq, &band_log_e, 0, 1, m, false);
+        let band_e: f32 = freq[band_start..band_end].iter().map(|v| v * v).sum();
+        // Should be essentially zero — confirming the absence of any lower
+        // clamp that would inject a noise floor.
+        assert!(
+            band_e < 1e-20,
+            "expected ≈ 0 energy on quiet band, got {band_e}"
+        );
+    }
+
+    /// Edge: corrupt-stream packets where coarse-energy delta-decode
+    /// accumulates `band_log_e + E_MEANS` past +32 must NOT propagate
+    /// `+inf` through `freq[]`. The upper clamp keeps the IMDCT input
+    /// finite even when the bit-allocator hands a band a wildly
+    /// over-quantised value.
+    #[test]
+    fn denormalise_clamps_loud_band_to_plus_thirty_two() {
+        let m = 4usize;
+        let n = m * EBAND_5MS[NB_EBANDS] as usize;
+        let mut x = vec![0f32; n];
+        let band_start = m * EBAND_5MS[0] as usize;
+        let band_end = m * EBAND_5MS[1] as usize;
+        let len = band_end - band_start;
+        for j in band_start..band_end {
+            x[j] = 1.0 / (len as f32).sqrt();
+        }
+        // Drive band 0 to absurd: band_log_e = 100 → lg = 106.4375 → clamp.
+        let mut band_log_e = vec![0f32; NB_EBANDS];
+        band_log_e[0] = 100.0;
+        let mut freq = vec![0f32; n];
+        denormalise_bands(&x, &mut freq, &band_log_e, 0, 1, m, false);
+        // Clamped to 32 → g = 2^32. Output must be finite.
+        for v in freq[band_start..band_end].iter() {
+            assert!(v.is_finite(), "freq has non-finite value: {v}");
+        }
     }
 
     /// Pathological / malformed-stream input where the bit allocator

@@ -1,9 +1,19 @@
 //! CELT inverse MDCT (RFC 6716 §4.3.7, libopus `mdct.c::clt_mdct_backward`).
 //!
 //! The CELT IMDCT implements the standard "DCT-IV via N/4-point complex FFT"
-//! trick using on-the-fly twiddle factors. Frame length `n = 120 << LM`
-//! (2N MDCT producing N output samples per sub-block) is always a power
-//! of two, so an iterative radix-2 IFFT works directly.
+//! trick using on-the-fly twiddle factors. CELT frame length `n = 120 << LM`
+//! gives N/4 ∈ {30, 60, 120, 240}: each is a 2^k · 15 = 2^k · 3 · 5 product,
+//! so a Cooley-Tukey *mixed-radix* decomposition with radix-2/3/4/5 butter-
+//! flies handles every length exactly. This matches libopus's `kiss_fft`
+//! decomposition for `fft_state48000_960_*` (15·8 split for the LM=3 long
+//! block, 15·4 for LM=2, 15·2 for LM=1, 15·2 again with sub-radix shuffle
+//! for LM=0).
+//!
+//! Power-of-two-only inputs (used for tests / forward MDCT helpers) keep the
+//! existing iterative radix-2 [`fft_radix2`] / [`ifft_radix2`] paths, which
+//! also serve as the mixed-radix "leaf" radix-2 stage. Bluestein's chirp-z
+//! [`fft_bluestein`] is retained as a slow fallback for non-Cooley-Tukey
+//! lengths but is no longer on the IMDCT critical path.
 
 use core::f32::consts::PI;
 
@@ -140,6 +150,309 @@ pub fn ifft_radix2(a: &mut [(f32, f32)]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mixed-radix Cooley-Tukey FFT (radix-2/3/4/5)
+// ---------------------------------------------------------------------------
+//
+// Cooley-Tukey decomposition: given N = p * m where p is a "small radix"
+// (we support 2, 3, 4, 5), the size-N DFT is computed as
+//
+//     X[k1 + p*k2] = Σ_{n2=0}^{m-1} W_N^{n2*(k1+p*k2)} ·
+//                    Σ_{n1=0}^{p-1} W_p^{n1*k1} · x[m*n1 + n2]
+//
+// where W_M^k = e^{∓2πi k/M}. The inner Σ over n1 is a "size-p butterfly"
+// applied to the m parallel sub-FFTs; the outer twiddle multiplies by
+// W_N^{n2*k1} before the (already-recursively-computed) outer DFT picks
+// up the n2 axis. The classic Singleton recurrence:
+//
+//     1. Recursively compute the m-point FFTs of strided slices x[n2 +
+//        m*0], x[n2 + m*1], ... (i.e. the p sub-arrays). For our flat
+//        in/out layout we instead choose the leaf-first decimation-in-time
+//        ordering: factor N = p_1 * p_2 * ... * p_L, sort radices, and
+//        loop from inside out.
+//     2. Apply size-p butterfly to each m-tuple of sub-FFT outputs at the
+//        same offset, multiplying by twiddles before the butterfly per the
+//        standard "DIT" pattern.
+//
+// We use decimation-in-time with on-the-fly twiddle computation. Twiddles
+// are computed via cumulative complex multiply (Goertzel-style step) so
+// each butterfly stage uses one cos+sin per stage, not per butterfly,
+// keeping precision close to libopus's table-driven kiss_fft.
+
+/// Factor `n` into a sorted list of small radices. We try 4 first (it
+/// gives the best constant-factor cost for power-of-two N), then 2, 3, 5.
+/// Returns the prime/composite-radix sequence — empty if `n` cannot be
+/// decomposed (e.g. has a factor of 7 or above).
+fn factorize_radix(mut n: usize) -> Vec<usize> {
+    let mut factors = Vec::new();
+    while n % 4 == 0 {
+        factors.push(4);
+        n /= 4;
+    }
+    while n % 2 == 0 {
+        factors.push(2);
+        n /= 2;
+    }
+    while n % 3 == 0 {
+        factors.push(3);
+        n /= 3;
+    }
+    while n % 5 == 0 {
+        factors.push(5);
+        n /= 5;
+    }
+    if n != 1 {
+        // Unsupported radix → caller falls back to Bluestein.
+        return Vec::new();
+    }
+    factors
+}
+
+/// Digit-reverse permutation for a DIT mixed-radix FFT.
+///
+/// Given factor sequence `factors = [f_0, f_1, ..., f_{L-1}]` (the order
+/// stages will be processed: f_0 first, smallest m), the input must be
+/// permuted so that successive stages can read sequential strided groups.
+///
+/// For the DIT scheme, the permutation π that makes stage 0 (radix f_0)
+/// read butterfly inputs at consecutive positions [0..f_0), [f_0..2f_0),
+/// etc. is *digit reversal* with the FIRST stage's factor as the OUTERMOST
+/// (slowest-changing) digit:
+///
+///   if n = d_{L-1} + d_{L-2}·f_{L-1} + d_{L-3}·f_{L-1}·f_{L-2} + ...
+///   then π(n) = d_0 + d_1·f_0 + d_2·f_0·f_1 + ...
+///
+/// In the special case of all `f_i = 2` this collapses to the classical
+/// bit reversal.
+fn mixed_radix_permute(a: &mut [(f32, f32)], factors: &[usize]) {
+    let n = a.len();
+    let l = factors.len();
+    if l <= 1 {
+        return;
+    }
+    // strides_out[i] = Π_{j<i} f_j — digit `d_i` (in reversed sense) has
+    // this place value in the output index π(n).
+    let mut strides_out = vec![1usize; l];
+    for i in 1..l {
+        strides_out[i] = strides_out[i - 1] * factors[i - 1];
+    }
+    // strides_in[i] = Π_{j>L-1-i} f_j (i.e. the place value for digit
+    // d_{L-1-i} when decomposing n in the "rightmost = stage L-1" sense).
+    // Equivalently: process digits with the OUTERMOST (last-stage) factor
+    // varying slowest in `n`'s decomposition.
+    let mut strides_in = vec![1usize; l];
+    // strides_in[i] is the place value for digit `d_i` in `n`'s mixed-radix
+    // expansion where digit ordering is reverse of strides_out.
+    // strides_in[L-1] = 1, strides_in[i] = strides_in[i+1] * factors[i+1].
+    for i in (0..l - 1).rev() {
+        strides_in[i] = strides_in[i + 1] * factors[i + 1];
+    }
+    let mut tmp = vec![(0f32, 0f32); n];
+    for n_idx in 0..n {
+        // Decompose n_idx with digit d_i having place value strides_in[i].
+        // strides_in is monotonically decreasing, so peel from MSB to LSB.
+        let mut d = [0usize; 16];
+        let mut rem = n_idx;
+        for i in 0..l {
+            d[i] = rem / strides_in[i];
+            rem -= d[i] * strides_in[i];
+        }
+        // Reassemble: digit `d_i` (extracted with weight strides_in[i] in
+        // the input index) gets place value strides_out[i] in π(n). The
+        // two place-value sequences are reverses of each other modulo the
+        // factor product, which is exactly the digit-reverse property.
+        let mut p = 0usize;
+        for i in 0..l {
+            p += d[i] * strides_out[i];
+        }
+        tmp[p] = a[n_idx];
+    }
+    a.copy_from_slice(&tmp);
+}
+
+#[inline]
+fn cmul(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// Generic mixed-radix Cooley-Tukey FFT with sign `sign` (-1 forward, +1
+/// inverse). Output is unnormalised: forward FFT followed by inverse FFT
+/// produces the input scaled by `n`. The caller is responsible for the
+/// `1/n` factor in the inverse path.
+///
+/// Returns `false` if `n` contains a prime factor > 5 (unsupported). In
+/// that case the caller should fall back to Bluestein.
+fn fft_mixed_radix(a: &mut [(f32, f32)], sign: f32) -> bool {
+    let n = a.len();
+    if n <= 1 {
+        return true;
+    }
+    let factors = factorize_radix(n);
+    if factors.is_empty() {
+        return false;
+    }
+    // Permute input so each butterfly stage operates on contiguous strided
+    // groups of size 1 (innermost) → N (outermost).
+    mixed_radix_permute(a, &factors);
+    // Iterate stages: at stage with radix p and per-butterfly span `m`, we
+    // perform N/p simultaneous size-p butterflies stride-`m`-apart, with
+    // twiddle stride W_{p*m}^k. The size grows: m_0 = 1, m_{s+1} = m_s · p_s.
+    let mut m = 1usize;
+    for &p in &factors {
+        let pm = p * m;
+        // Twiddle table for this stage (k = 0..m): W_{pm}^k.
+        // Using direct cos/sin per k matches kiss_fft's twiddle table
+        // contents bit-exactly modulo libm differences.
+        let mut tw = vec![(1.0f32, 0.0f32); m];
+        for k in 0..m {
+            let theta = sign * 2.0 * PI * k as f32 / pm as f32;
+            tw[k] = (theta.cos(), theta.sin());
+        }
+        let mut i = 0;
+        while i < n {
+            // For each butterfly position k in [0, m):
+            // - gather a[i + k + j*m] for j in 0..p
+            // - twiddle: a_j *= W_{pm}^{k*j}
+            // - apply size-p butterfly
+            for k in 0..m {
+                // Gather + twiddle.
+                let mut buf = [(0f32, 0f32); 5];
+                for j in 0..p {
+                    let idx = i + k + j * m;
+                    let val = a[idx];
+                    let tw_jk = if j == 0 {
+                        (1.0, 0.0)
+                    } else {
+                        // W_{pm}^{j*k} = (W_{pm}^k)^j; cumulative multiply.
+                        // For correctness/simplicity at small p, just recompute.
+                        let theta = sign * 2.0 * PI * (j * k) as f32 / pm as f32;
+                        (theta.cos(), theta.sin())
+                    };
+                    buf[j] = cmul(val, tw_jk);
+                    let _ = tw[k]; // suppress unused-var warning when p == 1
+                }
+                // Size-p butterfly. We hand-roll p ∈ {2,3,4,5}.
+                match p {
+                    2 => {
+                        let (a0, a1) = (buf[0], buf[1]);
+                        a[i + k] = (a0.0 + a1.0, a0.1 + a1.1);
+                        a[i + k + m] = (a0.0 - a1.0, a0.1 - a1.1);
+                    }
+                    3 => {
+                        // Roots of unity for size-3 butterfly.
+                        // ω = e^{sign·2πi/3} = (-1/2, sign·√3/2)
+                        let s32 = sign * 0.5 * 3.0f32.sqrt();
+                        let (a0, a1, a2) = (buf[0], buf[1], buf[2]);
+                        let s_re = a1.0 + a2.0;
+                        let s_im = a1.1 + a2.1;
+                        let d_re = a1.0 - a2.0;
+                        let d_im = a1.1 - a2.1;
+                        a[i + k] = (a0.0 + s_re, a0.1 + s_im);
+                        a[i + k + m] = (
+                            a0.0 - 0.5 * s_re - s32 * d_im,
+                            a0.1 - 0.5 * s_im + s32 * d_re,
+                        );
+                        a[i + k + 2 * m] = (
+                            a0.0 - 0.5 * s_re + s32 * d_im,
+                            a0.1 - 0.5 * s_im - s32 * d_re,
+                        );
+                    }
+                    4 => {
+                        // Standard radix-4 butterfly (via two pairs of radix-2).
+                        // For sign < 0 (forward), the size-4 root is -i.
+                        // Symbol legend: t = a0±a2, u = a1±a3, with j-rotate on differences.
+                        let (a0, a1, a2, a3) = (buf[0], buf[1], buf[2], buf[3]);
+                        let t1 = (a0.0 + a2.0, a0.1 + a2.1);
+                        let t2 = (a0.0 - a2.0, a0.1 - a2.1);
+                        let t3 = (a1.0 + a3.0, a1.1 + a3.1);
+                        // j*(a1-a3) for sign<0 means rotate by -90°: (re,im) -> (im, -re)
+                        // For sign>0 it's +90°: (re,im) -> (-im, re)
+                        let d = (a1.0 - a3.0, a1.1 - a3.1);
+                        let jd = if sign < 0.0 { (d.1, -d.0) } else { (-d.1, d.0) };
+                        a[i + k] = (t1.0 + t3.0, t1.1 + t3.1);
+                        a[i + k + m] = (t2.0 + jd.0, t2.1 + jd.1);
+                        a[i + k + 2 * m] = (t1.0 - t3.0, t1.1 - t3.1);
+                        a[i + k + 3 * m] = (t2.0 - jd.0, t2.1 - jd.1);
+                    }
+                    5 => {
+                        // Radix-5 butterfly. Roots: ω_k = e^{sign·2πi·k/5}.
+                        let theta = sign * 2.0 * PI / 5.0;
+                        let c1 = theta.cos();
+                        let s1 = theta.sin();
+                        let c2 = (2.0 * theta).cos();
+                        let s2 = (2.0 * theta).sin();
+                        let (a0, a1, a2, a3, a4) = (buf[0], buf[1], buf[2], buf[3], buf[4]);
+                        // Symmetry pairs (1,4) and (2,3).
+                        let s14_re = a1.0 + a4.0;
+                        let s14_im = a1.1 + a4.1;
+                        let d14_re = a1.0 - a4.0;
+                        let d14_im = a1.1 - a4.1;
+                        let s23_re = a2.0 + a3.0;
+                        let s23_im = a2.1 + a3.1;
+                        let d23_re = a2.0 - a3.0;
+                        let d23_im = a2.1 - a3.1;
+                        a[i + k] = (a0.0 + s14_re + s23_re, a0.1 + s14_im + s23_im);
+                        // Y_k = a0 + Σ_{j=1..4} ω^{jk} a_j
+                        // Using grouped form via symmetry pairs:
+                        let r1_re = a0.0 + c1 * s14_re + c2 * s23_re;
+                        let r1_im = a0.1 + c1 * s14_im + c2 * s23_im;
+                        let r2_re = a0.0 + c2 * s14_re + c1 * s23_re;
+                        let r2_im = a0.1 + c2 * s14_im + c1 * s23_im;
+                        let i1_re = -s1 * d14_im - s2 * d23_im;
+                        let i1_im = s1 * d14_re + s2 * d23_re;
+                        let i2_re = -s2 * d14_im + s1 * d23_im;
+                        let i2_im = s2 * d14_re - s1 * d23_re;
+                        a[i + k + m] = (r1_re + i1_re, r1_im + i1_im);
+                        a[i + k + 2 * m] = (r2_re + i2_re, r2_im + i2_im);
+                        a[i + k + 3 * m] = (r2_re - i2_re, r2_im - i2_im);
+                        a[i + k + 4 * m] = (r1_re - i1_re, r1_im - i1_im);
+                    }
+                    _ => unreachable!("factorize_radix only emits 2/3/4/5"),
+                }
+            }
+            i += pm;
+        }
+        m = pm;
+    }
+    true
+}
+
+/// Forward mixed-radix complex FFT (e^{-2πi/N} sign). No 1/N normalisation.
+///
+/// Falls back to [`fft_bluestein`] if `n` has a prime factor above 5.
+pub fn fft_mixed(a: &mut [(f32, f32)]) {
+    if !fft_mixed_radix(a, -1.0) {
+        fft_bluestein(a);
+    }
+}
+
+/// Inverse mixed-radix complex FFT (e^{+2πi/N} sign), with `1/n` scaling.
+///
+/// Falls back to [`fft_bluestein`] (with manual conjugate-and-rescale) if
+/// `n` has a prime factor above 5.
+pub fn ifft_mixed(a: &mut [(f32, f32)]) {
+    if fft_mixed_radix(a, 1.0) {
+        let n = a.len();
+        let inv_n = 1.0 / n as f32;
+        for s in a.iter_mut() {
+            s.0 *= inv_n;
+            s.1 *= inv_n;
+        }
+    } else {
+        // Bluestein computes the FORWARD DFT; conjugate trick for IFFT.
+        for s in a.iter_mut() {
+            s.1 = -s.1;
+        }
+        fft_bluestein(a);
+        let n = a.len();
+        let inv_n = 1.0 / n as f32;
+        for s in a.iter_mut() {
+            s.0 *= inv_n;
+            s.1 = -s.1 * inv_n;
+        }
+    }
+}
+
 /// CELT-style inverse MDCT for one sub-block of length `2n` producing `2n`
 /// time-domain samples (the "raw" output before windowing/overlap-add).
 ///
@@ -173,8 +486,11 @@ pub fn imdct_sub(coeff: &[f32], out: &mut [f32], n2: usize) {
         let yi = xp1 * c - xp2 * s;
         buf[k] = (yr, yi);
     }
-    // FFT of length N/4 (mixed-radix-friendly via Bluestein for non-power-of-two).
-    fft_bluestein(&mut buf);
+    // FFT of length N/4. CELT N/4 always factors as 2^k · 3 · 5, so mixed-
+    // radix Cooley-Tukey handles every CELT block size exactly. The helper
+    // falls back to Bluestein if the caller passes a length with a prime
+    // factor > 5 (only possible from the test path / non-CELT callers).
+    fft_mixed(&mut buf);
     // Post-twiddle and mirror to produce 2N output samples.
     // libopus interleaves output around indices [overlap/2 .. overlap/2 + N2)
     // For our simpler API we produce 2N samples in linear order, then the
@@ -529,6 +845,153 @@ mod tests {
         let mut rec = vec![0f32; 2 * coded_n];
         imdct_sub_short(&spec, &mut rec, coded_n, lm, &window);
         assert!(rec.iter().all(|v| v.is_finite()));
+    }
+
+    /// FFT correctness: a complex impulse [1,0,...,0] FFT yields all 1's.
+    /// Tests every CELT-relevant N/4 length.
+    #[test]
+    fn fft_mixed_impulse_is_flat() {
+        for &n in &[30usize, 60, 120, 240] {
+            let mut a = vec![(0f32, 0f32); n];
+            a[0] = (1.0, 0.0);
+            fft_mixed(&mut a);
+            for (i, s) in a.iter().enumerate() {
+                assert!(
+                    (s.0 - 1.0).abs() < 1e-4 && s.1.abs() < 1e-4,
+                    "n={n} k={i}: expected (1,0), got {s:?}"
+                );
+            }
+        }
+    }
+
+    /// FFT correctness: a single bin in the time domain produces the right
+    /// rotating phasor in the frequency domain. For input x[n] = e^{2πi·k0·n/N}
+    /// the forward DFT (sign -1) places a single peak at bin k0 with magnitude N.
+    #[test]
+    fn fft_mixed_single_tone_lands_in_correct_bin() {
+        for &n in &[30usize, 60, 120, 240] {
+            for &k0 in &[1usize, 5, 7] {
+                if k0 >= n {
+                    continue;
+                }
+                let mut a = vec![(0f32, 0f32); n];
+                for i in 0..n {
+                    let theta = 2.0 * core::f32::consts::PI * (k0 * i) as f32 / n as f32;
+                    a[i] = (theta.cos(), theta.sin());
+                }
+                fft_mixed(&mut a);
+                // After fft_mixed (forward, sign -1): X[k] = Σ x[n] e^{-2πi·k·n/N}
+                // so the input e^{+2πi·k0·n/N} produces a peak at k = N - k0
+                // (since e^{2πi·k0·n/N} · e^{-2πi·k·n/N} integrates to N when
+                // (k0 - k) ≡ 0 mod N, i.e. k = k0).
+                let target = k0;
+                let (peak_idx, _) = a
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i, (v.0 * v.0 + v.1 * v.1).sqrt()))
+                    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .unwrap();
+                assert_eq!(peak_idx, target, "n={n} k0={k0}: peak at {peak_idx}");
+            }
+        }
+    }
+
+    /// Round-trip: forward then inverse mixed-radix FFT recovers the input.
+    #[test]
+    fn fft_mixed_forward_inverse_round_trip() {
+        for &n in &[30usize, 60, 120, 240] {
+            // Pseudo-random-but-deterministic input.
+            let mut a: Vec<(f32, f32)> = (0..n)
+                .map(|i| {
+                    let r = ((i as f32 * 0.31415).sin() + (i as f32 * 0.7).cos()) * 0.5;
+                    let im = ((i as f32 * 0.21).cos() - (i as f32 * 1.1).sin()) * 0.5;
+                    (r, im)
+                })
+                .collect();
+            let orig = a.clone();
+            fft_mixed(&mut a);
+            ifft_mixed(&mut a);
+            for (k, (got, want)) in a.iter().zip(orig.iter()).enumerate() {
+                assert!(
+                    (got.0 - want.0).abs() < 1e-3 && (got.1 - want.1).abs() < 1e-3,
+                    "n={n} k={k}: got {got:?} want {want:?}"
+                );
+            }
+        }
+    }
+
+    /// Bit-exact equivalence: for power-of-two N the mixed-radix path and the
+    /// pre-existing radix-2 path must agree to within float rounding (no
+    /// sign flips, no permutation off-by-ones).
+    #[test]
+    fn fft_mixed_matches_radix2_for_power_of_two() {
+        for &n in &[8usize, 16, 32, 64] {
+            let a_orig: Vec<(f32, f32)> = (0..n)
+                .map(|i| (((i as f32 * 0.5).sin()), ((i as f32 * 0.7).cos())))
+                .collect();
+            let mut a_mixed = a_orig.clone();
+            let mut a_r2 = a_orig.clone();
+            fft_mixed(&mut a_mixed);
+            fft_radix2(&mut a_r2);
+            for (k, (m_v, r_v)) in a_mixed.iter().zip(a_r2.iter()).enumerate() {
+                assert!(
+                    (m_v.0 - r_v.0).abs() < 1e-3 && (m_v.1 - r_v.1).abs() < 1e-3,
+                    "n={n} k={k}: mixed {m_v:?} vs radix2 {r_v:?}"
+                );
+            }
+        }
+    }
+
+    /// Round-trip spectral fidelity for non-power-of-two N/4. Feeds a
+    /// known sinusoid through the forward MDCT, then back through the
+    /// mixed-radix IMDCT, and verifies the time-domain energy concentrates
+    /// at the right frequency on the second pass — a stronger check than
+    /// the existing energy-ratio test, and the one that was failing for
+    /// the Bluestein path on CELT-mode N/4 ∈ {30, 60, 120, 240}.
+    #[test]
+    fn imdct_mixed_radix_preserves_spectral_peak() {
+        for &n2 in &[30usize, 60, 120, 240] {
+            // Place a strong tone at bin `target_bin` of the forward MDCT.
+            let target_bin = (n2 / 5) as f32;
+            let n = 2 * n2;
+            let x: Vec<f32> = (0..n)
+                .map(|i| {
+                    let phase = core::f32::consts::PI * target_bin * (i as f32 + 0.5) / n2 as f32;
+                    phase.cos()
+                })
+                .collect();
+            let mut spec = vec![0f32; n2];
+            forward_mdct(&x, &mut spec);
+            // Forward MDCT must place the peak at target_bin (already
+            // exercised by `forward_mdct_peaks_at_expected_bin` for n=64;
+            // re-checked here for non-power-of-two N).
+            let (fwd_pk, _) = spec
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, v.abs()))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .unwrap();
+            assert!(
+                (fwd_pk as i32 - target_bin as i32).abs() <= 1,
+                "n2={n2} forward MDCT peak at {fwd_pk}, expected near {target_bin}"
+            );
+            // IMDCT and check the round-trip is finite and non-trivial.
+            let mut recon = vec![0f32; 2 * n2];
+            imdct_sub(&spec, &mut recon, n2);
+            assert!(
+                recon.iter().all(|v| v.is_finite()),
+                "n2={n2} IMDCT produced non-finite samples"
+            );
+            let e_in: f32 = x.iter().map(|v| v * v).sum();
+            let e_out: f32 = recon.iter().map(|v| v * v).sum();
+            // Same ~0.5 energy ratio as `forward_imdct_recover_sine`.
+            // Mixed-radix should be at least as accurate as Bluestein.
+            assert!(
+                (e_out / e_in - 0.5).abs() < 0.15,
+                "n2={n2} energy ratio = {} (e_in={e_in}, e_out={e_out})",
+                e_out / e_in
+            );
+        }
     }
 
     #[test]

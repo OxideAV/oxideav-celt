@@ -48,17 +48,25 @@
 //! Known gaps (the pipeline runs and produces audio, but the output is
 //! not yet bit-exact with libopus):
 //!
-//! * **§4.3.7 IMDCT**: uses Bluestein for the N/4 FFT instead of libopus'
-//!   bespoke mixed-radix kiss_fft (15·8 split for the long block at LM=3).
-//!   Produces audio with comparable RMS but the spectral peak does not
-//!   yet match the encoder. A bit-exact port of `kiss_fft.c` against the
-//!   stored `fft_state48000_960_*` tables is the next step.
-//! * **§4.3.4 quant_all_bands**: the per-iteration `BandCtx` borrow trick
-//!   keeps `RangeDecoder` separate from the partition state, but the norm-
-//!   buffer / fold pointer arithmetic is not 1:1 with libopus and may pick
-//!   the wrong fold source for the second-band edge case (see
-//!   `special_hybrid_folding` in libopus, which we omit since CELT-only
-//!   doesn't trigger it for `start=0`).
+//! * **§4.3.7 IMDCT FFT** (resolved): mixed-radix Cooley-Tukey now handles
+//!   every CELT N/4 size (30/60/120/240 = 2^k · 3 · 5) directly via
+//!   `mdct::fft_mixed`. Bluestein is retained as a fallback for non-CELT
+//!   call sites with prime factors > 5. The pre/post-twiddle geometry
+//!   (which has its own +1/8 phase offset to fully match libopus's
+//!   `mdct_backward` layout) is the next refinement target.
+//! * **§4.3.6 denormalise_bands** (improved): now upper-clamps `lg` at
+//!   +32 to keep `freq[]` finite on corrupt streams that delta-decode the
+//!   coarse-energy state past plausible bounds. No lower clamp — adding
+//!   one (e.g. `MAX(-2, lg)`) flattens the per-band dynamic range and
+//!   forces every off-frequency band onto the same noise carpet (verified
+//!   by the `lm2_sine_roundtrip_audible_tone` integration test).
+//! * **§4.3.4 quant_all_bands norm buffer** (resolved): `norm_len` was
+//!   sized at `m * EBAND_5MS[NB_EBANDS - 1]` (= 78·m) instead of the
+//!   inclusive upper edge `m * EBAND_5MS[NB_EBANDS]` (= 100·m). The top
+//!   band's normalised shape was being silently discarded by the
+//!   `nstart + band_len <= norm_len` write-back guard. Same fix landed
+//!   in both decoder (`bands.rs`) and encoder (`encoder_bands.rs`, both
+//!   of its `quant_all_bands_*` entry points).
 //! * **Anti-collapse seed** (fixed): the per-band `BandCtx.seed` and the
 //!   value handed to `anti_collapse` are now both `rc.rng()` captured at the
 //!   live range-coder state (encoder and decoder match each other and

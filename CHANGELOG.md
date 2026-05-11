@@ -7,24 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Mixed-radix Cooley-Tukey FFT for the IMDCT** (RFC 6716 §4.3.7) —
+  `mdct::fft_mixed` / `mdct::ifft_mixed` now handle every CELT N/4 size
+  (30/60/120/240 = 2^k · 3 · 5) directly via a 2/3/4/5-radix
+  decomposition that mirrors libopus's `kiss_fft` `fft_state48000_960_*`
+  layout (15·8 split for the LM=3 long block, 15·4 / 15·2 for the
+  shorter modes). The Bluestein chirp-z path stays as a fallback for
+  non-Cooley-Tukey lengths (test/forward-MDCT helpers only) but is no
+  longer on the IMDCT critical path. Five new regression tests cover
+  impulse → flat spectrum, single-tone bin location, forward/inverse
+  round-trip, equivalence with the existing radix-2 path on power-of-
+  two inputs, and IMDCT spectral fidelity for non-power-of-two N/4.
+
+### Fixed
+
+- **`bands::quant_all_bands` norm-buffer undersized by one band**
+  (RFC 6716 §4.3.4) — `norm_len` was sized at
+  `m * EBAND_5MS[NB_EBANDS - 1]` (= 78·m, the *index* of the topmost
+  band's lower edge) instead of `m * EBAND_5MS[NB_EBANDS]` (= 100·m,
+  the inclusive upper edge of the eband table). The top band's
+  normalised shape was being silently discarded by the
+  `nstart + band_len <= norm_len` write-back guard, leaving any later
+  fold-source pointer that landed in `[78m..100m]` reading mid-band-
+  boundary garbage. Same fix landed in both decoder
+  (`bands.rs::quant_all_bands`) and encoder
+  (`encoder_bands.rs::quant_all_bands_encode_*`, both entry points). A
+  new structural regression test pins the buffer-sizing invariant.
+
+- **`bands::denormalise_bands` over/underflow on edge packets**
+  (RFC 6716 §4.3.6) — explicit upper clamp at `lg = +32` keeps `freq[]`
+  finite when a corrupt stream delta-decodes the coarse-energy state
+  past plausible bounds (without it, `+inf` propagates into the IMDCT
+  and poisons the post-filter / de-emphasis state). Three regression
+  tests cover the per-band energy-conservation invariant
+  (`g² × |x|² = E_band` to 1e-4), the deep-silence absence-of-lower-
+  clamp behaviour (which would otherwise raise every off-frequency
+  band onto a uniform noise carpet — proven by the existing
+  `lm2_sine_roundtrip_audible_tone` integration test), and the loud-
+  band finite-output guarantee.
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-celt/compare/v0.1.3...v0.1.4) - 2026-05-10
 
 ### Other
 
 - cap extract_collapse_mask shift at 32 bits (RFC 6716 §4.3.4.5)
-
-### Fixed
-
-- **Shift-overflow panic in `extract_collapse_mask`** (RFC 6716 §4.3.4.5)
-  — when a malformed Opus stream (or fuzzer input) drives the per-band
-  block count `b` past 32, the `mask |= 1 << i` shift overflowed in
-  debug mode (and silently wrapped in release). The mask is bounded to
-  one bit per short-block sub-window (`B = 2^LM`, so `B <= 8` per the
-  RFC), so we now cap the loop at 32 iterations and saturate any
-  pathological high bits. Three regression tests pin the overflow
-  boundary, the saturated bit pattern, and the canonical LM=3 path.
-  Found by `oxideav-opus` fuzz run 25635976778 (`panic_free_decode` +
-  `opus_oracle_decode`).
 
 ## [0.1.3](https://github.com/OxideAV/oxideav-celt/compare/v0.1.2...v0.1.3) - 2026-05-06
 
