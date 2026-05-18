@@ -58,11 +58,17 @@
 //! * **Time-frequency change flags on transient frames** — `tf_res[i]` = 0
 //!   for the short-block / stereo / hybrid paths. The mono long-block path
 //!   honours the analyser's per-band picks (RFC §4.3.4.5).
-//! * **Stereo dynalloc band boosts** — the stereo path emits the cheap
-//!   "no boost" sequence on every band. The picker logic is wired (see
-//!   [`crate::encoder_decisions::pick_dynalloc_boost_band`]) but stays
-//!   disabled until the allocator's bisection accounts for the dual-stereo
-//!   `(width * channels)` quanta doubling.
+//! * **Stereo dynalloc band boosts (LM=3 only)** — the 20 ms stereo path
+//!   picks at most one boost band per frame via
+//!   [`crate::encoder_decisions::pick_dynalloc_boost_band_stereo`]. The
+//!   stereo picker requires the SAME band to be each channel's
+//!   independent mono-picker pick (per-channel intersection) so a
+//!   coincident outlier — centred kick drum, shared bass fundamental —
+//!   gets the extra pulses, while differently-tuned per-channel content
+//!   (each channel's own tonal band) leaves both channels' PVQ shape
+//!   budgets undisturbed. For LM=0/1/2 the path stays at all-zero
+//!   offsets until the tighter per-frame budget at those frame sizes is
+//!   re-validated.
 //! * **Intensity stereo (M/S with theta)** — not implemented. Stereo uses
 //!   dual-stereo only (L and R as two independent mono bands). Intensity
 //!   stereo would buy extra HF bits on low bit-rate stereo; at 64 kbit/s
@@ -521,6 +527,70 @@ impl CeltEncoder {
     /// Per-instance CELT frame length in 48 kHz samples (120, 240, 480, or 960).
     pub fn frame_samples(&self) -> usize {
         self.frame_samples
+    }
+
+    /// Per-instance packet budget in bytes for the next emitted frame.
+    /// Reflects either the default `bytes_per_frame_for(...)` schedule or
+    /// the most recent [`Self::set_target_bitrate`] override.
+    pub fn bytes_per_frame(&self) -> usize {
+        self.bytes_per_frame
+    }
+
+    /// Set the encoder's target bitrate in bits per second.
+    ///
+    /// Converts the supplied `bits_per_second` into the per-frame byte
+    /// budget the range coder targets:
+    ///
+    /// ```text
+    ///   bytes_per_frame = round(bits_per_second * frame_samples /
+    ///                           (8 * SAMPLE_RATE))
+    /// ```
+    ///
+    /// The resulting budget is clamped to a per-frame-size floor/ceiling
+    /// pair so the encoder always has enough headroom for the mandatory
+    /// per-frame header (silence flag, post-filter flag, transient,
+    /// intra, coarse energy, allocation symbols) and stays inside the
+    /// RFC 6716 §4.3 maximum of 1275 bytes per packet.
+    ///
+    /// | LM | frame  | floor (bytes) | floor (kbit/s) | ceiling (bytes) | ceiling (kbit/s) |
+    /// |----|--------|---------------|----------------|-----------------|-------------------|
+    /// |  3 | 20 ms  | 120           |  48            | 1275            | 510              |
+    /// |  2 | 10 ms  |  96           |  76.8          |  640            | 512              |
+    /// |  1 |  5 ms  |  72           | 115            |  320            | 512              |
+    /// |  0 | 2.5 ms |  60           | 192            |  160            | 512              |
+    ///
+    /// Stereo and mono share the same byte-budget mapping; callers
+    /// supply the desired *total* (L+R combined) bit-rate. The next
+    /// `send_frame` call uses the updated budget; in-flight packets
+    /// already in the output queue retain their original budget.
+    ///
+    /// The floors are calibrated to ~75% of the historical default
+    /// budgets ([`bytes_per_frame_for`]). They preserve enough headroom
+    /// for the fixed per-frame overhead (silence + post-filter +
+    /// transient + intra header, 21-band Laplace-coded coarse energy,
+    /// 21-band dynalloc-loop emission, spread ICDF + alloc-trim ICDF +
+    /// skip + intensity/dual-stereo symbols) plus the alloc-floor
+    /// `c << BITRES = 8` bits per coded band for the PVQ shape coder.
+    /// Below the floor the range coder runs out of output storage on
+    /// the first intra frame.
+    ///
+    /// Returns the clamped byte budget that was actually applied. This
+    /// is useful for callers that want to confirm their requested rate
+    /// fell inside the supported window.
+    pub fn set_target_bitrate(&mut self, bits_per_second: u32) -> usize {
+        let frame_samples = self.frame_samples as u64;
+        let raw = (bits_per_second as u64 * frame_samples + (8 * SAMPLE_RATE as u64 / 2))
+            / (8 * SAMPLE_RATE as u64);
+        let (floor, ceil) = match self.frame_samples {
+            960 => (120usize, 1275usize),
+            480 => (96, 640),
+            240 => (72, 320),
+            120 => (60, 160),
+            _ => unreachable!("frame_samples validated at construction"),
+        };
+        let bytes = (raw as usize).clamp(floor, ceil);
+        self.bytes_per_frame = bytes;
+        bytes
     }
 
     /// Test hook: force every emitted packet to carry a post-filter header
@@ -1912,17 +1982,27 @@ impl CeltEncoder {
             rc.encode_icdf(spread as usize, &SPREAD_ICDF, 5);
         }
 
-        // Dynalloc — stereo path. Mono boosts (single quanta on the peak
-        // band) are wired and tested. Stereo dynalloc remains disabled
-        // for now: stereo's `(width * channels)` quanta compounds with
-        // the dual-stereo PVQ partitioning to push the range coder over
-        // budget at LM<=2 byte-per-frame defaults. Re-enable once the
-        // allocator's bisection accounts for dual-stereo offset doubling
-        // — see [`crate::encoder_decisions::pick_dynalloc_boost_band`] for
-        // the picker that already runs (just left unused here).
+        // Dynalloc — stereo path. The picker
+        // [`crate::encoder_decisions::pick_dynalloc_boost_band_stereo`]
+        // runs the mono picker on each channel independently and returns
+        // the band index only when BOTH channels picked it. The
+        // per-channel intersection avoids the regression mode where a
+        // min-of-channels "ridge" between the L and R tonal bands gets
+        // mistaken for a coincident outlier (a synthetic L=1k+R=1.5k sine
+        // signal triggered this when min-of-channels was wired). The
+        // result: boosts only fire on content where the SAME band is
+        // each channel's standout — centred kick drum, shared bass
+        // fundamental. Only enabled for LM=3 (20 ms, 256 byte default)
+        // for this slice — shorter frames have tighter per-frame budgets
+        // where the per-channel intersection alone isn't enough to keep
+        // PVQ shape headroom positive on adversarial signals.
         let cap = init_caps(lm as usize, channels);
         let mut offsets = [0i32; NB_EBANDS];
-        let boost_band: Option<usize> = None;
+        let boost_band: Option<usize> = if lm == 3 {
+            crate::encoder_decisions::pick_dynalloc_boost_band_stereo(&band_log_e, 0, NB_EBANDS)
+        } else {
+            None
+        };
         let mut dynalloc_logp = 6i32;
         let mut total_bits_frac = (bytes as i32) * 8 << BITRES;
         tell = rc.tell_frac() as i32;
@@ -2462,5 +2542,66 @@ mod tests {
             !h.transient,
             "force_long_only must clamp transient=false even on click input"
         );
+    }
+
+    #[test]
+    fn set_target_bitrate_lm3_mono_default_matches_64kbps() {
+        // 64 kbit/s at 960 samples / 48 kHz = (64000 * 960) / (8 * 48000)
+        //                                   = 64000 * 0.0025 = 160 bytes.
+        // Matches the historical DEFAULT_BYTES_PER_FRAME for LM=3 mono.
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        assert_eq!(enc.bytes_per_frame(), 160);
+        assert_eq!(enc.set_target_bitrate(64_000), 160);
+        assert_eq!(enc.bytes_per_frame(), 160);
+    }
+
+    #[test]
+    fn set_target_bitrate_lm3_stereo_default_matches_102kbps() {
+        // The historical stereo default at LM=3 is 256 bytes/frame.
+        // 256 * 8 / (960/48000) = 256 * 8 / 0.020 = 102_400 bit/s.
+        // Round-trip: request 102_400 → expect 256 bytes.
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(2);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        assert_eq!(enc.bytes_per_frame(), 256);
+        assert_eq!(enc.set_target_bitrate(102_400), 256);
+    }
+
+    #[test]
+    fn set_target_bitrate_clamps_low_below_floor() {
+        // Below the LM=3 floor (120 bytes ≈ 48 kbit/s) the budget clamps
+        // up to 120.
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        assert_eq!(enc.set_target_bitrate(1_000), 120);
+    }
+
+    #[test]
+    fn set_target_bitrate_clamps_high_above_ceiling() {
+        // 600 kbit/s exceeds the LM=3 ceiling of 510 kbit/s (1275 bytes /
+        // 20 ms = 510 kbit/s). Clamp to 1275.
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new(&p).unwrap();
+        assert_eq!(enc.set_target_bitrate(600_000), 1275);
+    }
+
+    #[test]
+    fn set_target_bitrate_lm0_short_frames() {
+        // 2.5 ms frames: budget at 256 kbit/s = (256000 * 120) / (8 * 48000)
+        //                                     = 80 bytes; well above the
+        // 60-byte floor.
+        let mut p = CodecParameters::audio(CodecId::new(crate::CODEC_ID_STR));
+        p.channels = Some(1);
+        p.sample_rate = Some(SAMPLE_RATE);
+        let mut enc = CeltEncoder::new_with_frame_samples(&p, 120).unwrap();
+        assert_eq!(enc.set_target_bitrate(256_000), 80);
     }
 }

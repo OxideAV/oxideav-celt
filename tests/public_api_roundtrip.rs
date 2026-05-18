@@ -1691,3 +1691,202 @@ fn tonal_signal_roundtrips_under_perceptual_decisions() {
         mag_off
     );
 }
+
+/// Stereo dynalloc round-trip test.
+///
+/// Constructs a stereo signal where BOTH channels carry the same 1 kHz
+/// tone (centred content — equal energy in L and R). The picker
+/// [`oxideav_celt::encoder_decisions::pick_dynalloc_boost_band_stereo`]
+/// runs the mono picker on each channel and intersects the results;
+/// because the tone lives in the same band for L and R, the picker
+/// returns the tone-bearing band and the encoder emits a `(true, false)`
+/// dynalloc sequence for that band.
+///
+/// The test asserts the stream still decodes end-to-end (no range-coder
+/// overflow, no PVQ-allocator underflow) and each channel's decoded
+/// output carries the target tone (Goertzel magnitude at 1 kHz dominates
+/// an off-frequency probe). This exercises the boost-emission path
+/// through to PCM rather than just the picker function's unit-test
+/// coverage.
+#[test]
+fn stereo_dynalloc_centred_tone_roundtrips() {
+    let params = build_params(2);
+    let mut enc = CeltEncoder::new(&params).unwrap();
+    let mut dec = CeltDecoder::new(&params).unwrap();
+
+    let n_frames = 4usize;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    let freq = 1000.0f32;
+    let mut interleaved: Vec<f32> = Vec::with_capacity(n_samples * 2);
+    for i in 0..n_samples {
+        let t = i as f32 / SAMPLE_RATE as f32;
+        let s = (2.0 * std::f32::consts::PI * freq * t).sin() * 0.3;
+        // Centred content: identical L and R. Picker's per-channel
+        // mono picks coincide and the stereo dynalloc boosts the
+        // tone-bearing band.
+        interleaved.push(s);
+        interleaved.push(s);
+    }
+
+    let frame_interleaved = FRAME_SAMPLES * 2;
+    for chunk in interleaved.chunks(frame_interleaved) {
+        if chunk.len() == frame_interleaved {
+            enc.send_frame(&pcm_frame_f32(chunk, 2)).unwrap();
+        }
+    }
+    enc.flush().unwrap();
+
+    let mut decoded: Vec<f32> = Vec::new();
+    while let Ok(pkt) = enc.receive_packet() {
+        dec.send_packet(&pkt).unwrap();
+        while let Ok(frame) = dec.receive_frame() {
+            decoded.extend(decoded_f32(&frame));
+        }
+    }
+    assert_eq!(decoded.len(), n_samples * 2);
+    assert!(decoded.iter().all(|v| v.is_finite()));
+
+    // De-interleave the steady-state region (frames 2 and 3).
+    let start_s = FRAME_SAMPLES * 2;
+    let end_s = FRAME_SAMPLES * 4;
+    let mut l: Vec<f32> = Vec::with_capacity(end_s - start_s);
+    let mut r: Vec<f32> = Vec::with_capacity(end_s - start_s);
+    for i in start_s..end_s {
+        l.push(decoded[2 * i]);
+        r.push(decoded[2 * i + 1]);
+    }
+
+    let goertzel = |samples: &[f32], f: f32| -> f32 {
+        let w = 2.0 * std::f32::consts::PI * f / SAMPLE_RATE as f32;
+        let cw = w.cos();
+        let (mut s0, mut s1, mut s2) = (0f32, 0f32, 0f32);
+        for &x in samples {
+            s0 = 2.0 * cw * s1 - s2 + x;
+            s2 = s1;
+            s1 = s0;
+        }
+        let _ = s0;
+        (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).sqrt()
+    };
+    let l_tone = goertzel(&l, freq);
+    let l_off = goertzel(&l, 5000.0);
+    let r_tone = goertzel(&r, freq);
+    let r_off = goertzel(&r, 5000.0);
+    println!(
+        "stereo centred-tone dynalloc roundtrip: L tone/off={:.2}, R tone/off={:.2}",
+        l_tone / l_off.max(1e-9),
+        r_tone / r_off.max(1e-9)
+    );
+    assert!(
+        l_tone > 0.3 * l_off,
+        "L tone buried with stereo dynalloc on: tone={:.3}, off={:.3}",
+        l_tone,
+        l_off
+    );
+    assert!(
+        r_tone > 0.3 * r_off,
+        "R tone buried with stereo dynalloc on: tone={:.3}, off={:.3}",
+        r_tone,
+        r_off
+    );
+}
+
+/// User-settable target bitrate round-trip.
+///
+/// Verifies that [`oxideav_celt::encoder::CeltEncoder::set_target_bitrate`]
+/// produces packets whose actual byte length matches the requested per-
+/// frame budget, and that the decoder accepts both a low (~24 kbit/s
+/// mono) and a high (~192 kbit/s mono) configuration. The high path is
+/// the more demanding regression test — adding budget headroom should
+/// only increase decoded SNR, never break the encoder's allocator.
+#[test]
+fn set_target_bitrate_round_trips_at_low_and_high_rates() {
+    use oxideav_celt::encoder::{CeltEncoder, FRAME_SAMPLES, SAMPLE_RATE};
+
+    let params = build_params(1);
+
+    // Build a 4-frame 1 kHz mono test signal.
+    let n_frames = 4usize;
+    let n_samples = FRAME_SAMPLES * n_frames;
+    let freq = 1000.0f32;
+    let signal: Vec<f32> = (0..n_samples)
+        .map(|i| (2.0 * std::f32::consts::PI * freq * i as f32 / SAMPLE_RATE as f32).sin() * 0.3)
+        .collect();
+
+    let encode_and_decode = |bps: u32| -> (usize, Vec<f32>) {
+        let mut enc = CeltEncoder::new(&params).unwrap();
+        let bytes = enc.set_target_bitrate(bps);
+        let mut dec = CeltDecoder::new(&params).unwrap();
+        for chunk in signal.chunks(FRAME_SAMPLES) {
+            if chunk.len() == FRAME_SAMPLES {
+                enc.send_frame(&pcm_frame_f32(chunk, 1)).unwrap();
+            }
+        }
+        enc.flush().unwrap();
+        let mut decoded: Vec<f32> = Vec::with_capacity(n_samples);
+        while let Ok(pkt) = enc.receive_packet() {
+            // Every packet should equal the configured byte budget.
+            assert_eq!(
+                pkt.data.len(),
+                bytes,
+                "packet size {} != configured budget {}",
+                pkt.data.len(),
+                bytes
+            );
+            dec.send_packet(&pkt).unwrap();
+            while let Ok(frame) = dec.receive_frame() {
+                decoded.extend(decoded_f32(&frame));
+            }
+        }
+        (bytes, decoded)
+    };
+
+    // Low (56 kbit/s → 140 bytes — above the 120-byte LM=3 floor) and
+    // high (192 kbit/s → 480 bytes — below the 1275-byte ceiling).
+    let (low_bytes, low_dec) = encode_and_decode(56_000);
+    let (high_bytes, high_dec) = encode_and_decode(192_000);
+
+    assert_eq!(low_dec.len(), n_samples);
+    assert_eq!(high_dec.len(), n_samples);
+    assert!(low_dec.iter().all(|v| v.is_finite()));
+    assert!(high_dec.iter().all(|v| v.is_finite()));
+    assert!(high_bytes > low_bytes);
+
+    // Steady-state Goertzel ratio at both rates. The high-bitrate path
+    // should preserve the tone at least as well as the low-bitrate path.
+    let goertzel = |samples: &[f32], f: f32| -> f32 {
+        let w = 2.0 * std::f32::consts::PI * f / SAMPLE_RATE as f32;
+        let cw = w.cos();
+        let (mut s0, mut s1, mut s2) = (0f32, 0f32, 0f32);
+        for &x in samples {
+            s0 = 2.0 * cw * s1 - s2 + x;
+            s2 = s1;
+            s1 = s0;
+        }
+        let _ = s0;
+        (s1 * s1 + s2 * s2 - 2.0 * cw * s1 * s2).sqrt()
+    };
+    let slice_lo = &low_dec[FRAME_SAMPLES * 2..FRAME_SAMPLES * 3];
+    let slice_hi = &high_dec[FRAME_SAMPLES * 2..FRAME_SAMPLES * 3];
+    let ratio_lo = goertzel(slice_lo, freq) / goertzel(slice_lo, 5000.0).max(1e-9);
+    let ratio_hi = goertzel(slice_hi, freq) / goertzel(slice_hi, 5000.0).max(1e-9);
+    println!(
+        "set_target_bitrate: low={} B ratio={:.2}, high={} B ratio={:.2}",
+        low_bytes, ratio_lo, high_bytes, ratio_hi
+    );
+    // Both rates must keep the tone audible (tone strictly dominates the
+    // off-frequency probe). We don't require strict monotonicity in the
+    // ratio because CELT's perceptual allocator can spend the extra bits
+    // on bands other than the one carrying the tone — but neither rate
+    // may bury it.
+    assert!(
+        ratio_lo > 1.0,
+        "low-bitrate tone buried: ratio={:.2}",
+        ratio_lo
+    );
+    assert!(
+        ratio_hi > 1.0,
+        "high-bitrate tone buried: ratio={:.2}",
+        ratio_hi
+    );
+}

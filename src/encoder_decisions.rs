@@ -161,6 +161,59 @@ pub fn pick_dynalloc_boost_band(
     best_band
 }
 
+/// Stereo dynalloc decision — pick the band that the encoder should boost
+/// by one quanta for a dual-stereo packet. Returns the band index, or
+/// `None` to leave every band at the cheap "no boost" emission.
+///
+/// Heuristic (clean-room — RFC §4.3.3 only specifies the bit layout, not
+/// the encoder's pick): run the per-channel mono picker
+/// ([`pick_dynalloc_boost_band`], ~6 dB excess threshold) independently
+/// on L and R. Boost only when BOTH channels' independent picks land on
+/// the *same* band index. This is the strongest "both channels agree on
+/// this outlier" signal we can derive from per-channel energies alone.
+///
+/// Rationale:
+///
+///   * A min-of-channels heuristic (taking `min(L_e[i], R_e[i])` and
+///     re-running the mono picker) is too liberal: when each channel has
+///     its own loud band, the min-of-channels signal contains a "ridge"
+///     between the two channels' loud bands that the picker mistakes for
+///     a coincident outlier — even though each individual channel sees
+///     that ridge as filler-energy at a band it doesn't care about.
+///     Wiring this triggered a measurable SNR regression on the per-
+///     channel sine round-trip (1 kHz L + 1.5 kHz R), confirming the
+///     false-positive.
+///
+///   * Per-channel intersection avoids that failure mode: a hard-panned
+///     outlier in only one channel never triggers the boost, and content
+///     where both channels are flat returns `None`. The boost fires only
+///     on content where the SAME band is each channel's mono pick — e.g.
+///     identical-mix content like a centred kick drum or a shared bass
+///     fundamental.
+///
+/// `band_log_e` is the channel-interleaved per-band log-energy buffer:
+/// indices `[0..NB_EBANDS)` are channel 0 (L), indices
+/// `[NB_EBANDS..2*NB_EBANDS)` are channel 1 (R). Only the band slice
+/// `[start_band, end_band)` is examined within each channel.
+pub fn pick_dynalloc_boost_band_stereo(
+    band_log_e: &[f32],
+    start_band: usize,
+    end_band: usize,
+) -> Option<usize> {
+    debug_assert!(end_band <= NB_EBANDS);
+    debug_assert!(band_log_e.len() >= 2 * NB_EBANDS);
+    if end_band <= start_band {
+        return None;
+    }
+    let pick_l = pick_dynalloc_boost_band(&band_log_e[..NB_EBANDS], start_band, end_band);
+    let pick_r =
+        pick_dynalloc_boost_band(&band_log_e[NB_EBANDS..2 * NB_EBANDS], start_band, end_band);
+    match (pick_l, pick_r) {
+        (Some(l), Some(r)) if l == r => Some(l),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +318,71 @@ mod tests {
         log_e[5] = 0.5; // ~3 dB — below the 6 dB threshold
         let pick = pick_dynalloc_boost_band(&log_e, 0, NB_EBANDS);
         assert_eq!(pick, None, "sub-threshold excess must not boost");
+    }
+
+    #[test]
+    fn dynalloc_stereo_boosts_band_loud_in_both_channels() {
+        // Both channels carry the same ~12 dB outlier at band 10 — the
+        // min-of-channels still sits well above the median, so the picker
+        // takes it.
+        let mut log_e = [0f32; 2 * NB_EBANDS];
+        log_e[10] = 2.0;
+        log_e[NB_EBANDS + 10] = 2.0;
+        let pick = pick_dynalloc_boost_band_stereo(&log_e, 0, NB_EBANDS);
+        assert_eq!(pick, Some(10));
+    }
+
+    #[test]
+    fn dynalloc_stereo_skips_band_loud_in_one_channel_only() {
+        // Hard-panned outlier: L has the ~12 dB peak at band 10, R is flat.
+        // L's mono pick is Some(10), R's mono pick is None — the
+        // intersection rule drops the boost (the quiet channel has no
+        // band to spend the extra pulses on).
+        let mut log_e = [0f32; 2 * NB_EBANDS];
+        log_e[10] = 2.0;
+        // R is all-zero by initialiser.
+        let pick = pick_dynalloc_boost_band_stereo(&log_e, 0, NB_EBANDS);
+        assert_eq!(
+            pick, None,
+            "hard-panned outlier must not trigger a stereo boost"
+        );
+    }
+
+    #[test]
+    fn dynalloc_stereo_skips_band_loud_in_each_at_different_indices() {
+        // L has its outlier at band 4, R at band 6 (mirrors the round-trip
+        // sine test where L=1 kHz lands in band 4 and R=1.5 kHz in band 6).
+        // L's mono pick = Some(4), R's mono pick = Some(6); they disagree
+        // → no stereo boost. This is the case the min-of-channels
+        // heuristic got wrong: it would invent a "ridge" outlier between
+        // the two peaks and boost a band neither channel actually wanted.
+        let mut log_e = [0f32; 2 * NB_EBANDS];
+        log_e[4] = 2.0;
+        log_e[NB_EBANDS + 6] = 2.0;
+        let pick = pick_dynalloc_boost_band_stereo(&log_e, 0, NB_EBANDS);
+        assert_eq!(
+            pick, None,
+            "different peak bands per channel must not boost"
+        );
+    }
+
+    #[test]
+    fn dynalloc_stereo_skips_flat_signal() {
+        // Both channels flat → both mono picks None → intersection None.
+        let log_e = [0.1f32; 2 * NB_EBANDS];
+        let pick = pick_dynalloc_boost_band_stereo(&log_e, 0, NB_EBANDS);
+        assert_eq!(pick, None);
+    }
+
+    #[test]
+    fn dynalloc_stereo_inherits_mono_excess_threshold() {
+        // ~3 dB excess (below the mono ~6 dB floor) in both channels →
+        // both mono picks None → stereo intersection None. Confirms the
+        // stereo picker doesn't accidentally lower the threshold.
+        let mut log_e = [0f32; 2 * NB_EBANDS];
+        log_e[10] = 0.5;
+        log_e[NB_EBANDS + 10] = 0.5;
+        let pick = pick_dynalloc_boost_band_stereo(&log_e, 0, NB_EBANDS);
+        assert_eq!(pick, None);
     }
 }

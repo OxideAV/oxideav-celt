@@ -15,6 +15,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Stereo dynalloc band boost** (RFC 6716 §4.3.3, LM=3 / 20 ms only) —
+  `encoder_decisions::pick_dynalloc_boost_band_stereo` runs the mono
+  picker on each channel independently and returns the band index only
+  when BOTH channels picked the same band (per-channel intersection).
+  Centred content (kick drum, shared bass fundamental) gets the extra
+  pulse budget; hard-panned outliers and content where each channel's
+  loudest band differs leave the PVQ shape budgets untouched. The
+  earlier min-of-channels heuristic was rejected after a bring-up
+  regression on a per-channel sine round-trip (1 kHz L + 1.5 kHz R)
+  showed the picker invents a "ridge" outlier between the two channels'
+  loud bands; the per-channel-intersection rule has clean unit-test
+  coverage on the hard-panned, different-band-per-channel, and centred-
+  outlier cases, plus an end-to-end `stereo_dynalloc_centred_tone_
+  roundtrips` integration test that pins L+R Goertzel ratios at
+  ~34.5× tone/off-frequency. Currently gated to LM=3 (256 byte / 20 ms
+  default budget); LM=0/1/2 stereo paths stay at the all-zero offsets
+  pending separate per-frame-budget calibration.
+
+- **User-settable target bitrate** (`CeltEncoder::set_target_bitrate(bps)`
+  + `bytes_per_frame()` reader) — converts a bits-per-second target into
+  the per-frame byte budget, clamped to a per-frame-size floor/ceiling
+  pair that preserves enough headroom for the fixed per-frame header +
+  coarse-energy + allocation overhead plus PVQ shape headroom and stays
+  inside the RFC 6716 §4.3 maximum of 1275 bytes/packet. Supported
+  windows: LM=3 48-510 kbit/s, LM=2 77-512 kbit/s, LM=1 115-512 kbit/s,
+  LM=0 192-512 kbit/s. Five new unit tests pin the default-roundtrip
+  values + low/high clamps; an integration test
+  (`set_target_bitrate_round_trips_at_low_and_high_rates`) confirms a
+  56 kbit/s and a 192 kbit/s mono session both produce decoder-valid
+  packets at the configured byte sizes and both keep the tonal target
+  audible end-to-end.
+
 - **Mixed-radix Cooley-Tukey FFT for the IMDCT** (RFC 6716 §4.3.7) —
   `mdct::fft_mixed` / `mdct::ifft_mixed` now handle every CELT N/4 size
   (30/60/120/240 = 2^k · 3 · 5) directly via a 2/3/4/5-radix

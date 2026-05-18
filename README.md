@@ -113,11 +113,28 @@ PCM frame and clears its OLA tail.
 
 ### Bitrate
 
-The encoder uses a fixed per-frame byte budget: 160 bytes/frame
-(~64 kbit/s) for mono and 256 bytes/frame (~102 kbit/s) for stereo.
-These are the defaults libopus picks for the CELT music path at
-20 ms/48 kHz; they leave enough headroom for the per-channel coarse/
-fine energy overhead plus the PVQ shape bits.
+The encoder defaults to a fixed per-frame byte budget: 160 bytes/frame
+(~64 kbit/s) for mono and 256 bytes/frame (~102 kbit/s) for stereo at
+LM=3 (20 ms / 48 kHz). The full default schedule is in
+`bytes_per_frame_for` (`encoder.rs`).
+
+Callers can override the budget at runtime with
+`CeltEncoder::set_target_bitrate(bps)`. The supplied bits-per-second
+target is converted to a per-frame byte count and clamped to a
+per-frame-size floor/ceiling pair so the range coder always has enough
+headroom for the mandatory header + coarse-energy + allocation symbols
+plus PVQ shape headroom, and stays inside the RFC 6716 §4.3 maximum of
+1275 bytes per packet:
+
+| LM | frame  | floor (kbit/s) | ceiling (kbit/s) | default (mono / stereo) |
+|----|--------|----------------|-------------------|--------------------------|
+|  3 | 20 ms  |  48            | 510               |  64  / 102               |
+|  2 | 10 ms  |  76.8          | 512               |  96  / 154               |
+|  1 |  5 ms  | 115            | 512               | 154  / 246               |
+|  0 | 2.5 ms | 192            | 512               | 320  / 512               |
+
+`set_target_bitrate` returns the clamped byte budget so callers can
+confirm whether the requested rate fell inside the supported window.
 
 ## What's implemented
 
@@ -197,8 +214,13 @@ every gap below.
   no-op decision (every band gets `tf_change = 0`) until the
   recombine + Hadamard interaction in those modes is wired through
   `quant_partition_enc`.
-- **Dynalloc stereo path** still emits all-zero offsets; the mono path
-  picks one outlier band per frame.
+- **Dynalloc stereo path** picks one boost band at LM=3 (20 ms) via the
+  per-channel intersection of the mono picker (see
+  `encoder_decisions::pick_dynalloc_boost_band_stereo`). Centred content
+  (same band loud on both L and R) gets the extra pulse budget; hard-
+  panned outliers or different-band-per-channel content leaves both
+  channels' PVQ shape budgets undisturbed. LM=0/1/2 stereo still emits
+  all-zero offsets pending separate per-frame-budget calibration.
 - **Intensity stereo.** Stereo uses dual-stereo only — L and R coded as
   two independent mono bands in one packet. Intensity stereo would buy
   extra HF bits on low bit-rate stereo; at 102 kbit/s the dual path
