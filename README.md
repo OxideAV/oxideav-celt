@@ -4,31 +4,42 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-05-20
 
-**Orphan-rebuild scaffold.** The crate's prior implementation was
-retired under the workspace clean-room policy: provenance for several
-core modules could not be defended against the "no external library
-source as reference" rule that governs every crate in this workspace.
+**Round-1 bootstrap.** The bit-exact CELT/SILK range decoder
+(RFC 6716 §4.1) is implemented and unit-tested. This is the leaf
+entropy-coding primitive that every CELT and SILK symbol passes
+through; the band-decode, PVQ, and MDCT paths will layer on top of
+it in later rounds.
 
-Per workspace policy, the only acceptable response is a full
-clean-room re-implementation against RFC 6716 and black-box validator
-binaries. That work has not yet been scheduled.
+What is wired up today:
 
-Every public entry point currently returns `Error::NotImplemented`.
+* `RangeDecoder::new(buf)` — initialization per §4.1.1.
+* `dec_bit_logp(logp)` — binary symbol with probability `2^-logp` of
+  a "1" (§4.1.3.2).
+* `dec_bits(n)` — raw bits, packed LSB-first from the end of the
+  frame (§4.1.4).
+* `dec_uint(ft)` — uniformly-distributed integer in `0..ft`,
+  including the `ftb > 8` split-decode branch (§4.1.5).
+* `tell()` — whole-bit budget accounting (§4.1.6.1).
+* Sticky `has_error()` for the corrupt-frame path documented in
+  §4.1.5.
 
-## Planned clean-room sources
+Higher-level entry points (frame decoder, encoder, codec
+registration with the runtime) still return `Error::NotImplemented`.
 
-The clean-room rebuild will consult only:
+## Clean-room provenance
 
-* RFC 6716 — Definition of the Opus Audio Codec (covers CELT layer +
-  range coder + MDCT path).
-* RFC 7845 — Ogg Encapsulation for the Opus Audio Codec (where the
-  framing intersects).
-* Black-box invocations of `opusdec` / `opusenc` (the binaries — not
-  their source) as opaque validators.
+The implementation references only the IETF specifications under
+`docs/audio/opus/`:
+
+* RFC 6716 — Definition of the Opus Audio Codec (CELT layer + range
+  coder + MDCT path).
+* RFC 8251 — Opus Update.
+* RFC 7845 — Ogg Encapsulation for Opus (consulted for framing).
 
 No external library source — libopus, the Opus reference encoder /
 decoder, etc. — is permitted as a reference under the workspace
-clean-room policy.
+clean-room policy. Black-box invocations of `opusdec` / `opusenc`
+are allowed as opaque validators only.
 
 ## License
 
