@@ -6,20 +6,23 @@
 //! pseudocode equations in the RFC; no external library source was
 //! consulted.
 //!
-//! Only the subset required by the CELT layer's bootstrap is wired up
-//! in round 1:
+//! The following routines are wired up:
 //!
 //! * Initialization (§4.1.1).
 //! * Symbol-update internal helper (§4.1.2).
 //! * Renormalization (§4.1.2.1).
+//! * `ec_decode_bin` for power-of-two `ft` symbols (§4.1.3.1).
 //! * `ec_dec_bit_logp` (§4.1.3.2).
+//! * `ec_dec_icdf` for inverse-CDF table decoding (§4.1.3.3).
 //! * `ec_dec_bits` for raw bits (§4.1.4).
 //! * `ec_dec_uint` for uniformly-distributed integers (§4.1.5).
 //! * `ec_tell` for whole-bit accounting (§4.1.6.1).
+//! * `ec_tell_frac` for 1/8th-bit-precision accounting (§4.1.6.2).
 //!
-//! Higher-precision `ec_tell_frac`, `ec_decode_bin`, `ec_dec_icdf`, and
-//! the full `ec_decode`/`ec_dec_update` symbol path are intentionally
-//! deferred to a later round when the band decoder needs them.
+//! The full generic `ec_decode`/`ec_dec_update` symbol path is reachable
+//! through the private helpers and is exercised internally by
+//! `dec_uint`; a dedicated public symbol-decoding API will land
+//! together with the band decoder when the bit allocator needs it.
 
 use crate::Error;
 
@@ -122,6 +125,45 @@ impl<'a> RangeDecoder<'a> {
         self.nbits_total
             .saturating_sub(lg)
             .saturating_add(self.nbits_raw)
+    }
+
+    /// Current 1/8th-bit-precision budget consumed by the range coder
+    /// plus the raw bit reader (RFC 6716 §4.1.6.2).
+    ///
+    /// `ec_tell_frac` follows the procedure in §4.1.6.2 exactly: from
+    /// `lg = ilog(rng)`, extract `r_Q15 = rng >> (lg - 16)` as a Q15
+    /// value in `[2^15, 2^16)`. Three iterations of the
+    /// `r_Q15 = (r_Q15*r_Q15) >> 15; lg = 2*lg + (r_Q15 >> 16)` recursion
+    /// expand `lg` to 1/8th-bit precision. Raw bits add `8*nbits_raw`
+    /// (§4.1.6) to the result. By construction the result satisfies
+    /// `ec_tell() == ceil(ec_tell_frac()/8.0)` from §4.1.6.
+    pub fn tell_frac(&self) -> u32 {
+        let lg0 = 32 - self.rng.leading_zeros();
+        // §4.1.6.2: lg must be at least 24 after renormalization.
+        // r_Q15 = rng >> (lg - 16) lies in [2^15, 2^16).
+        let mut r_q15 = self.rng >> (lg0 - 16);
+        // Build the 1/8th-bit-precision lg one bit at a time. The
+        // spec doubles `lg` on each of three refinement passes, so the
+        // accumulator starts at the whole-bit value `lg0`.
+        let mut lg_frac = lg0;
+        // Three passes give three extra bits = 1/8th-bit precision.
+        for _ in 0..3 {
+            r_q15 = (r_q15 * r_q15) >> 15;
+            let bit = r_q15 >> 16;
+            lg_frac = 2 * lg_frac + bit;
+            // If the bit was a 1, halve r_Q15 so it lies in
+            // [2^15, 2^16) again.
+            if bit == 1 {
+                r_q15 >>= 1;
+            }
+        }
+        // ec_tell_frac() returns nbits_total*8 - lg, plus raw bits in
+        // 1/8th-bit units (§4.1.6: raw bits add to the total in whole
+        // bits, i.e. multiples of 8 in this scale).
+        self.nbits_total
+            .saturating_mul(8)
+            .saturating_sub(lg_frac)
+            .saturating_add(self.nbits_raw.saturating_mul(8))
     }
 
     /// Decode a single binary symbol with probability `2^-logp` of
@@ -236,6 +278,81 @@ impl<'a> RangeDecoder<'a> {
                 Ok(t)
             }
         }
+    }
+
+    /// Decode the `fs` value for a power-of-two `ft = 1<<ftb`
+    /// (RFC 6716 §4.1.3.1, `ec_decode_bin`).
+    ///
+    /// Mathematically equivalent to [`Self::decode`] with `ft = 1<<ftb`,
+    /// but avoids the division: `rng / ft = rng >> ftb`. The caller is
+    /// expected to follow with [`Self::dec_update`] (or, more typically
+    /// for the SILK path, to use [`Self::dec_icdf`] which combines the
+    /// two steps).
+    ///
+    /// Returns `fs` in the range `[0, 1<<ftb)`. If `ftb` is out of
+    /// range (`> 25` would violate the §4.1.3 ftb bound for the
+    /// table-driven path), the function still returns a sensible value
+    /// (the shift saturates) — callers are expected to provide a valid
+    /// `ftb`.
+    pub fn decode_bin(&mut self, ftb: u32) -> u32 {
+        // s = rng / (1 << ftb) = rng >> ftb.
+        let s = self.rng >> ftb;
+        if s == 0 {
+            // Would only happen for ftb > ilog(rng); per the
+            // renormalization invariant ilog(rng) >= 24, so any
+            // practical ftb (the spec uses up to 8 for icdf and up
+            // to 15 elsewhere) is fine. Defensively saturate to 0.
+            return 0;
+        }
+        let ft = 1u32 << ftb;
+        // fs = ft - min(val / s + 1, ft).
+        let approx = (self.val / s).saturating_add(1);
+        ft - approx.min(ft)
+    }
+
+    /// Decode a single symbol via an inverse cumulative distribution
+    /// function table (RFC 6716 §4.1.3.3, `ec_dec_icdf`).
+    ///
+    /// The table `icdf` stores `(1<<ftb) - fh[k]` for each symbol `k`,
+    /// terminated by a sentinel `0` entry (so the implicit
+    /// `fh[K_last] == ft`). `fl[0]` is implicitly 0; the table values
+    /// are strictly monotonically decreasing.
+    ///
+    /// Combines the search step (find `k` such that
+    /// `fs < (1<<ftb) - icdf[k]`) with the range/value update,
+    /// replacing the division by a sequence of multiplications. The
+    /// renormalization loop is run before returning.
+    ///
+    /// Returns the decoded symbol index `k` in `0..icdf.len()-1`. If
+    /// the table is empty or malformed (no terminating `0`), the
+    /// decoder latches its sticky error flag and returns 0.
+    pub fn dec_icdf(&mut self, icdf: &[u8], ftb: u32) -> u32 {
+        // s corresponds to rng / ft with ft = 1<<ftb.
+        let s = self.rng >> ftb;
+        // The spec's search expressed as a forward walk: for each
+        // candidate k starting at 0, compute `next = s * icdf[k]` (a
+        // descending sequence as icdf is monotonically decreasing).
+        // The first k where `val >= next` is the decoded symbol;
+        // `t - next` is the new range, where `t` tracks the previous
+        // step's `next` (initialised to `rng` so that k=0 reduces to
+        // `rng' = rng - s*icdf[0]`, matching §4.1.2 for `fl[0] == 0`).
+        let mut t = self.rng;
+        for (k, &cell) in icdf.iter().enumerate() {
+            let next = s.saturating_mul(cell as u32);
+            if self.val >= next {
+                self.val -= next;
+                self.rng = t - next;
+                self.normalize();
+                return k as u32;
+            }
+            t = next;
+        }
+        // Malformed table: no terminating 0 entry was reached, which
+        // would indicate the bitstream's required symbol falls beyond
+        // the table. §4.1.5's general guidance for corrupt-frame
+        // recovery applies — latch the error flag and return 0.
+        self.error = true;
+        0
     }
 
     // ----- internal helpers -----
@@ -459,6 +576,162 @@ mod tests {
             let _ = dec.dec_bit_logp(2);
             let now = dec.tell();
             assert!(now >= prev, "tell() went backwards: {} -> {}", prev, now);
+            prev = now;
+        }
+    }
+
+    /// `decode_bin(ftb)` must match the generic `decode(1<<ftb)` path
+    /// exactly (RFC 6716 §4.1.3.1 says the two are mathematically
+    /// equivalent). Compare a handful of `ftb` values against the
+    /// generic helper on independent decoders fed the same bytes.
+    #[test]
+    fn decode_bin_matches_generic_decode() {
+        for &ftb in &[1u32, 4, 8, 12, 15] {
+            let buf = [0x37u8, 0x91, 0xC4, 0x18, 0xA2, 0x5D, 0x6E, 0xFF];
+            let mut a = RangeDecoder::new(&buf);
+            let mut b = RangeDecoder::new(&buf);
+            let from_bin = a.decode_bin(ftb);
+            let from_generic = b.decode(1u32 << ftb);
+            assert_eq!(
+                from_bin, from_generic,
+                "decode_bin({ftb}) != decode(1<<{ftb})"
+            );
+            assert!(from_bin < (1u32 << ftb), "fs={from_bin} out of range");
+        }
+    }
+
+    /// §4.1.6.1 specifies `ec_tell() == ceil(ec_tell_frac()/8.0)`.
+    /// Walk a decoder forward through a mix of symbol and raw-bit
+    /// reads and assert this identity at every step.
+    #[test]
+    fn tell_frac_consistent_with_tell() {
+        let mut dec = RangeDecoder::new(&[0xA3, 0x7F, 0x10, 0x5C, 0xE8, 0x91, 0x42, 0xB7]);
+        // Initial: ec_tell() == 1 per §4.1.6.1.
+        assert_eq!(dec.tell(), 1);
+        // ec_tell_frac() / 8.0, rounded up, must equal ec_tell().
+        for _ in 0..12 {
+            let whole = dec.tell();
+            let frac = dec.tell_frac();
+            // ceil(frac/8) == (frac + 7) / 8.
+            let ceil_eighths = frac.div_ceil(8);
+            assert_eq!(
+                ceil_eighths, whole,
+                "tell()={whole} != ceil(tell_frac()={frac} / 8)={ceil_eighths}"
+            );
+            // Then advance the decoder.
+            let _ = dec.dec_bit_logp(1);
+            let _ = dec.dec_bits(2);
+        }
+    }
+
+    /// `tell_frac()` of a freshly initialised decoder should land in
+    /// the 1-bit termination reserve (§4.1.6.1 says `tell()` is 1
+    /// then, so `tell_frac()` is at most 8 and at least 1 since the
+    /// extra two bits of slack are baked into `nbits_total`).
+    #[test]
+    fn tell_frac_initial_within_one_bit() {
+        let dec = RangeDecoder::new(&[0xCC, 0xDD, 0xEE, 0xFF]);
+        let frac = dec.tell_frac();
+        assert!(
+            (1..=8).contains(&frac),
+            "tell_frac initial out of [1,8]: {frac}"
+        );
+        assert!(frac.div_ceil(8) == dec.tell());
+    }
+
+    /// `dec_icdf` over a binary `{ft-1, 1}/ft` distribution must
+    /// behave identically to `dec_bit_logp(logp)` with the same `ftb`
+    /// (RFC 6716 §4.1.3.2 + §4.1.3.3 — both are special cases of
+    /// `ec_decode` with `ft = 1<<ftb`). Drive both with the same
+    /// input bytes and compare per-step decisions.
+    #[test]
+    fn dec_icdf_matches_dec_bit_logp_for_binary() {
+        let buf = [0xDE, 0xAD, 0xBE, 0xEF, 0x10, 0x32, 0x54, 0x76];
+        // logp = 3 → ft = 8, P("1") = 1/8. icdf for this PDF is
+        // {ft - fh[0], ft - fh[1]} = {1, 0}: symbol 0 (the "0" bit)
+        // is the high-probability outcome.
+        let logp = 3u32;
+        let icdf = [1u8, 0];
+        let mut a = RangeDecoder::new(&buf);
+        let mut b = RangeDecoder::new(&buf);
+        for _ in 0..16 {
+            let via_logp = a.dec_bit_logp(logp);
+            let via_icdf = b.dec_icdf(&icdf, logp);
+            assert_eq!(
+                via_logp, via_icdf,
+                "dec_bit_logp({logp}) != dec_icdf({:?}, {logp})",
+                icdf
+            );
+        }
+        assert!(!a.has_error() && !b.has_error());
+    }
+
+    /// `dec_icdf` with a uniform `{1,1,1,1,1,1,1,1}/8` distribution
+    /// must always return a symbol in `0..8` and never trip the
+    /// error flag. Equivalent to `dec_uint(8)` in expectation.
+    #[test]
+    fn dec_icdf_uniform_returns_in_range() {
+        // PDF {1,1,1,1,1,1,1,1}/8 → fh = {1,2,3,4,5,6,7,8} → icdf =
+        // {7,6,5,4,3,2,1,0}.
+        let icdf = [7u8, 6, 5, 4, 3, 2, 1, 0];
+        let mut dec = RangeDecoder::new(&[0x42, 0x18, 0xC3, 0x7F, 0x55, 0xAA, 0x33, 0xCC]);
+        for _ in 0..16 {
+            let k = dec.dec_icdf(&icdf, 3);
+            assert!(k < 8, "icdf uniform returned {k} out of [0,8)");
+        }
+        assert!(!dec.has_error());
+    }
+
+    /// `dec_icdf` with a degenerate single-symbol table `{0}` (only
+    /// the terminator) means `ft - fh[0] = 0`, i.e. the only symbol
+    /// covers the whole interval and is always returned. This must
+    /// not consume any range coder bits beyond renormalization, and
+    /// must not error.
+    #[test]
+    fn dec_icdf_single_symbol_always_zero() {
+        let icdf = [0u8]; // only the terminator: ft - fh[0] == 0.
+        let mut dec = RangeDecoder::new(&[0x77, 0x33, 0x11, 0xAA]);
+        let before_tell = dec.tell();
+        for _ in 0..4 {
+            let k = dec.dec_icdf(&icdf, 3);
+            assert_eq!(k, 0);
+        }
+        // No range mass was consumed (the symbol covered everything),
+        // so tell() should be unchanged or have advanced only by
+        // renormalization (in practice, zero advance after the first
+        // call because rng wasn't reduced).
+        assert!(dec.tell() >= before_tell);
+        assert!(!dec.has_error());
+    }
+
+    /// `tell_frac()` advances monotonically across mixed operations,
+    /// in the same way `tell()` does (§4.1.6.2 inherits the
+    /// monotonicity of `ec_tell` since the procedure only adds bits).
+    #[test]
+    fn tell_frac_is_monotonic() {
+        let mut dec = RangeDecoder::new(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        // Uniform 8-way icdf so each call burns ~3 bits of entropy.
+        let icdf = [7u8, 6, 5, 4, 3, 2, 1, 0];
+        let mut prev = dec.tell_frac();
+        for i in 0..24 {
+            match i % 3 {
+                0 => {
+                    let _ = dec.dec_bit_logp(2);
+                }
+                1 => {
+                    let _ = dec.dec_icdf(&icdf, 3);
+                }
+                _ => {
+                    let _ = dec.dec_bits(2);
+                }
+            }
+            let now = dec.tell_frac();
+            assert!(
+                now >= prev,
+                "tell_frac() went backwards: {} -> {}",
+                prev,
+                now
+            );
             prev = now;
         }
     }

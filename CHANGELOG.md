@@ -6,6 +6,21 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-2 entropy primitives (2026-05-21):** three additional
+  range-decoder methods to round out the §4.1 surface:
+  `decode_bin(ftb)` (§4.1.3.1, the division-free power-of-two `ft`
+  decode), `dec_icdf(icdf, ftb)` (§4.1.3.3, the primary SILK
+  interface — table-driven inverse-CDF symbol decode with combined
+  search-and-update), and `tell_frac()` (§4.1.6.2, 1/8th-bit-precision
+  bit-budget accounting). The `tell() == ceil(tell_frac()/8)`
+  identity from §4.1.6.1 is asserted in CI on every decoder step.
+  7 new unit tests cover: `decode_bin` ≡ generic `decode(1<<ftb)`,
+  `tell_frac`-vs-`tell` consistency on a live decoder, the
+  freshly-initialised `tell_frac` slack, `dec_icdf` ≡
+  `dec_bit_logp` for the binary case, `dec_icdf` uniform-PDF
+  in-range, the degenerate single-symbol icdf table, and
+  `tell_frac` monotonicity under mixed symbol+raw operations.
+
 * **Round-1 bootstrap (2026-05-20):** bit-exact CELT/SILK range
   decoder per RFC 6716 §4.1. `RangeDecoder` exposes `new`,
   `dec_bit_logp` (§4.1.3.2), `dec_bits` (§4.1.4), `dec_uint`

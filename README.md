@@ -2,24 +2,29 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-05-20
+## Status — 2026-05-21
 
-**Round-1 bootstrap.** The bit-exact CELT/SILK range decoder
-(RFC 6716 §4.1) is implemented and unit-tested. This is the leaf
-entropy-coding primitive that every CELT and SILK symbol passes
-through; the band-decode, PVQ, and MDCT paths will layer on top of
-it in later rounds.
+**Round-2.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1)
+now covers the full entropy-primitive surface needed by the SILK
+ICDF tables and the CELT band-decode bit allocator. The
+band-decode, PVQ, and MDCT paths will layer on top of these in
+later rounds.
 
 What is wired up today:
 
 * `RangeDecoder::new(buf)` — initialization per §4.1.1.
+* `decode_bin(ftb)` — power-of-two-`ft` decode (§4.1.3.1).
 * `dec_bit_logp(logp)` — binary symbol with probability `2^-logp` of
   a "1" (§4.1.3.2).
+* `dec_icdf(icdf, ftb)` — table-driven inverse-CDF symbol decode,
+  the primary SILK interface (§4.1.3.3).
 * `dec_bits(n)` — raw bits, packed LSB-first from the end of the
   frame (§4.1.4).
 * `dec_uint(ft)` — uniformly-distributed integer in `0..ft`,
   including the `ftb > 8` split-decode branch (§4.1.5).
 * `tell()` — whole-bit budget accounting (§4.1.6.1).
+* `tell_frac()` — 1/8th-bit-precision budget accounting (§4.1.6.2),
+  satisfying `tell() == ceil(tell_frac()/8)` everywhere.
 * Sticky `has_error()` for the corrupt-frame path documented in
   §4.1.5.
 
