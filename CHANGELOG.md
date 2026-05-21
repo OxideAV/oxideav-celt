@@ -6,6 +6,44 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-5 bit-allocation fields (2026-05-22):** the four §4.3.3
+  scalar fields that sit between the coarse-energy block and the
+  per-band shape vectors (Table 56 order: alloc.trim → skip →
+  intensity → dual). `decode_alloc_trim` walks the Table 58 PDF
+  `{2,2,5,10,22,46,22,10,5,2,2}/128` (icdf
+  `[126,124,119,109,87,41,19,9,4,2,0]`, ftb=7), `decode_skip_flag`
+  and `decode_dual_stereo` read `{1,1}/2` bits via `dec_bit_logp(1)`,
+  and `decode_intensity_band` decodes a uniform value in
+  `0..=coded_bands` via `dec_uint(coded_bands+1)`. Each field is
+  gated by a caller-supplied boolean recording whether the §4.3.3
+  reservation step fired; gated-off fields return `None` and do not
+  touch the range decoder, preserving `ec_tell_frac()` accounting
+  for the caller's outer budget walk. The `decode_band_allocation`
+  orchestrator composes all four in Table 56 order and returns a
+  `BandAllocation` with §4.3.3 defaults filled in (trim=5,
+  skip=false, intensity offset=0, dual=false) for every gated-off
+  field. 18 new unit tests cover: defaults match §4.3.3 prose; the
+  Table 58 PDF round-trips through the icdf form (sum = ft = 128,
+  per-cell mass exact, terminator-zero, monotonic descent); each
+  per-field decoder is a no-op when gated off and advances `tell()`
+  when gated on; intensity in-range across all 21 possible
+  `coded_bands` values; the orchestrator's all-off path yields
+  defaults with no decoder consumption; the all-on path advances
+  `tell()` and lands in §4.3.3 value ranges; mono-only gating
+  leaves intensity/dual at defaults; hybrid mode (`coded_bands=4`)
+  bounds intensity correctly; field-order matches Table 56 by
+  hand-decoding the same buffer step-by-step and comparing against
+  the orchestrator's result; ensemble of inputs exercises the
+  inner-cell trim values `{4, 5, 6}` (90/128 of the PDF mass).
+
+  The full §4.3.3 budget walk (`total_boost`, per-band cap[]
+  vector, anti-collapse / skip / intensity reservation arithmetic)
+  is NOT in this round; the caller computes the gating booleans
+  externally. The band-boost loop in particular depends on
+  `cache_caps50[]` which RFC 6716 §4.3.3 names as living in
+  libopus `static_modes_float.h` — that is a separate docs gap,
+  queued behind the Laplace / `e_prob_model` blocker.
+
 * **Round-4 coarse-energy scaffold (2026-05-21):** RFC 6716 §4.3.2.1
   scaffolding for the per-band coarse-energy decoder. Lands:
   `NUM_BANDS = 21` from Table 55; the intra-mode prediction

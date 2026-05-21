@@ -2,15 +2,17 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-05-21
+## Status — 2026-05-22
 
-**Round-4.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-5.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
-precede band-decode), and the §4.3.2.1 coarse-energy scaffolding
-(21-band layout + intra prediction filter) are now wired up. The
-Laplace decoder + `e_prob_model` table are docs-gap-blocked until a
-clean-room derivation lands. The band decode, PVQ, and MDCT paths
-still come later.
+precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
+layout + intra prediction filter), and the §4.3.3 bit-allocation
+scalar fields (alloc.trim, skip, intensity-band, dual-stereo) are now
+wired up. The Laplace decoder + `e_prob_model` table remain
+docs-gap-blocked; the band-boost loop (which depends on `cache_caps50[]`
+in libopus) is a second docs gap queued behind that one. The band
+decode, PVQ, and MDCT paths still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -66,6 +68,28 @@ Coarse-energy scaffold (RFC 6716 §4.3.2.1):
   bars). The gap'd path is asserted not to disturb the range
   decoder or the carried state so that future rounds compose
   cleanly.
+
+Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
+
+* `decode_alloc_trim(dec, gated)` decodes the trim parameter via
+  Table 58 PDF `{2,2,5,10,22,46,22,10,5,2,2}/128`; returns `Some(0..=10)`
+  when gated on, `None` when the §4.3.3 budget gate
+  `ec_tell_frac()+48 <= total - total_boost` was missed (caller
+  treats absent as the default `5`).
+* `decode_skip_flag(dec, gated)` decodes the §4.3.3 `{1,1}/2` skip
+  bit (`logp=1`); `None` when no skip reservation was made.
+* `decode_intensity_band(dec, gated, coded_bands)` decodes the
+  uniform intensity-band offset in `0..=coded_bands` via
+  `dec_uint(coded_bands+1)`; `None` for mono frames or when the
+  stereo intensity reservation didn't fit.
+* `decode_dual_stereo(dec, gated)` decodes the §4.3.3 `{1,1}/2`
+  dual-stereo flag; `None` when no dual reservation was made.
+* `decode_band_allocation(dec, gates)` orchestrates the four
+  fields in Table 56 order (trim → skip → intensity → dual),
+  returning a `BandAllocation` with §4.3.3 defaults filled in for
+  every gated-off field. The orchestrator does not touch the
+  range decoder for gated-off fields, so caller-side
+  `ec_tell_frac()` accounting stays accurate.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
