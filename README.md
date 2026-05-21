@@ -4,10 +4,13 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-05-21
 
-**Round-3.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1)
-plus the CELT frame-header prefix (RFC 6716 §4.3, the scalar
-fields that precede band-decode) are now wired up. The band
-decode, PVQ, energy envelope, and MDCT paths still come later.
+**Round-4.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
+precede band-decode), and the §4.3.2.1 coarse-energy scaffolding
+(21-band layout + intra prediction filter) are now wired up. The
+Laplace decoder + `e_prob_model` table are docs-gap-blocked until a
+clean-room derivation lands. The band decode, PVQ, and MDCT paths
+still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -41,6 +44,28 @@ CELT frame header (RFC 6716 §4.3 prefix + §4.3.5 anti-collapse):
   the band shape vectors in the bitstream.
 * `CeltFrameHeader::post_filter_gain_q15()` rebuilds the §4.3.7.1
   gain `G = 3*(gain+1)/32` in Q15 fixed-point.
+
+Coarse-energy scaffold (RFC 6716 §4.3.2.1):
+
+* `NUM_BANDS = 21` (RFC Table 55). Pure CELT codes all 21 bands;
+  Hybrid mode codes only bands 17..=20 (the SILK layer covers
+  0..=16 below 8 kHz).
+* `INTRA_ALPHA_Q15 = 0`, `INTRA_BETA_Q15 = 4915` (the literal Q15
+  coefficients RFC line 6063 supplies for intra-mode prediction;
+  `4915 / 32768 ≈ 0.1500`).
+* `CoarseEnergyState::new()` holds the previous frame's per-band
+  Q8 log-energies, zero on stream open and after any decoder reset.
+* `apply_intra_prediction(errors_q8, out_q8)` runs the §4.3.2.1
+  prediction filter in its intra reduction — the β-IIR over bands
+  with the temporal arm vanishing.
+* `decode_coarse_energy(dec, state, intra, lm)` is the locked-in
+  public entry point; it currently returns `Error::NotImplemented`
+  because the `e_prob_model` table and the `ec_laplace_decode`
+  algorithm are docs-gap-blocked (the RFC names libopus source as
+  their normative location, which the workspace clean-room policy
+  bars). The gap'd path is asserted not to disturb the range
+  decoder or the carried state so that future rounds compose
+  cleanly.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.

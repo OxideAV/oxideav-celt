@@ -6,6 +6,39 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-4 coarse-energy scaffold (2026-05-21):** RFC 6716 §4.3.2.1
+  scaffolding for the per-band coarse-energy decoder. Lands:
+  `NUM_BANDS = 21` from Table 55; the intra-mode prediction
+  coefficients `INTRA_ALPHA_Q15 = 0` and `INTRA_BETA_Q15 = 4915`
+  (the only numeric coefficients §4.3.2.1 supplies directly, RFC
+  line 6063); a `CoarseEnergyState` carrier struct holding the
+  previous frame's per-band Q8 log-energies (zeroed on reset, the
+  state for next-frame inter prediction); the post-Laplace-decode
+  arithmetic `apply_intra_prediction` that runs the §4.3.2.1 2-D
+  prediction filter in its intra reduction (β-IIR over bands with
+  the time arm vanishing); and a public `decode_coarse_energy`
+  entry-point whose signature is locked in for future rounds but
+  currently returns `Error::NotImplemented`. 7 new unit tests pin
+  band-count, intra prediction coefficients, fresh-state shape,
+  the trivial all-zero reconstruction, the single-impulse β-decay
+  cascade, an additive two-band hand-computed reconstruction, the
+  gap'd `decode_coarse_energy` non-disturbance of the range decoder,
+  and the IIR's steady-state stability bound under a constant input.
+
+  **DOCS GAP filed.** RFC 6716 §4.3.2.1 normatively delegates the
+  `e_prob_model` per-band Laplace probability table and the
+  `ec_laplace_decode` algorithm to libopus source files
+  (`quant_bands.c`, `laplace.c`) which the workspace clean-room
+  policy bars us from reading. Without either piece, this round
+  cannot land a bit-exact coarse-energy decoder; the scaffold's
+  `decode_coarse_energy` therefore returns `NotImplemented` and the
+  module docstring documents the closure requirements (a clean-room
+  derivation of the table + a prose specification of the Laplace
+  decoder algorithm). The decoder's `tell()` and the state's
+  `prev_q8` are asserted untouched on the gap'd path so that future
+  rounds can drop the Laplace decoder in without altering the
+  state shape or call site.
+
 * **Round-3 frame header (2026-05-21):** the always-present prefix of
   the CELT frame header (RFC 6716 §4.3, Table 56) — silence flag
   (`{32767,1}/32768`), post-filter flag (`{1,1}/2`) and its four
