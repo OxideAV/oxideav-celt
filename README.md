@@ -4,13 +4,12 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-05-21
 
-**Round-2.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1)
-now covers the full entropy-primitive surface needed by the SILK
-ICDF tables and the CELT band-decode bit allocator. The
-band-decode, PVQ, and MDCT paths will layer on top of these in
-later rounds.
+**Round-3.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1)
+plus the CELT frame-header prefix (RFC 6716 §4.3, the scalar
+fields that precede band-decode) are now wired up. The band
+decode, PVQ, energy envelope, and MDCT paths still come later.
 
-What is wired up today:
+Range decoder (RFC 6716 §4.1):
 
 * `RangeDecoder::new(buf)` — initialization per §4.1.1.
 * `decode_bin(ftb)` — power-of-two-`ft` decode (§4.1.3.1).
@@ -27,6 +26,21 @@ What is wired up today:
   satisfying `tell() == ceil(tell_frac()/8)` everywhere.
 * Sticky `has_error()` for the corrupt-frame path documented in
   §4.1.5.
+
+CELT frame header (RFC 6716 §4.3 prefix + §4.3.5 anti-collapse):
+
+* `CeltFrameHeader::decode_prefix(dec)` walks Table 56 in order
+  through silence (§4.3 / `{32767,1}/32768`), the post-filter flag
+  and its four parameters (§4.3.7.1: `octave` uniform 0..6,
+  `period` = `4+octave` raw bits, `gain` 3 raw bits, `tapset`
+  `{2,1,1}/4`), the transient flag (§4.3.1, `{7,1}/8`), and the
+  intra flag (§4.3.2.1, `{7,1}/8`).
+* `decode_anti_collapse_flag(dec, transient)` reads the §4.3.5
+  `{1,1}/2` bit on transient frames and is a no-op otherwise. This
+  is exposed separately because §4.3.5 places anti-collapse AFTER
+  the band shape vectors in the bitstream.
+* `CeltFrameHeader::post_filter_gain_q15()` rebuilds the §4.3.7.1
+  gain `G = 3*(gain+1)/32` in Q15 fixed-point.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.

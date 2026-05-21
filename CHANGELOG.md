@@ -6,6 +6,27 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-3 frame header (2026-05-21):** the always-present prefix of
+  the CELT frame header (RFC 6716 §4.3, Table 56) — silence flag
+  (`{32767,1}/32768`), post-filter flag (`{1,1}/2`) and its four
+  §4.3.7.1 parameters (`octave` uniform(6), `period` = `4+octave`
+  raw bits, `gain` = 3 raw bits, `tapset` `{2,1,1}/4`), transient
+  flag (`{7,1}/8`), and intra flag (`{7,1}/8`). The §4.3.5
+  anti-collapse bit is exposed via `decode_anti_collapse_flag`
+  because Table 56 places it after the band shape vectors, not in
+  the prefix. New public types `CeltFrameHeader`, `PostFilter` and
+  the helper `CeltFrameHeader::post_filter_gain_q15()` for the
+  §4.3.7.1 gain reconstruction. 8 new unit tests cover: all-zero
+  buffer biases every flag off, all-ones buffer biases every flag
+  on, `decode_prefix` advances `tell()`, the post-filter
+  gain-Q15 formula across all 8 raw indices including the spec's
+  `gain=7 ⇒ G=0.75` corner, the §4.3.7.1 period-bound endpoints
+  (`(16<<0)-1 = 15` and `(16<<5)+511-1 = 1022`),
+  `decode_anti_collapse_flag` is a no-op when transient is unset,
+  it advances `tell()` when transient is set, and a smoke test
+  stitches the prefix walk and the deferred anti-collapse bit
+  together end-to-end.
+
 * **Round-2 entropy primitives (2026-05-21):** three additional
   range-decoder methods to round out the §4.1 surface:
   `decode_bin(ftb)` (§4.1.3.1, the division-free power-of-two `ft`
