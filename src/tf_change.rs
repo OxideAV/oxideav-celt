@@ -49,10 +49,8 @@
 //!
 //! Every PDF, every adjustment value, every prose paragraph below is
 //! transcribed from RFC 6716 §4.3.1 and §4.3.4.5 + Tables 60–63
-//! (`docs/audio/opus/rfc6716-opus.txt`). No external library source —
-//! the libopus `celt.c` `tf_select_table[][]` definition the RFC
-//! itself names, the encoder's `tf_analysis` routine, or any other
-//! reference — was consulted.
+//! (`docs/audio/opus/rfc6716-opus.txt`). No external implementation
+//! was consulted.
 
 use crate::range_decoder::RangeDecoder;
 
