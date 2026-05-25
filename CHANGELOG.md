@@ -6,6 +6,53 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-6 time-frequency change parameters (2026-05-25):** the
+  §4.3.4.5 + §4.3.1 TF group. `decode_tf_changes(dec, start, end,
+  is_transient)` reads one bit per coded band; first band uses
+  PDF `{3,1}/4` (transient) or `{15,1}/16` (non-transient),
+  subsequent bands use PDF `{15,1}/16` (transient) or `{31,1}/32`
+  (non-transient). The rare "1" symbol toggles the running TF
+  choice per the §4.3.4.5 differential encoding. `decode_tf_select`
+  decodes the global `tf_select` flag (`{1,1}/2`) only when at
+  least one band's tf_change would yield a different TF adjustment
+  under `tf_select=0` vs `tf_select=1`; the §4.3.4.5 "no impact"
+  gate is exposed standalone as `tf_select_matters` for caller
+  inspection. `tf_adjustment` indexes the four published TF tables
+  (60–63) in one function: `[i8;2]×4` rows per table, indexed by
+  `LM ∈ {0,1,2,3}` (= 2.5/5/10/20 ms) and `tf_change ∈ {0,1}`.
+  The four tables are exposed as `pub const`s
+  (`TABLE_60_NON_TRANSIENT_SEL0`, `TABLE_61_NON_TRANSIENT_SEL1`,
+  `TABLE_62_TRANSIENT_SEL0`, `TABLE_63_TRANSIENT_SEL1`).
+  `decode_tf_parameters` orchestrates the whole §4.3.4.5 walk in
+  Table 56 order and returns a `TfParameters { tf_changes,
+  tf_select, tf_select_decoded }`. 19 new unit tests cover:
+  every published TF table matches the RFC entry-for-entry; the
+  non-transient `tf_change=0` column is all-zero (no-change ⇒ no
+  adjustment); non-transient adjustments are all `<= 0`;
+  `tf_adjustment` dispatch picks the right table per
+  `(is_transient, tf_select)`; oversized `lm` saturates to 3
+  rather than panicking; any non-zero `tf_select` is coerced to
+  `select=1`; `TfParameters::zeros` has the right shape; empty
+  band range is a no-op; full 21-band CELT range advances `tell()`
+  and returns 21 entries; hybrid 17..21 range returns 4 entries;
+  the low-byte (`val=127`) §4.1.1 init biases every per-band
+  decode to "0"; the high-byte (`val=0`) init flips the first
+  band's tf_change `true`; the `tf_select` gate is correctly
+  satisfied / unsatisfied on the documented LM corner cases;
+  `decode_tf_select` empty-`tf_changes` is a no-op; the
+  full-pipeline `decode_tf_parameters` keeps `tf_select_decoded`
+  in sync with the gate predicate across a (seed × transient × LM)
+  product matrix; orchestrator agrees with a hand-stitched
+  `decode_tf_changes` + `decode_tf_select` call on the same
+  buffer; `decode_tf_parameters(start=end)` does not touch the
+  range decoder; per-band `tf_adjustment` round-trips through every
+  published table entry.
+
+  This is decoder-side only. §4.3.4.1 transient detection is
+  encoder-side; the Hadamard transform that implements the TF
+  resolution change in the actual shape decode path is band-decode
+  work for a later round. No Laplace decoding required.
+
 * **Round-5 bit-allocation fields (2026-05-22):** the four §4.3.3
   scalar fields that sit between the coarse-energy block and the
   per-band shape vectors (Table 56 order: alloc.trim → skip →

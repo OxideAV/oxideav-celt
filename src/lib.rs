@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-05-22):** round-5. The bit-exact CELT/SILK range
+//! **Status (2026-05-25):** round-6. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -12,8 +12,11 @@
 //! a clean-room derivation lands. The §4.3.3 bit-allocation field
 //! decoders (alloc.trim, skip, intensity-band, dual-stereo) are
 //! exposed standalone, gated on caller-supplied reservation
-//! booleans. The band-boost loop, full budget walk, band decode,
-//! PVQ, and MDCT machinery still come later.
+//! booleans. The §4.3.4.5 time-frequency change parameters
+//! (per-band `tf_change` + the gated global `tf_select` + the four
+//! TF-adjustment tables 60–63) are wired up. The band-boost loop,
+//! full budget walk, band decode, PVQ, and MDCT machinery still
+//! come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -34,6 +37,7 @@ pub mod bit_allocation;
 pub mod coarse_energy;
 pub mod frame_header;
 pub mod range_decoder;
+pub mod tf_change;
 
 pub use bit_allocation::{
     decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,
@@ -45,6 +49,11 @@ pub use coarse_energy::{
 };
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
 pub use range_decoder::RangeDecoder;
+pub use tf_change::{
+    decode_tf_changes, decode_tf_parameters, decode_tf_select, tf_adjustment, tf_select_matters,
+    TfParameters, LM_VALUES, TABLE_60_NON_TRANSIENT_SEL0, TABLE_61_NON_TRANSIENT_SEL1,
+    TABLE_62_TRANSIENT_SEL0, TABLE_63_TRANSIENT_SEL1, TF_CHANGE_VALUES,
+};
 
 /// Crate-local error type. The encoder, frame-level decoder, and
 /// higher-level codec entry points are not yet wired up; calling them

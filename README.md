@@ -2,17 +2,19 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-05-22
+## Status — 2026-05-25
 
-**Round-5.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-6.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
-layout + intra prediction filter), and the §4.3.3 bit-allocation
-scalar fields (alloc.trim, skip, intensity-band, dual-stereo) are now
-wired up. The Laplace decoder + `e_prob_model` table remain
-docs-gap-blocked; the band-boost loop (which depends on `cache_caps50[]`
-in libopus) is a second docs gap queued behind that one. The band
-decode, PVQ, and MDCT paths still come later.
+layout + intra prediction filter), the §4.3.3 bit-allocation scalar
+fields (alloc.trim, skip, intensity-band, dual-stereo), and the
+§4.3.4.5 time-frequency change parameters (per-band `tf_change` +
+the gated global `tf_select` + the four tabulated TF-adjustment
+tables 60–63) are now wired up. The Laplace decoder + `e_prob_model`
+table remain docs-gap-blocked; the band-boost loop (which depends on
+`cache_caps50[]` in libopus) is a second docs gap queued behind that
+one. The band decode, PVQ, and MDCT paths still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -90,6 +92,35 @@ Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
   every gated-off field. The orchestrator does not touch the
   range decoder for gated-off fields, so caller-side
   `ec_tell_frac()` accounting stays accurate.
+
+Time-frequency change parameters (RFC 6716 §4.3.4.5 + §4.3.1):
+
+* `decode_tf_changes(dec, start, end, is_transient)` reads one bit
+  per coded band, with PDF `{3,1}/4` (transient) or `{15,1}/16`
+  (non-transient) on the first band and `{15,1}/16` (transient) or
+  `{31,1}/32` (non-transient) on subsequent bands. The rare "1"
+  symbol toggles the running TF choice per the §4.3.4.5 differential
+  encoding.
+* `decode_tf_select(dec, is_transient, lm, tf_changes)` decodes the
+  global `tf_select` flag with PDF `{1,1}/2`, but only when at least
+  one decoded `tf_change` would produce a different TF adjustment
+  under tf_select=0 vs tf_select=1. Returns `(0, false)` when the
+  bit was gated off; the range decoder is untouched in that case.
+* `tf_select_matters(is_transient, lm, tf_changes)` is the pure
+  predicate the §4.3.4.5 prose calls "can it have an impact on the
+  result".
+* `tf_adjustment(is_transient, tf_select, lm, tf_change)` indexes
+  the four published Tables 60–63 in one function. Returns a signed
+  i8 per band (negative ⇒ +temporal resolution, positive ⇒
+  +frequency resolution, both via Hadamard levels per §4.3.4.5).
+* `decode_tf_parameters(dec, start, end, is_transient, lm)`
+  orchestrates the full §4.3.4.5 walk in Table 56 order and returns
+  a `TfParameters { tf_changes, tf_select, tf_select_decoded }`.
+* The four tables themselves are exposed as `pub const`s
+  (`TABLE_60_NON_TRANSIENT_SEL0`, `TABLE_61_NON_TRANSIENT_SEL1`,
+  `TABLE_62_TRANSIENT_SEL0`, `TABLE_63_TRANSIENT_SEL1`),
+  `[i8; 2] × 4` rows indexed by LM ∈ `{0,1,2,3}`
+  (= 2.5 / 5 / 10 / 20 ms) and `tf_change` ∈ `{0, 1}`.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
