@@ -35,6 +35,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod bit_allocation;
 pub mod coarse_energy;
+pub mod fine_energy;
 pub mod frame_header;
 pub mod range_decoder;
 pub mod tf_change;
@@ -46,6 +47,10 @@ pub use bit_allocation::{
 pub use coarse_energy::{
     apply_intra_prediction, decode_coarse_energy, CoarseEnergyState, INTRA_ALPHA_Q15,
     INTRA_BETA_Q15, NUM_BANDS,
+};
+pub use fine_energy::{
+    decode_fine_energy, decode_fine_energy_band, finalize_extra_bits, fine_correction_q14,
+    fine_correction_qn, FinalizePriority, FinalizeResult, MAX_FINE_BITS,
 };
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
 pub use range_decoder::RangeDecoder;

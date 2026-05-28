@@ -2,12 +2,13 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-05-25
+## Status — 2026-05-29
 
-**Round-6.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-7.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
-layout + intra prediction filter), the §4.3.3 bit-allocation scalar
+layout + intra prediction filter), the §4.3.2.2 fine-energy
+refinement decoder + finalize step, the §4.3.3 bit-allocation scalar
 fields (alloc.trim, skip, intensity-band, dual-stereo), and the
 §4.3.4.5 time-frequency change parameters (per-band `tf_change` +
 the gated global `tf_select` + the four tabulated TF-adjustment
@@ -92,6 +93,32 @@ Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
   every gated-off field. The orchestrator does not touch the
   range decoder for gated-off fields, so caller-side
   `ec_tell_frac()` accounting stays accurate.
+
+Fine-energy refinement (RFC 6716 §4.3.2.2):
+
+* `decode_fine_energy_band(dec, b_bits)` reads exactly `b_bits` raw
+  bits via `dec_bits` (§4.1.4) to form `f ∈ [0, 2^b_bits)`, and
+  returns the closed-form Q14 correction
+  `(2f+1) * 2^(13-b_bits) - 2^13`. `b_bits = 0` is a no-op (bands
+  the allocator could not buy fine bits for stay at the coarse
+  value); the function does not consume raw bits in that case.
+* `decode_fine_energy(dec, bits_per_band)` walks all 21 bands and
+  returns per-band Q14 corrections in one call. Total bits consumed
+  equals `sum(bits_per_band)`.
+* `fine_correction_q14(f, b_bits)` / `fine_correction_qn(f, b_bits, n)`
+  expose the closed-form §4.3.2.2 correction at arbitrary fixed-point
+  scales (Q14 specialised path + rounding Qn variant) for encoders
+  and test scaffolding.
+* `finalize_extra_bits(dec, priorities, coded_bands, channels, budget)`
+  walks the §4.3.2.2 finalize step: leftover raw bits are spent ≤ 1
+  per band per channel in `(priority 0 ascending, priority 1
+  ascending)` order. Returns per-band Q14 corrections summed across
+  channels plus `(bits_consumed, bits_unused)`. Excess budget is left
+  unused per the spec ("If any bits are left after this, they are
+  left unused").
+* `MAX_FINE_BITS = 8` caps the per-band fine-bit count (the §4.3.3
+  allocator never exceeds this in practice; the Q14 closed-form is
+  exact for `b_bits <= 13`).
 
 Time-frequency change parameters (RFC 6716 §4.3.4.5 + §4.3.1):
 

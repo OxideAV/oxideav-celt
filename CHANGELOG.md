@@ -6,6 +6,50 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-7 fine-energy refinement (2026-05-29):** RFC 6716 §4.3.2.2
+  decoder for the second of CELT's three-step coarse-fine-fine
+  energy-envelope strategy. The fine step is purely a raw-bit channel
+  (no Laplace decoder, no `e_prob_model` table) so it is implementable
+  without consulting the libopus source files that the §4.3.2.1 prose
+  delegates to. `decode_fine_energy_band(dec, b_bits)` reads exactly
+  `b_bits` raw bits, forms `f ∈ [0, 2^b_bits)`, and returns the
+  closed-form Q14 correction `(2f+1) * 2^(13-b_bits) - 2^13`
+  (derivation from the spec's `(f+1/2)/2^B - 1/2`).
+  `decode_fine_energy(dec, &[u32; 21])` walks the full envelope.
+  `fine_correction_q14` / `fine_correction_qn` expose the closed-form
+  arithmetic standalone for encoders and test scaffolding (the Qn
+  variant uses round-half-up arithmetic so callers at low precision
+  get the nearest-representable answer rather than truncation).
+  `finalize_extra_bits(dec, priorities, coded_bands, channels, budget)`
+  walks the §4.3.2.2 finalize step: leftover raw bits are spent ≤ 1
+  per band per channel in `(priority 0 ascending, priority 1
+  ascending)` order, returning per-band Q14 corrections summed across
+  channels plus `(bits_consumed, bits_unused)`. Excess budget is left
+  unused per the spec. `MAX_FINE_BITS = 8` caps per-band fine bits.
+  20 new unit tests cover: `b_bits=0` is a no-op on the decoder; the
+  Q14 closed form matches the spec's decimal formula bit-for-bit at
+  every `(f, B)` for B ∈ [1, 8]; correction range is `[-8192, +8191]`
+  for every legal pair; symmetric `(half-1, half)` around zero;
+  endpoint extrema at `f=0` and `f=max`; Q14 vs Qn agreement at
+  n=14; Q8 / Q14 / 64 round-trip with documented one-step boundary at
+  B=8; `decode_fine_energy_band` consumes exactly `b_bits` raw bits;
+  full-envelope total matches `sum(bits_per_band)`; all-zero `B_i`
+  envelope is a complete no-op; finalize's zero-budget / zero-coded-
+  bands no-ops; finalize surplus-left-unused mono and stereo (Q14
+  corrections summed across channels); finalize priority-0 drains
+  fully before priority-1 starts; priority-1 walks ascending after
+  priority-0; finalize's `bits_consumed` matches the `tell()` delta
+  exactly; budget-tight at exactly the priority-0 capacity leaves
+  priority-1 untouched; spot-check Q14 corrections against
+  hand-computed decimal values; smoke stitches `decode_fine_energy`
+  and `finalize_extra_bits` on the same decoder.
+
+  This is decoder-side only. The §4.3.3 bit allocator that produces
+  the per-band `B_i` vector and the `(priorities, leftover_budget)`
+  inputs is gated separately on the `cache_caps50[]` DOCS-GAP; the
+  fine-energy API here is parameterised on caller-supplied
+  allocations so it composes cleanly once the gap closes.
+
 * **Round-6 time-frequency change parameters (2026-05-25):** the
   §4.3.4.5 + §4.3.1 TF group. `decode_tf_changes(dec, start, end,
   is_transient)` reads one bit per coded band; first band uses
