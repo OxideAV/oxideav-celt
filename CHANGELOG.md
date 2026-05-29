@@ -4,6 +4,21 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/OxideAV/oxideav-celt/compare/v0.1.5...v0.1.6) - 2026-05-29
+
+### Other
+
+- round-8 §4.3.4.3 spreading parameter + Table 56 / Table 59 (RFC 6716)
+- round-7 §4.3.2.2 fine-energy refinement + finalize step (RFC 6716)
+- scrub external-name disclaimer (clean-room hygiene)
+- round-6 §4.3.4.5 time-frequency change: per-band tf_change + gated tf_select + Tables 60–63 (RFC 6716)
+- round-5 §4.3.3 bit-allocation fields: alloc.trim / skip / intensity / dual (RFC 6716)
+- round-4 coarse-energy scaffold: 21-band layout + intra prediction filter + DOCS GAP (RFC 6716 §4.3.2.1)
+- round-3 frame header: silence/post-filter/transient/intra prefix + deferred anti-collapse (RFC 6716 §4.3, §4.3.5, §4.3.7.1)
+- round-2 entropy primitives: ec_decode_bin / ec_dec_icdf / ec_tell_frac (RFC 6716 §4.1.3.1, §4.1.3.3, §4.1.6.2)
+- round-1 bootstrap: bit-exact CELT/SILK range decoder (RFC 6716 §4.1)
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ### Added
 
 * **Round-8 spreading parameter (2026-05-29):** RFC 6716 §4.3.4.3
