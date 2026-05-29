@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-05-29
+## Status — 2026-05-30
 
-**Round-8.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-9.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -12,9 +12,12 @@ refinement decoder + finalize step, the §4.3.3 bit-allocation scalar
 fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.4.5
 time-frequency change parameters (per-band `tf_change` + the gated
 global `tf_select` + the four tabulated TF-adjustment tables 60–63),
-and the §4.3.4.3 spreading parameter (PDF `{7, 2, 21, 2}/32` +
-Table 59 `f_r` lookup + closed-form rotation-gain helpers) are now
-wired up. The Laplace decoder + `e_prob_model` table remain
+the §4.3.4.3 spreading parameter (PDF `{7, 2, 21, 2}/32` + Table 59
+`f_r` lookup + closed-form rotation-gain helpers), the §4.3.7.1
+post-filter (three tap shapes in f32 + Q15 + gain reconstruction +
+per-sample / slice filter response), and the §4.3.7.2 single-pole
+de-emphasis filter (`α_p = 0.8500061035`, in both f32 and Q15) are
+now wired up. The Laplace decoder + `e_prob_model` table remain
 docs-gap-blocked; the band-boost loop (which depends on a
 `cache_caps50[]` numeric table the RFC delegates to a source file
 outside the workspace clean-room allow-list) is a second docs gap
@@ -179,6 +182,46 @@ Spreading parameter (RFC 6716 §4.3.4.3 + Table 56 + Table 59):
   or empty band).
 * `DEFAULT_SPREAD = Spread::Normal` is the bulk-probability fallback
   for callers that skip the CELT side of the bitstream entirely.
+
+Post-filter (RFC 6716 §4.3.7.1):
+
+* `POST_FILTER_TAPS_F32` / `POST_FILTER_TAPS_Q15` — the three §4.3.7.1
+  tap shapes in both f32 and Q15 fixed-point. Each row is
+  `[g0, g1, g2]`; the §4.3.7.1 response weights `g1` / `g2` apply to
+  the symmetric pair `y(n - T ± k)`, so the total lobe contribution
+  is `g0 + 2*g1 + 2*g2 ≈ 1.0` for every tapset.
+* `tap_coefficients_f32(tapset)` / `tap_coefficients_q15(tapset)` —
+  thin lookup wrappers returning the three taps as a tuple; out-of-
+  range tapsets saturate defensively to the last valid entry.
+* `gain_f32(gain_index)` / `gain_q15(gain_index)` — reconstruct the
+  post-filter gain `G = 3*(gain+1)/32` from the 3-bit raw index.
+  Q15 is exact (`3*(gain+1)*1024`); the f32 form covers
+  `0.09375..=0.75`.
+* `filter_sample_f32(x, history, period, gain, tapset)` — single-
+  sample evaluation of the §4.3.7.1 recursion
+  `y(n) = x + G * (g0*y(n-T) + g1*(y(n-T+1)+y(n-T-1)) + g2*(y(n-T+2)+y(n-T-2)))`.
+  Past samples that lie before `history` are treated as zero (the
+  startup-condition reading); the pitch period is silently clamped
+  to the §4.3.7.1 minimum 15.
+* `apply_post_filter_f32(out, prev_output, period, gain_index, tapset)`
+  — in-place slice variant. `prev_output` carries the most-recent
+  filtered samples across frame boundaries.
+* `POST_FILTER_PERIOD_MIN = 15`, `POST_FILTER_PERIOD_MAX = 1022`
+  pin the §4.3.7.1 "bounded between 15 and 1022, inclusively"
+  prose.
+
+De-emphasis (RFC 6716 §4.3.7.2):
+
+* `ALPHA_P_F32 = 0.8500061035` (the spec coefficient) and the Q15
+  form `ALPHA_P_Q15 = 27853 = round(α_p · 32768)`.
+* `Deemphasis { last_y }` — single-pole IIR state carrying the
+  `y(n-1)` sample across calls so the filter runs continuously
+  through frame boundaries.
+* `Deemphasis::step(x)` per-sample evaluation; `apply_in_place`
+  / `apply` for slice processing; `reset()` for a §4.5.2 decoder
+  reset.
+* `deemphasize_in_place_f32(out, y_prev) -> y_prev_next` —
+  one-shot convenience wrapper.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.

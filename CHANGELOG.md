@@ -21,6 +21,69 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-9 post-filter + de-emphasis (2026-05-30):** RFC 6716
+  §4.3.7.1 + §4.3.7.2, the last two pipeline stages between the
+  inverse MDCT and the final PCM output. The post-filter contributes
+  the three §4.3.7.1 tap shapes in both f32 (`POST_FILTER_TAPS_F32`)
+  and Q15 fixed-point (`POST_FILTER_TAPS_Q15`); the gain
+  reconstruction `G = 3*(gain+1)/32` in f32 (`gain_f32`) and exact
+  Q15 (`gain_q15= 3*(gain+1)*1024`); a per-sample evaluator
+  `filter_sample_f32(x, history, period, gain, tapset)` of the
+  §4.3.7.1 recursion
+  `y(n) = x + G*(g0*y(n-T) + g1*(y(n-T+1)+y(n-T-1)) + g2*(y(n-T+2)+y(n-T-2)))`;
+  and an in-place slice variant `apply_post_filter_f32(out,
+  prev_output, period, gain_index, tapset)` that carries the
+  previous-frame's filtered tail through `prev_output` so the
+  recursive part stays continuous across frame boundaries.
+  Defensive corners: out-of-range tapsets clamp to the last valid
+  entry; pitch periods below 15 clamp to `POST_FILTER_PERIOD_MIN`;
+  past samples that lie before `history` are treated as zero, so
+  the startup transient degrades to passthrough rather than reading
+  out of bounds. 19 new unit tests pin: each of the three tap rows
+  matches the RFC's decimal listing to f32 precision; the Q15 rows
+  match `round(f32 * 32768)` exactly (with a documented ±1 ULP
+  discrepancy on one entry due to the RFC's truncation of the
+  underlying ratio); `g0 + 2*g1 + 2*g2 ≈ 1.0` (the unity-gain-at-
+  pitch property each tapset relies on); tapset and Q15 lookup
+  saturation; `gain_f32` matches `3*(gain+1)/32` across every legal
+  raw index plus the corner cases `gain=0 ⇒ 0.09375` and `gain=7 ⇒
+  0.75`; `gain_q15` matches `round(gain_f32 * 32768)` exactly with
+  hand-checked corners; the per-sample evaluator returns `x`
+  unchanged at `G=0` (the gain-transition crossfade corner); empty
+  history degrades to passthrough; single-impulse history at the
+  centre tap position contributes exactly `G * g0`; symmetric
+  impulse pairs at `T±1` and `T±2` pick up the `2*G*g1` and `2*G*g2`
+  lobe contributions; zero history with non-zero input is
+  passthrough for every tapset and gain; the slice variant's
+  startup-passthrough is held for `n < T-2`; the period bounds
+  match the §4.3.7.1 "between 15 and 1022 inclusive" prose; the
+  period clamp produces identical output for `period=0` and
+  `period=15`. The de-emphasis filter contributes a single-pole IIR
+  state struct `Deemphasis { last_y }` carrying `y(n-1)` across
+  calls; `step` / `apply_in_place` / `apply` / `reset` methods; a
+  one-shot convenience wrapper `deemphasize_in_place_f32`; the spec
+  coefficient `ALPHA_P_F32 = 0.8500061035` and its Q15 form
+  `ALPHA_P_Q15 = 27853`. 14 new unit tests pin: the f32 / Q15
+  coefficients match the RFC decimal; default state is zero; an
+  impulse produces the expected geometric decay
+  `y(n) = α_p^n`; zero input + zero state stays zero; a DC input
+  converges to the steady-state `1/(1-α_p) ≈ 6.667`; running the
+  filter on two halves with state-carry matches running it on the
+  joined buffer one-shot (the cross-frame continuity invariant);
+  `step` and `apply_in_place` produce identical results on the same
+  input; `apply` writes only to the destination slice; length
+  mismatch panics; reset zeroes the state; the convenience wrapper
+  matches the stateful filter; the response stays finite under
+  bounded input.
+
+  No external library source consulted. The §4.3.7.1 prose gives
+  the full mathematical recursion and the three tap shapes as
+  explicit decimals; §4.3.7.2 prints the single-pole IIR in
+  algebraic form and `alpha_p` as a decimal. Both stages therefore
+  close against the RFC text alone; the source files the RFC
+  normatively delegates to sit outside the workspace clean-room
+  allow-list and were not consulted.
+
 * **Round-8 spreading parameter (2026-05-29):** RFC 6716 §4.3.4.3
   decoder for the `spread` scalar that sits between the global
   `tf_select` flag and the §4.3.3 dynamic-allocation phase in

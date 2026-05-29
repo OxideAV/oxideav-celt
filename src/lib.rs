@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-05-29):** round-8. The bit-exact CELT/SILK range
+//! **Status (2026-05-30):** round-9. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -17,9 +17,12 @@
 //! (per-band `tf_change` + the gated global `tf_select` + the four
 //! TF-adjustment tables 60–63) are wired up. The §4.3.4.3 spreading
 //! parameter (PDF `{7, 2, 21, 2}/32`) + Table 59 `f_r` lookup +
-//! closed-form rotation-gain helpers are now wired up. The band-boost
-//! loop, full budget walk, band decode, PVQ, and MDCT machinery
-//! still come later.
+//! closed-form rotation-gain helpers are wired up. The §4.3.7.1
+//! post-filter tap shapes (three §4.3.7.1 tapsets in f32 + Q15) +
+//! gain reconstruction + per-sample / slice filter response and the
+//! §4.3.7.2 single-pole de-emphasis filter (`α_p = 0.8500061035`)
+//! are now wired up. The band-boost loop, full budget walk, band
+//! decode, PVQ, and MDCT machinery still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -39,8 +42,10 @@ use oxideav_core::RuntimeContext;
 
 pub mod bit_allocation;
 pub mod coarse_energy;
+pub mod deemphasis;
 pub mod fine_energy;
 pub mod frame_header;
+pub mod post_filter;
 pub mod range_decoder;
 pub mod spread;
 pub mod tf_change;
@@ -53,11 +58,17 @@ pub use coarse_energy::{
     apply_intra_prediction, decode_coarse_energy, CoarseEnergyState, INTRA_ALPHA_Q15,
     INTRA_BETA_Q15, NUM_BANDS,
 };
+pub use deemphasis::{deemphasize_in_place_f32, Deemphasis, ALPHA_P_F32, ALPHA_P_Q15};
 pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, finalize_extra_bits, fine_correction_q14,
     fine_correction_qn, FinalizePriority, FinalizeResult, MAX_FINE_BITS,
 };
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
+pub use post_filter::{
+    apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,
+    tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN,
+    POST_FILTER_TAPS_F32, POST_FILTER_TAPS_Q15, TAPS_PER_SET,
+};
 pub use range_decoder::RangeDecoder;
 pub use spread::{
     decode_spread, pre_rotation_stride, rotation_gain_ratio, rotation_gain_squared_ratio, Spread,
