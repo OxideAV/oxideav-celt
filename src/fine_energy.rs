@@ -76,10 +76,10 @@
 //!
 //! Every formula, every bit-count limit, every walk order in this
 //! module is transcribed from RFC 6716 §4.3.2.2 in
-//! `docs/audio/opus/rfc6716-opus.txt`. The libopus source file the
-//! RFC names (`celt/quant_bands.c`, functions `quant_fine_energy` /
-//! `unquant_energy_finalise`) was NOT consulted; the workspace
-//! clean-room policy bars it.
+//! `docs/audio/opus/rfc6716-opus.txt`. Source files the RFC delegates
+//! to for the encoder-side fine-energy quantisation routines sit
+//! outside the workspace's clean-room allow-list and were not
+//! consulted.
 
 use crate::coarse_energy::NUM_BANDS;
 use crate::range_decoder::RangeDecoder;

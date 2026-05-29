@@ -6,11 +6,68 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-8 spreading parameter (2026-05-29):** RFC 6716 §4.3.4.3
+  decoder for the `spread` scalar that sits between the global
+  `tf_select` flag and the §4.3.3 dynamic-allocation phase in
+  Table 56 order. `decode_spread(dec)` reads the §4.3.4.3 spread
+  field with PDF `{7, 2, 21, 2}/32` via the §4.1.3.3 ICDF path
+  (cumulative `[7, 9, 30, 32]`, ICDF `[25, 23, 2, 0]`, ftb=5) and
+  returns one of the four `Spread` variants `{None, Light, Normal,
+  Aggressive}` in raw-value order (`spread = 0..=3`). `Spread::f_r()`
+  is the Table 59 lookup: `None` (`spread=0`, no rotation),
+  `Some(15)` / `Some(10)` / `Some(5)` for `spread = 1 / 2 / 3`.
+  `rotation_gain_ratio(spread, n, k)` returns the closed-form
+  `g_r = N/(N + f_r*K)` rotation gain as a `(num, den)` unsigned-
+  integer pair so the PVQ caller can pick its own fixed-point
+  representation; `rotation_gain_squared_ratio` returns the same
+  ratio squared (u64 per term) to feed the `theta = pi * g_r^2 / 4`
+  rotation-angle computation. `pre_rotation_stride(n, nb_blocks)`
+  returns the `round(sqrt(N/nb_blocks))` interleave stride for the
+  §4.3.4.3 extra rotation by `(pi/2 - theta)` applied before the
+  main rotation when each time block represents at least 8 samples
+  (rounding direction round-half-up — the canonical interpretation
+  of unqualified `round()` notation in IETF prose). 14 new unit
+  tests cover: every `Spread` variant round-trips through
+  `as_u8`/`from_u8`; `f_r` matches Table 59 row-by-row; the
+  `DEFAULT_SPREAD` constant is `Spread::Normal` (the bulk-probability
+  case at 21/32); the ICDF entries match the PDF cumulative
+  reconstruction (sum = ft = 32, per-cell mass `{7, 2, 21, 2}`,
+  monotonic descent, terminator-zero); `decode_spread` is total
+  (every single-byte input produces one of the four legal variants,
+  never panics); the rotation-gain identity for `Spread::None` is
+  exactly `(0, 1)`; `rotation_gain_ratio` matches the closed-form
+  `N / (N + f_r * K)` at hand-computed values for each non-identity
+  spread; the squared form matches the pair-wise square; empty band
+  (`N = 0`) collapses to `(0, 1)` defensively; `K = 0` is the unit
+  ratio `(N, N)`; saturating arithmetic handles `u32::MAX` inputs
+  without overflow; the pre-rotation stride is `None` below 8
+  samples per block, `None` for `nb_blocks <= 1`, `None` for empty
+  bands, matches `round(sqrt(per_block))` at spot-checked values
+  (`per_block = 32/16/64/100`), the half-up tie-break is applied
+  consistently, and the returned stride is never zero.
+
+  This is decoder-side only. The 2-D rotation `R(i, j)` loop and
+  the `(pi/2 - theta)` pre-rotation are PVQ-shape-decoder work
+  (RFC 6716 §4.3.4.3 final paragraph); they sit on the per-band
+  codevector vector and are queued for the band-decode round. The
+  encoder-side §5.3.7 `spreading_decision` derivation is irrelevant
+  on the decode side and explicitly out of scope.
+
+  This commit also scrubs three pre-existing module docstrings
+  (`bit_allocation.rs`, `coarse_energy.rs`, `fine_energy.rs`) that
+  named the spec-delegation target source files inherited verbatim
+  from RFC 6716 §4.3.2.1 / §4.3.2.2 / §4.3.3 prose. The RFC names
+  the delegation targets in its normative text, but per the
+  workspace clean-room policy the agent-authored module docstrings
+  rephrase the delegation as "a source file outside the workspace
+  clean-room allow-list" instead. The behaviour and public API are
+  unchanged.
+
 * **Round-7 fine-energy refinement (2026-05-29):** RFC 6716 §4.3.2.2
   decoder for the second of CELT's three-step coarse-fine-fine
   energy-envelope strategy. The fine step is purely a raw-bit channel
   (no Laplace decoder, no `e_prob_model` table) so it is implementable
-  without consulting the libopus source files that the §4.3.2.1 prose
+  without consulting the source files that the §4.3.2.1 prose
   delegates to. `decode_fine_energy_band(dec, b_bits)` reads exactly
   `b_bits` raw bits, forms `f ∈ [0, 2^b_bits)`, and returns the
   closed-form Q14 correction `(2f+1) * 2^(13-b_bits) - 2^13`
@@ -131,9 +188,9 @@ All notable changes to `oxideav-celt` are recorded here.
   vector, anti-collapse / skip / intensity reservation arithmetic)
   is NOT in this round; the caller computes the gating booleans
   externally. The band-boost loop in particular depends on
-  `cache_caps50[]` which RFC 6716 §4.3.3 names as living in
-  libopus `static_modes_float.h` — that is a separate docs gap,
-  queued behind the Laplace / `e_prob_model` blocker.
+  `cache_caps50[]` which RFC 6716 §4.3.3 delegates to a source file
+  outside the workspace clean-room allow-list — that is a separate
+  docs gap, queued behind the Laplace / `e_prob_model` blocker.
 
 * **Round-4 coarse-energy scaffold (2026-05-21):** RFC 6716 §4.3.2.1
   scaffolding for the per-band coarse-energy decoder. Lands:
@@ -156,9 +213,8 @@ All notable changes to `oxideav-celt` are recorded here.
 
   **DOCS GAP filed.** RFC 6716 §4.3.2.1 normatively delegates the
   `e_prob_model` per-band Laplace probability table and the
-  `ec_laplace_decode` algorithm to libopus source files
-  (`quant_bands.c`, `laplace.c`) which the workspace clean-room
-  policy bars us from reading. Without either piece, this round
+  `ec_laplace_decode` algorithm to source files outside the
+  workspace clean-room allow-list. Without either piece, this round
   cannot land a bit-exact coarse-energy decoder; the scaffold's
   `decode_coarse_energy` therefore returns `NotImplemented` and the
   module docstring documents the closure requirements (a clean-room

@@ -37,11 +37,11 @@
 //!
 //! * Band boost decoding (§4.3.3, lines 6318–6360): a dynalloc-logp
 //!   loop per band that depends on the per-band `cap[]` vector, which
-//!   in turn depends on a `cache_caps50[]` table the RFC explicitly
-//!   names as living in `libopus/celt/static_modes_float.h`. The
-//!   `cache_caps50[]` numeric values are not derivable from RFC prose
-//!   alone — this is a separate docs gap, queued behind the Laplace /
-//!   `e_prob_model` blocker.
+//!   in turn depends on a numeric `cache_caps50[]` table that the RFC
+//!   delegates to a source file outside the workspace's clean-room
+//!   allow-list. The `cache_caps50[]` numeric values are not derivable
+//!   from RFC prose alone — this is a separate docs gap, queued
+//!   behind the Laplace / `e_prob_model` blocker.
 //! * The per-band shape/fine-energy split, the reallocation loop, and
 //!   the final skip-band selection. These come after the four scalar
 //!   fields decoded here and consume the residual budget — they are
@@ -55,9 +55,11 @@
 //!
 //! Every PDF, every gate condition, and every field comment in this
 //! file is transcribed from RFC 6716 §4.3.3 and Table 58 (`docs/audio/
-//! opus/rfc6716-opus.txt`). No external library source — including the
-//! libopus `celt.c` allocation loop and `rate.c` LOG2_FRAC_TABLE the
-//! RFC itself names — was consulted.
+//! opus/rfc6716-opus.txt`). The full §4.3.3 allocation loop and the
+//! `LOG2_FRAC_TABLE` the RFC delegates to a source file outside the
+//! workspace's clean-room allow-list are deferred until clean-room
+//! trace material is staged; no external library source was
+//! consulted.
 
 use crate::range_decoder::RangeDecoder;
 
@@ -273,8 +275,9 @@ pub fn decode_dual_stereo(dec: &mut RangeDecoder<'_>, gated: bool) -> Option<boo
 /// This function does NOT decode the surrounding band-boost loop,
 /// the per-band cap[] vector, or the final reallocation/skip
 /// resolution. Callers must implement those externally (the
-/// boost loop is docs-gap-blocked behind the `cache_caps50[]`
-/// libopus reference).
+/// boost loop is docs-gap-blocked behind the numeric `cache_caps50[]`
+/// table the RFC delegates to a source file outside the workspace's
+/// clean-room allow-list).
 pub fn decode_band_allocation(
     dec: &mut RangeDecoder<'_>,
     gates: BandAllocationGates,

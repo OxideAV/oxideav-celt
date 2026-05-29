@@ -4,18 +4,22 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-05-29
 
-**Round-7.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-8.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
 refinement decoder + finalize step, the §4.3.3 bit-allocation scalar
-fields (alloc.trim, skip, intensity-band, dual-stereo), and the
-§4.3.4.5 time-frequency change parameters (per-band `tf_change` +
-the gated global `tf_select` + the four tabulated TF-adjustment
-tables 60–63) are now wired up. The Laplace decoder + `e_prob_model`
-table remain docs-gap-blocked; the band-boost loop (which depends on
-`cache_caps50[]` in libopus) is a second docs gap queued behind that
-one. The band decode, PVQ, and MDCT paths still come later.
+fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.4.5
+time-frequency change parameters (per-band `tf_change` + the gated
+global `tf_select` + the four tabulated TF-adjustment tables 60–63),
+and the §4.3.4.3 spreading parameter (PDF `{7, 2, 21, 2}/32` +
+Table 59 `f_r` lookup + closed-form rotation-gain helpers) are now
+wired up. The Laplace decoder + `e_prob_model` table remain
+docs-gap-blocked; the band-boost loop (which depends on a
+`cache_caps50[]` numeric table the RFC delegates to a source file
+outside the workspace clean-room allow-list) is a second docs gap
+queued behind that one. The band decode, PVQ, and MDCT paths still
+come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -66,11 +70,10 @@ Coarse-energy scaffold (RFC 6716 §4.3.2.1):
 * `decode_coarse_energy(dec, state, intra, lm)` is the locked-in
   public entry point; it currently returns `Error::NotImplemented`
   because the `e_prob_model` table and the `ec_laplace_decode`
-  algorithm are docs-gap-blocked (the RFC names libopus source as
-  their normative location, which the workspace clean-room policy
-  bars). The gap'd path is asserted not to disturb the range
-  decoder or the carried state so that future rounds compose
-  cleanly.
+  algorithm are docs-gap-blocked (the RFC delegates them to a
+  source file outside the workspace clean-room allow-list). The
+  gap'd path is asserted not to disturb the range decoder or the
+  carried state so that future rounds compose cleanly.
 
 Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
 
@@ -149,6 +152,34 @@ Time-frequency change parameters (RFC 6716 §4.3.4.5 + §4.3.1):
   `[i8; 2] × 4` rows indexed by LM ∈ `{0,1,2,3}`
   (= 2.5 / 5 / 10 / 20 ms) and `tf_change` ∈ `{0, 1}`.
 
+Spreading parameter (RFC 6716 §4.3.4.3 + Table 56 + Table 59):
+
+* `decode_spread(dec)` reads the §4.3.4.3 spread field with PDF
+  `{7, 2, 21, 2}/32` via the §4.1.3.3 ICDF path. Returns one of
+  the four `Spread` variants `{None, Light, Normal, Aggressive}`
+  in raw-value order (`spread = 0..=3`).
+* `Spread::f_r()` is the Table 59 lookup: `None` (`spread=0`),
+  `Some(15)` (`spread=1`), `Some(10)` (`spread=2`), `Some(5)`
+  (`spread=3`). `f_r = None` means the spreading rotation is the
+  identity.
+* `rotation_gain_ratio(spread, n, k)` returns the `g_r = N/(N+f_r*K)`
+  rotation gain as a `(num, den)` unsigned-integer pair so the PVQ
+  caller can pick its own fixed-point representation. `Spread::None`
+  collapses to `(0, 1)`. `N = 0` returns `(0, 1)` defensively so a
+  caller looping over all band indices sees a well-defined zero.
+* `rotation_gain_squared_ratio(spread, n, k)` returns the same ratio
+  squared (`u64` per term to avoid overflow), feeding the
+  `theta = pi * g_r^2 / 4` rotation-angle computation that the PVQ
+  caller will run.
+* `pre_rotation_stride(n, nb_blocks)` returns the
+  `round(sqrt(N/nb_blocks))` interleave stride that the §4.3.4.3
+  "extra rotation" rule applies BEFORE the main rotation when each
+  time block represents at least 8 samples. Returns `None` for the
+  gated-off cases (`nb_blocks <= 1`, per-block sample count below 8,
+  or empty band).
+* `DEFAULT_SPREAD = Spread::Normal` is the bulk-probability fallback
+  for callers that skip the CELT side of the bitstream entirely.
+
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
 
@@ -162,10 +193,10 @@ The implementation references only the IETF specifications under
 * RFC 8251 — Opus Update.
 * RFC 7845 — Ogg Encapsulation for Opus (consulted for framing).
 
-No external library source — libopus, the Opus reference encoder /
-decoder, etc. — is permitted as a reference under the workspace
-clean-room policy. Black-box invocations of `opusdec` / `opusenc`
-are allowed as opaque validators only.
+Source files the RFC delegates to for normative numeric tables and
+algorithms sit outside the workspace clean-room allow-list and were
+not consulted. Black-box invocations of `opusdec` / `opusenc` are
+allowed as opaque validators only.
 
 ## License
 

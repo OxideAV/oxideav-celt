@@ -21,16 +21,12 @@
 //!
 //! RFC 6716 §4.3.2.1 normatively describes the coarse-energy
 //! mechanism but DELEGATES the actual numeric parameters and the
-//! Laplace-decoder algorithm to libopus source files which the
-//! workspace clean-room policy bars us from reading:
-//!
-//! > "These parameters are held in the e_prob_model table in
-//! >  quant_bands.c. The coarse energy decoding is performed by
-//! >  unquant_coarse_energy() (quant_bands.c). The decoding of the
-//! >  Laplace-distributed values is implemented in ec_laplace_decode()
-//! >  (laplace.c)."
-//! >    — RFC 6716 §4.3.2.1, lines 6073–6077 of
-//! >      `docs/audio/opus/rfc6716-opus.txt`.
+//! Laplace-decoder algorithm to source files that sit outside the
+//! workspace's clean-room allow-list. The §4.3.2.1 prose names the
+//! delegation target by file name; we redact those names here to keep
+//! the comment free of forbidden-source references. The unredacted
+//! prose lives at lines 6073–6077 of
+//! `docs/audio/opus/rfc6716-opus.txt`.
 //!
 //! The RFC's prose gives us:
 //!
@@ -80,7 +76,7 @@
 //!   × 2 parameters): the intra and inter Laplace parameters for
 //!   every band/frame-size combination. The shape and numeric values
 //!   are not derivable from spec PDFs alone; they need to be either
-//!   transcribed from a non-libopus spec source (none known to exist)
+//!   transcribed from an allowed spec source (none known to exist)
 //!   or commissioned as a clean-room behavioural-trace document
 //!   anchored to a black-box `opusdec` validator.
 //! * The `ec_laplace_decode` algorithm prose (budget-aware decode of
@@ -95,10 +91,10 @@
 //! ## Clean-room provenance
 //!
 //! Every numeric value, every formula, and every field comment in
-//! this file is transcribed from RFC 6716 (`docs/audio/opus/`). No
-//! external library source, including the libopus
-//! `celt/quant_bands.c` and `celt/laplace.c` files explicitly named
-//! by the RFC itself, was consulted.
+//! this file is transcribed from RFC 6716 (`docs/audio/opus/`). The
+//! source files that the RFC delegates to for the `e_prob_model`
+//! table and the Laplace decoder algorithm sit outside the
+//! workspace's clean-room allow-list and were not consulted.
 
 use crate::range_decoder::RangeDecoder;
 use crate::Error;
@@ -263,7 +259,8 @@ pub fn decode_coarse_energy(
 ) -> Result<Vec<i16>, Error> {
     // The Laplace decoder + e_prob_model probability table are
     // off-limits per the workspace clean-room policy (the RFC names
-    // libopus source files as their normative location). See the
+    // source files outside the workspace clean-room allow-list as
+    // their normative location). See the
     // module docstring's DOCS GAP section for the closure
     // requirements.
     Err(Error::NotImplemented)
