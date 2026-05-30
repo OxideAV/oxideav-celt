@@ -4,6 +4,54 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-10 §4.3.3 stereo reservation helpers (2026-05-30):**
+  the `LOG2_FRAC_TABLE` numeric constant + the two pure-arithmetic
+  helpers that drive the §4.3.3 intensity-stereo and dual-stereo
+  reservation gates. `LOG2_FRAC_TABLE: [u8; 24]` holds the
+  conservative `log2(n)` in 1/8-bit units, indexed by `coded_bands ∈
+  0..=23`; values come from the Feist-facts CSV at
+  `docs/audio/celt/tables/log2_frac_table.csv` and are documented in
+  the clean-room narrative §2.5 at
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md`.
+  `intensity_rsv(coded_bands, stereo, total_8th_bits) -> u32`
+  returns the §4.3.3 intensity reservation in 1/8 bits — the
+  `LOG2_FRAC_TABLE[coded_bands]` lookup when stereo + budget covers
+  it, zero otherwise (mono frames, empty band ranges,
+  out-of-table band counts, or budget too small per "if intensity_rsv
+  > total, set it to 0"). `reserve_stereo(coded_bands, stereo,
+  total_8th_bits) -> (u32, i32, u32)` runs the full two-step
+  reservation in §4.3.3 order (intensity_rsv first, then
+  dual_stereo_rsv if `total > 8` after intensity), returning
+  `(intensity_rsv, total_after, dual_stereo_rsv)`. 16 new unit tests
+  pin: `LOG2_FRAC_TABLE` has exactly 24 entries; spot-checks against
+  the §2.5 narrative (`[0]=0`, `[1]=8`, `[2]=13`, `[3]=16`,
+  `[16]=33`, `[23]=37`); the table is monotone non-decreasing; every
+  entry sits between `floor(log2(n))*8` and `log2(n)*8 + 8` (the
+  conservative-rounding bounds); `intensity_rsv` returns zero for
+  mono regardless of band/budget combinations; zero band range
+  returns zero; out-of-range band counts (`24, 25, 100, u32::MAX`)
+  fall back to zero defensively; stereo with sufficient budget
+  returns `LOG2_FRAC_TABLE[coded_bands]` for every legal value 1..=23;
+  budget-tight at the §4.3.3 equality boundary (e.g. 21 bands needs
+  36 → budget 35 drops, budget 36 keeps, budget 100 keeps); hybrid
+  4-band CELT reserves 19 1/8-bits; `reserve_stereo` on mono is
+  passthrough; large stereo budget reserves both intensity and dual
+  (36 + 8 = 44 of total subtracted for 21-band CELT); tight stereo
+  budget at the 44-budget boundary reserves only intensity, +1 budget
+  flips dual on; under-budget for intensity drops it but dual still
+  considers the remainder; empty band range + stereo skips intensity
+  but reserves dual; `reserve_stereo`'s intensity output agrees with
+  `intensity_rsv` across a (band, budget, stereo) grid.
+
+  No external library source consulted. The clean-room narrative at
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.5
+  describes the §4.3.3 stereo reservation step in algebraic form;
+  the numeric `LOG2_FRAC_TABLE` values come from the Feist-facts CSV
+  extract at `docs/audio/celt/tables/log2_frac_table.csv` (24 entries
+  of 1/8-bit units, unsigned byte). Lib test count 142 → 158 (+16).
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-celt/compare/v0.1.5...v0.1.6) - 2026-05-29
 
 ### Other

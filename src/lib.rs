@@ -2,18 +2,22 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-05-30):** round-9. The bit-exact CELT/SILK range
+//! **Status (2026-05-30):** round-10. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
 //! coarse-energy scaffolding (21-band layout from Table 55 + intra
 //! prediction filter with `α=0, β=4915/32768`) is in place; the
-//! Laplace decoder + `e_prob_model` table are docs-gap-blocked until
-//! a clean-room derivation lands. The §4.3.2.2 fine-energy refinement
-//! decoder + finalize step is bit-exact. The §4.3.3 bit-allocation
-//! field decoders (alloc.trim, skip, intensity-band, dual-stereo)
-//! are exposed standalone, gated on caller-supplied reservation
-//! booleans. The §4.3.4.5 time-frequency change parameters
+//! Laplace decoder + `e_prob_model` table remain queued for a future
+//! round (numeric CSV now staged at
+//! `docs/audio/celt/tables/e_prob_model.csv`). The §4.3.2.2
+//! fine-energy refinement decoder + finalize step is bit-exact. The
+//! §4.3.3 bit-allocation field decoders (alloc.trim, skip,
+//! intensity-band, dual-stereo) are exposed standalone, gated on
+//! caller-supplied reservation booleans, plus the §4.3.3 stereo
+//! reservation helpers (`LOG2_FRAC_TABLE` lookup + `intensity_rsv` +
+//! `reserve_stereo`) that compute the intensity + dual gates from
+//! the running budget. The §4.3.4.5 time-frequency change parameters
 //! (per-band `tf_change` + the gated global `tf_select` + the four
 //! TF-adjustment tables 60–63) are wired up. The §4.3.4.3 spreading
 //! parameter (PDF `{7, 2, 21, 2}/32`) + Table 59 `f_r` lookup +
@@ -52,7 +56,8 @@ pub mod tf_change;
 
 pub use bit_allocation::{
     decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,
-    decode_skip_flag, BandAllocation, BandAllocationGates, DEFAULT_ALLOC_TRIM,
+    decode_skip_flag, intensity_rsv, reserve_stereo, BandAllocation, BandAllocationGates,
+    DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE,
 };
 pub use coarse_energy::{
     apply_intra_prediction, decode_coarse_energy, CoarseEnergyState, INTRA_ALPHA_Q15,

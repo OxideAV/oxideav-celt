@@ -4,25 +4,29 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-05-30
 
-**Round-9.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-10.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
 refinement decoder + finalize step, the §4.3.3 bit-allocation scalar
-fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.4.5
-time-frequency change parameters (per-band `tf_change` + the gated
-global `tf_select` + the four tabulated TF-adjustment tables 60–63),
-the §4.3.4.3 spreading parameter (PDF `{7, 2, 21, 2}/32` + Table 59
-`f_r` lookup + closed-form rotation-gain helpers), the §4.3.7.1
-post-filter (three tap shapes in f32 + Q15 + gain reconstruction +
-per-sample / slice filter response), and the §4.3.7.2 single-pole
-de-emphasis filter (`α_p = 0.8500061035`, in both f32 and Q15) are
-now wired up. The Laplace decoder + `e_prob_model` table remain
-docs-gap-blocked; the band-boost loop (which depends on a
-`cache_caps50[]` numeric table the RFC delegates to a source file
-outside the workspace clean-room allow-list) is a second docs gap
-queued behind that one. The band decode, PVQ, and MDCT paths still
-come later.
+fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.3
+stereo reservation helpers (`LOG2_FRAC_TABLE` lookup + `intensity_rsv`
++ `reserve_stereo`), the §4.3.4.5 time-frequency change parameters
+(per-band `tf_change` + the gated global `tf_select` + the four
+tabulated TF-adjustment tables 60–63), the §4.3.4.3 spreading
+parameter (PDF `{7, 2, 21, 2}/32` + Table 59 `f_r` lookup + closed-
+form rotation-gain helpers), the §4.3.7.1 post-filter (three tap
+shapes in f32 + Q15 + gain reconstruction + per-sample / slice filter
+response), and the §4.3.7.2 single-pole de-emphasis filter
+(`α_p = 0.8500061035`, in both f32 and Q15) are now wired up. The
+Laplace decoder + `e_prob_model` table remain queued for a future
+round (numeric CSV is now staged at
+`docs/audio/celt/tables/e_prob_model.csv` so the work is no longer
+docs-gap-blocked). The band-boost loop (which depends on the
+`cache_caps50[]` per-band cap cache, CSV also now staged at
+`docs/audio/celt/tables/cache_caps50.csv`) is similarly unblocked
+from a docs standpoint but pending implementation. The band decode,
+PVQ, and MDCT paths still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -77,6 +81,22 @@ Coarse-energy scaffold (RFC 6716 §4.3.2.1):
   source file outside the workspace clean-room allow-list). The
   gap'd path is asserted not to disturb the range decoder or the
   carried state so that future rounds compose cleanly.
+
+Stereo reservation helpers (RFC 6716 §4.3.3 + clean-room narrative
+§2.5):
+
+* `LOG2_FRAC_TABLE: [u8; 24]` — the conservative `log2(n)` table in
+  1/8-bit units, indexed by `coded_bands ∈ 0..=23`. Numeric values
+  reproduced from `docs/audio/celt/tables/log2_frac_table.csv`.
+* `intensity_rsv(coded_bands, stereo, total_8th_bits) -> u32` —
+  returns the intensity-stereo selector reservation in 1/8 bits
+  (`LOG2_FRAC_TABLE[coded_bands]` when stereo + budget covers it,
+  zero otherwise per §4.3.3).
+* `reserve_stereo(coded_bands, stereo, total_8th_bits) -> (u32, i32, u32)`
+  — runs both stereo reservation steps (intensity_rsv then
+  dual_stereo_rsv) in §4.3.3 order. Returns
+  `(intensity_rsv, total_after, dual_stereo_rsv)` in 1/8 bits. Mono
+  frames pass through unchanged.
 
 Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
 

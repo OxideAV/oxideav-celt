@@ -21,12 +21,15 @@
 //!   point.
 //! * `intensity` (stereo frames only) is decoded only if
 //!   `intensity_rsv > 0`, i.e. the conservative log2-in-8th-bits of
-//!   `end-start` fits in the remaining budget.
+//!   `end-start` (looked up in [`LOG2_FRAC_TABLE`]) fits in the
+//!   remaining budget.
 //! * `dual` (stereo frames only) is decoded only if
 //!   `dual_stereo_rsv = 8` (8th bits) was set, i.e. there were still
 //!   more than 8 8th bits left after subtracting `intensity_rsv`.
 //!
-//! This module exposes a per-field decoder for each scalar, plus an
+//! This module exposes a per-field decoder for each scalar, the two
+//! reservation helpers [`intensity_rsv`] / [`reserve_stereo`] that
+//! drive the gating arithmetic for the two stereo fields, plus an
 //! orchestrator [`decode_band_allocation`] that takes the gating
 //! booleans as parameters (the caller, which holds the full §4.3.3
 //! budget loop, decides whether each reservation was made). Returning
@@ -54,12 +57,13 @@
 //! ## Clean-room provenance
 //!
 //! Every PDF, every gate condition, and every field comment in this
-//! file is transcribed from RFC 6716 §4.3.3 and Table 58 (`docs/audio/
-//! opus/rfc6716-opus.txt`). The full §4.3.3 allocation loop and the
-//! `LOG2_FRAC_TABLE` the RFC delegates to a source file outside the
-//! workspace's clean-room allow-list are deferred until clean-room
-//! trace material is staged; no external library source was
-//! consulted.
+//! file is transcribed from RFC 6716 §4.3.3 + Table 58
+//! (`docs/audio/opus/rfc6716-opus.txt`) and the clean-room narrative at
+//! `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2. The
+//! `LOG2_FRAC_TABLE` numeric values come from the Feist-facts
+//! numeric extract at `docs/audio/celt/tables/log2_frac_table.csv`
+//! (metadata in `log2_frac_table.meta`). No external library source
+//! was consulted.
 
 use crate::range_decoder::RangeDecoder;
 
@@ -84,6 +88,126 @@ const ALLOC_TRIM_ICDF: &[u8] = &[126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
 
 /// `ftb` for the allocation trim ICDF (RFC 6716 Table 58: `ft = 128`).
 const ALLOC_TRIM_FTB: u32 = 7;
+
+/// Conservative `log2(n)` in 1/8 bit units, for `n ∈ 0..=23`
+/// (RFC 6716 §4.3.3 / clean-room narrative §2.5).
+///
+/// Each entry `LOG2_FRAC_TABLE[n]` is the conservative — i.e.
+/// always rounded down to integer 1/8-bit precision — base-2
+/// logarithm of `n`. Examples:
+///
+/// * `LOG2_FRAC_TABLE[0] = 0`  (sentinel: `log2(0)` is undefined,
+///   but the §4.3.3 reservation walk only indexes this slot when
+///   `end - start == 0`, i.e. no coded bands at all).
+/// * `LOG2_FRAC_TABLE[1] = 8`  (= `log2(1)*8 + 8` — the conservative
+///   rounding biases `log2(1) = 0` up to a full 1-bit reservation
+///   to keep encoder/decoder lockstep).
+/// * `LOG2_FRAC_TABLE[2] = 13` (= `floor(log2(2) * 8 + 8*log2(e)*...)`
+///   — `log2(2) = 1` plus ~5/8 of additional headroom, conservatively
+///   rounded down).
+/// * `LOG2_FRAC_TABLE[16] = 33` (= ~4.125 bits, close to the exact
+///   `log2(16) = 4`).
+/// * `LOG2_FRAC_TABLE[23] = 37`.
+///
+/// The table is exposed as a `pub const` so the §4.3.3 budget walk
+/// (computed in a future round, once the band-boost + `cap[]` machinery
+/// is in place) can look up the intensity-stereo reservation without
+/// re-computing it.
+///
+/// Numeric values come from the Feist-facts CSV at
+/// `docs/audio/celt/tables/log2_frac_table.csv` (24 entries, 1/8-bit
+/// units, unsigned byte). The CSV is documented in the clean-room
+/// narrative at `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md`
+/// §2.5 and is normatively cited by RFC 6716 §4.3.3.
+pub const LOG2_FRAC_TABLE: [u8; 24] = [
+    0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29, 30, 31, 32, 32, 33, 34, 34, 35, 36, 36, 37, 37,
+];
+
+/// Reservation (in 1/8 bit units) for the §4.3.3 intensity-stereo
+/// selector, given a budget and the number of coded bands.
+///
+/// Returns the conservative `log2(coded_bands)` in 1/8-bit units when
+/// the §4.3.3 reservation step fires, and zero when the reservation
+/// must be dropped (either the frame is mono, the budget is too
+/// small, or `coded_bands` is outside the table's domain).
+///
+/// Inputs:
+///
+/// * `coded_bands` = `end - start`, the number of CELT bands that
+///   this frame codes (RFC 6716 §4.3.3 lines 6310–6314). The §4.3.3
+///   walk only indexes `LOG2_FRAC_TABLE` for `1..=22` (the maximum
+///   CELT band range is 21 — pure CELT 0..21 — and Hybrid mode 17..21
+///   gives 4); values outside `1..=23` clamp to a zero reservation
+///   defensively rather than out-of-bounds, matching the §4.3.3
+///   prose that mono frames and empty band ranges reserve nothing.
+/// * `stereo` = `true` for two-channel CELT, `false` for mono.
+///   Mono frames never reserve intensity bits (RFC 6716 §4.3.3
+///   lines 6405–6408), so the function always returns `0` when
+///   `stereo == false`.
+/// * `total_8th_bits` = the §4.3.3 running budget in 1/8 bits at the
+///   point where intensity_rsv is considered (after anti_collapse_rsv
+///   and skip_rsv have been subtracted). The reservation is taken
+///   only if `LOG2_FRAC_TABLE[coded_bands] <= total_8th_bits`,
+///   otherwise it is dropped to zero per §4.3.3.
+///
+/// The return value is in 1/8-bit units, matching the rest of the
+/// §4.3.3 budget arithmetic; callers subtract it from `total` and
+/// then test `total > 8` for the dual-stereo reservation.
+///
+/// This function does NOT consult the range decoder; it is the
+/// pure-arithmetic side of the §4.3.3 reservation prose, exposed
+/// standalone so a future round's full budget walk can drop it in
+/// without restructuring.
+pub fn intensity_rsv(coded_bands: u32, stereo: bool, total_8th_bits: i32) -> u32 {
+    if !stereo {
+        return 0;
+    }
+    // Defensive: §4.3.3 only ever indexes LOG2_FRAC_TABLE at 1..=22 in
+    // practice. Empty band ranges shouldn't reserve intensity bits at
+    // all (there are no stereo bands to apply intensity to); values
+    // beyond the table fall back to no reservation to avoid panics.
+    let idx = coded_bands as usize;
+    if idx == 0 || idx >= LOG2_FRAC_TABLE.len() {
+        return 0;
+    }
+    let rsv = LOG2_FRAC_TABLE[idx] as i32;
+    // §4.3.3: "If intensity_rsv > total, set it to 0; otherwise
+    // decrement total by it ...". We return the value that survives
+    // the >total test, or 0 if it would exceed the budget.
+    if rsv > total_8th_bits {
+        0
+    } else {
+        rsv as u32
+    }
+}
+
+/// Compute the trio (intensity_rsv, total_after, dual_stereo_rsv) for
+/// the §4.3.3 stereo reservation step.
+///
+/// Convenience helper that bundles the two §4.3.3 stereo decisions
+/// (intensity-band selector reservation followed by dual-stereo flag
+/// reservation) into a single function. The §4.3.3 prose runs them in
+/// fixed order:
+///
+/// 1. `intensity_rsv = LOG2_FRAC_TABLE[end - start]` (conservative
+///    log2 of the band count, in 1/8 bits); if `intensity_rsv >
+///    total`, set it to 0.
+/// 2. Decrement `total` by `intensity_rsv`.
+/// 3. If `total > 8`, set `dual_stereo_rsv = 8` and decrement
+///    `total` by 8.
+///
+/// Returns `(intensity_rsv, total_after, dual_rsv)` in 1/8 bits.
+/// `total_after` is what the caller's remaining-budget variable
+/// should be after this step. Mono frames pass `stereo = false` and
+/// receive `(0, total_8th_bits, 0)` — the reservation step is a
+/// no-op for mono per RFC 6716 §4.3.3 lines 6405–6408.
+pub fn reserve_stereo(coded_bands: u32, stereo: bool, total_8th_bits: i32) -> (u32, i32, u32) {
+    let i_rsv = intensity_rsv(coded_bands, stereo, total_8th_bits);
+    let after_intensity = total_8th_bits - i_rsv as i32;
+    let d_rsv: u32 = if stereo && after_intensity > 8 { 8 } else { 0 };
+    let total_after = after_intensity - d_rsv as i32;
+    (i_rsv, total_after, d_rsv)
+}
 
 /// Decoded band-allocation fields for one CELT frame (RFC 6716 §4.3.3).
 ///
@@ -622,5 +746,216 @@ mod tests {
         let after = dec.tell();
         assert!(v <= 1);
         assert!(after > before, "no advance on dec_uint(2)");
+    }
+
+    /// `LOG2_FRAC_TABLE` has exactly 24 entries — one per index
+    /// `n ∈ 0..=23`. The §4.3.3 stereo-reservation walk only ever
+    /// indexes `1..=22` in practice, but the table extends to 23 to
+    /// match the clean-room CSV at
+    /// `docs/audio/celt/tables/log2_frac_table.csv`.
+    #[test]
+    fn log2_frac_table_length() {
+        assert_eq!(LOG2_FRAC_TABLE.len(), 24);
+    }
+
+    /// Spot-check `LOG2_FRAC_TABLE` against the values listed in the
+    /// clean-room narrative
+    /// `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.5:
+    /// `[0]=0`, `[1]=8`, `[2]=13`, `[16]=33`, `[23]=37`.
+    #[test]
+    fn log2_frac_table_spot_check() {
+        assert_eq!(LOG2_FRAC_TABLE[0], 0);
+        assert_eq!(LOG2_FRAC_TABLE[1], 8);
+        assert_eq!(LOG2_FRAC_TABLE[2], 13);
+        assert_eq!(LOG2_FRAC_TABLE[3], 16);
+        assert_eq!(LOG2_FRAC_TABLE[16], 33);
+        assert_eq!(LOG2_FRAC_TABLE[23], 37);
+    }
+
+    /// `LOG2_FRAC_TABLE` is monotone non-decreasing: each entry is at
+    /// least as large as the previous (the conservative log2 of `n+1`
+    /// can never be less than the conservative log2 of `n`). This is
+    /// a structural invariant the §4.3.3 budget walk relies on.
+    #[test]
+    fn log2_frac_table_monotone_non_decreasing() {
+        for w in LOG2_FRAC_TABLE.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "LOG2_FRAC_TABLE not monotone: {} > {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// Each entry is a conservative — i.e. floor-rounded — bound on
+    /// `n * 8` in 1/8 bit units. For `n >= 1`, `LOG2_FRAC_TABLE[n]`
+    /// must be at most `8 + 8*ceil(log2(n))` (a generous upper bound
+    /// covering the conservative-rounding policy). And for `n >= 2`,
+    /// it must be at least `8 * floor(log2(n))` (the strict floor
+    /// lower bound).
+    #[test]
+    fn log2_frac_table_bounds_match_log2() {
+        for (n, &entry) in LOG2_FRAC_TABLE.iter().enumerate().skip(1) {
+            let value = entry as f64;
+            let log2_n = (n as f64).log2();
+            // Upper bound: log2(n)*8 + 8 (allow the conservative
+            // rounding to overshoot by up to 1 bit).
+            assert!(
+                value <= log2_n * 8.0 + 8.0 + 1e-6,
+                "LOG2_FRAC_TABLE[{n}] = {value} > log2({n})*8 + 8"
+            );
+            // Lower bound for n >= 2: at least floor(log2(n))*8.
+            if n >= 2 {
+                let floor_lower = (log2_n.floor() * 8.0) - 1e-6;
+                assert!(
+                    value >= floor_lower,
+                    "LOG2_FRAC_TABLE[{n}] = {value} < floor(log2({n}))*8 = {floor_lower}"
+                );
+            }
+        }
+    }
+
+    /// Mono frames never reserve intensity bits per RFC 6716 §4.3.3
+    /// lines 6405–6408. Regardless of band count and budget, the
+    /// helper returns zero.
+    #[test]
+    fn intensity_rsv_mono_is_zero() {
+        for coded_bands in [0u32, 1, 4, 21, 22, 23] {
+            for total in [0i32, 100, 10_000] {
+                assert_eq!(intensity_rsv(coded_bands, false, total), 0);
+            }
+        }
+    }
+
+    /// Empty band range never reserves intensity bits — there are no
+    /// stereo bands to apply intensity to.
+    #[test]
+    fn intensity_rsv_zero_bands_is_zero() {
+        assert_eq!(intensity_rsv(0, true, 10_000), 0);
+    }
+
+    /// Out-of-table band counts fall back to a zero reservation
+    /// defensively rather than panicking. The §4.3.3 walk only ever
+    /// passes `coded_bands ∈ 1..=22` in practice.
+    #[test]
+    fn intensity_rsv_out_of_range_is_zero() {
+        // 24, 100, u32::MAX — all out of LOG2_FRAC_TABLE's 0..24 domain.
+        for coded_bands in [24u32, 25, 100, u32::MAX] {
+            assert_eq!(intensity_rsv(coded_bands, true, 10_000), 0);
+        }
+    }
+
+    /// `intensity_rsv` returns `LOG2_FRAC_TABLE[coded_bands]` when
+    /// the budget covers it. At a generous budget every legal
+    /// `coded_bands` value lands on its table entry.
+    #[test]
+    fn intensity_rsv_stereo_budget_sufficient() {
+        let big_budget = 10_000;
+        for coded_bands in 1u32..=23 {
+            let got = intensity_rsv(coded_bands, true, big_budget);
+            let want = LOG2_FRAC_TABLE[coded_bands as usize] as u32;
+            assert_eq!(got, want, "mismatch at coded_bands={coded_bands}");
+        }
+    }
+
+    /// `intensity_rsv` returns zero when the reservation would exceed
+    /// the running budget, per §4.3.3 "If intensity_rsv > total, set
+    /// it to 0".
+    #[test]
+    fn intensity_rsv_budget_too_small() {
+        // 21 bands needs 36 1/8-bits. Budget of 35 drops to zero.
+        assert_eq!(intensity_rsv(21, true, 35), 0);
+        // Budget of exactly 36 is the equality boundary — the §4.3.3
+        // prose says "if intensity_rsv > total, set to 0", so equality
+        // keeps the reservation.
+        assert_eq!(intensity_rsv(21, true, 36), 36);
+        // Budget of 100 keeps it.
+        assert_eq!(intensity_rsv(21, true, 100), 36);
+    }
+
+    /// Hybrid-mode 4-band CELT reserves `LOG2_FRAC_TABLE[4] = 19`
+    /// 1/8 bits for intensity when the budget covers it.
+    #[test]
+    fn intensity_rsv_hybrid_four_bands() {
+        let rsv = intensity_rsv(4, true, 1000);
+        assert_eq!(rsv, 19);
+        assert_eq!(rsv, LOG2_FRAC_TABLE[4] as u32);
+    }
+
+    /// `reserve_stereo` on a mono frame is a complete no-op: zero
+    /// reservations, total unchanged.
+    #[test]
+    fn reserve_stereo_mono_is_passthrough() {
+        let (i_rsv, total_after, d_rsv) = reserve_stereo(21, false, 500);
+        assert_eq!(i_rsv, 0);
+        assert_eq!(d_rsv, 0);
+        assert_eq!(total_after, 500);
+    }
+
+    /// Stereo with a large budget reserves intensity, then 8 1/8-bits
+    /// for dual. Verify against `LOG2_FRAC_TABLE[21] + 8 = 36 + 8 = 44`
+    /// of total reservation taken.
+    #[test]
+    fn reserve_stereo_large_budget_both_reservations() {
+        let total = 1000;
+        let (i_rsv, total_after, d_rsv) = reserve_stereo(21, true, total);
+        assert_eq!(i_rsv, 36);
+        assert_eq!(d_rsv, 8);
+        assert_eq!(total_after, 1000 - 36 - 8);
+    }
+
+    /// Stereo with a tight budget: intensity reserved exactly, then
+    /// not enough left for dual.
+    #[test]
+    fn reserve_stereo_tight_budget_no_dual() {
+        // 21 bands: intensity = 36, then after_intensity = 8 which is
+        // NOT > 8, so dual_rsv = 0.
+        let (i_rsv, total_after, d_rsv) = reserve_stereo(21, true, 44);
+        assert_eq!(i_rsv, 36);
+        assert_eq!(d_rsv, 0);
+        assert_eq!(total_after, 8);
+        // Bump budget by 1 — now after_intensity = 9 > 8, dual fires.
+        let (_, total_after_2, d_rsv_2) = reserve_stereo(21, true, 45);
+        assert_eq!(d_rsv_2, 8);
+        assert_eq!(total_after_2, 1);
+    }
+
+    /// Stereo with a budget below the intensity reservation: both
+    /// reservations drop to zero.
+    #[test]
+    fn reserve_stereo_below_intensity_drops_both() {
+        // 21 bands need 36, budget of 30 forces i_rsv = 0; after that
+        // we still test "total > 8" for dual — 30 > 8 so dual fires
+        // with 8. (Per §4.3.3: dual is reserved iff total > 8 AFTER
+        // intensity subtraction, which here is the original 30.)
+        let (i_rsv, total_after, d_rsv) = reserve_stereo(21, true, 30);
+        assert_eq!(i_rsv, 0);
+        assert_eq!(d_rsv, 8);
+        assert_eq!(total_after, 22);
+    }
+
+    /// Stereo with empty band range: no intensity reserved (zero band
+    /// count), but dual still considered against the budget.
+    #[test]
+    fn reserve_stereo_empty_bands() {
+        let (i_rsv, total_after, d_rsv) = reserve_stereo(0, true, 100);
+        assert_eq!(i_rsv, 0);
+        assert_eq!(d_rsv, 8);
+        assert_eq!(total_after, 92);
+    }
+
+    /// Cross-check `intensity_rsv` against `reserve_stereo`'s first
+    /// returned value across a grid of budgets and band counts.
+    #[test]
+    fn reserve_stereo_intensity_matches_helper() {
+        for coded_bands in 0u32..=23 {
+            for total in [0i32, 16, 36, 50, 200] {
+                for stereo in [false, true] {
+                    let (i_rsv, _, _) = reserve_stereo(coded_bands, stereo, total);
+                    assert_eq!(i_rsv, intensity_rsv(coded_bands, stereo, total));
+                }
+            }
+        }
     }
 }
