@@ -4,6 +4,70 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-11 §4.3.4.5 Hadamard-transform primitives (2026-05-31):** the
+  three pure helpers the §4.3.4.5 TF-resolution-change step needs once
+  the per-band shape vectors come on-line. `walsh_hadamard_inplace`
+  runs the orthonormal radix-2 forward Walsh–Hadamard transform in
+  natural (Hadamard) order, with per-level `1/√2` scaling so the
+  matrix is orthonormal and the L2 norm is preserved.
+  `walsh_hadamard_sequency_inplace` runs the same transform in
+  sequency (Walsh) order: the natural-order butterfly cascade
+  followed by the textbook `bit_reverse(gray(s))` permutation that
+  places the zero-sequency (DC) bin at output index 0 and the
+  maximum-sequency bin at output index `2^levels - 1`. This is the
+  variant the §4.3.4.5 prose calls for in the time-resolution-
+  increase branch ("the decoder uses the 'sequency order' because
+  the input vector is sorted in time"). `apply_tf_resolution_change`
+  orchestrates the two over an interleaved `nb_blocks × subvec` band
+  layout: `tf_adjustment < 0` ⇒ sequency-ordered WHT per sub-vector
+  (time-resolution increase); `tf_adjustment > 0` ⇒ natural-order WHT
+  across the interleaved blocks (frequency-resolution increase);
+  `tf_adjustment == 0` is a no-op. Returns `false` and leaves the
+  band unchanged when the shape constraints are violated (non-power-
+  of-two block count or sub-vector length, or a request exceeding
+  the available WHT levels in either direction).
+
+  11 new unit tests pin: natural-order WHT of `[1,0,0,0]` yields the
+  constant `0.5` row at N=4 (each row of the natural Hadamard matrix
+  starts with `+1`); natural-order WHT of `[1,1,1,1]` yields
+  `[2, 0, 0, 0]` (DC at sequency-0 bin under the natural ordering
+  because the natural Hadamard matrix row 0 is the all-ones row);
+  applying the WHT twice is identity within `1e-5` (orthonormal
+  involutivity at N=8); L2 norm preserved at N=16; sequency-ordered
+  WHT puts a constant signal in bin 0 (sequency-DC) and a maximum-
+  sign-alternation signal in bin N-1 (highest sequency); `tf=0` is
+  a strict no-op; `tf=-2` on a 2-block × 4-sample band with both
+  blocks `[1,1,1,1]` produces `[2,0,0,0]` per sub-vector; `tf=+2`
+  on a 4-block × 1-sample band with all-ones across the blocks
+  produces `[2,0,0,0]` across blocks (natural-order DC); shape
+  rejections for non-divisible band length, non-power-of-two
+  sub-vector length, oversized `|tf_adjustment|`, and non-power-of-
+  two block count; the internal `bit_reverse(gray(s))` permutation
+  matches a hand-computed N=4 table.
+
+  Normalization choice (`HADAMARD_LEVEL_SCALE = 1/√2`) is documented
+  in `src/hadamard.rs` as a decoder-side decision because RFC 6716
+  §4.3.4.5 is silent on the per-level scaling. Chosen to keep the
+  unit-norm band shape vectors invariant across TF resolution
+  changes so the §4.3.6 denormalization step (which multiplies by
+  `sqrt(energy)`) sees the same shape regardless of `tf_adjustment`.
+  Swap to `1.0` (unscaled butterfly) if a future `opusdec` trace
+  shows the reference does no normalization at all.
+
+  Pure clean-room derivation: the Walsh–Hadamard transform is
+  textbook material that predates CELT by decades (Hadamard 1893,
+  Walsh 1923). The radix-2 butterfly cascade was written from first
+  principles against the matrix definition `H_2 = [[1,1],[1,-1]]`,
+  `H_{2n} = H_2 ⊗ H_n`. No external library source consulted (this
+  includes libopus, libcelt, FFmpeg / libav*, any third-party Rust
+  crate for Opus or for Walsh–Hadamard, and any web resource). The
+  sequency-order permutation `bit_reverse(gray(s))` is the standard
+  result from any DSP textbook covering the Walsh transform.
+
+  Lib test count 158 → 169 (+11).
+
 ## [0.1.7](https://github.com/OxideAV/oxideav-celt/compare/v0.1.6...v0.1.7) - 2026-05-30
 
 ### Other

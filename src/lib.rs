@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-05-30):** round-10. The bit-exact CELT/SILK range
+//! **Status (2026-05-31):** round-11. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -19,14 +19,17 @@
 //! `reserve_stereo`) that compute the intensity + dual gates from
 //! the running budget. The §4.3.4.5 time-frequency change parameters
 //! (per-band `tf_change` + the gated global `tf_select` + the four
-//! TF-adjustment tables 60–63) are wired up. The §4.3.4.3 spreading
-//! parameter (PDF `{7, 2, 21, 2}/32`) + Table 59 `f_r` lookup +
-//! closed-form rotation-gain helpers are wired up. The §4.3.7.1
-//! post-filter tap shapes (three §4.3.7.1 tapsets in f32 + Q15) +
-//! gain reconstruction + per-sample / slice filter response and the
-//! §4.3.7.2 single-pole de-emphasis filter (`α_p = 0.8500061035`)
-//! are now wired up. The band-boost loop, full budget walk, band
-//! decode, PVQ, and MDCT machinery still come later.
+//! TF-adjustment tables 60–63) plus the §4.3.4.5 Hadamard transform
+//! primitives (orthonormal radix-2 WHT in both natural and sequency
+//! order + the `apply_tf_resolution_change` orchestrator) are wired
+//! up. The §4.3.4.3 spreading parameter (PDF `{7, 2, 21, 2}/32`) +
+//! Table 59 `f_r` lookup + closed-form rotation-gain helpers are
+//! wired up. The §4.3.7.1 post-filter tap shapes (three §4.3.7.1
+//! tapsets in f32 + Q15) + gain reconstruction + per-sample / slice
+//! filter response and the §4.3.7.2 single-pole de-emphasis filter
+//! (`α_p = 0.8500061035`) are now wired up. The band-boost loop,
+//! full budget walk, band decode, PVQ, and MDCT machinery still come
+//! later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -49,6 +52,7 @@ pub mod coarse_energy;
 pub mod deemphasis;
 pub mod fine_energy;
 pub mod frame_header;
+pub mod hadamard;
 pub mod post_filter;
 pub mod range_decoder;
 pub mod spread;
@@ -69,6 +73,10 @@ pub use fine_energy::{
     fine_correction_qn, FinalizePriority, FinalizeResult, MAX_FINE_BITS,
 };
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
+pub use hadamard::{
+    apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
+    HADAMARD_LEVEL_SCALE,
+};
 pub use post_filter::{
     apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,
     tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN,

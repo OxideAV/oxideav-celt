@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-05-30
+## Status — 2026-05-31
 
-**Round-10.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-11.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -13,11 +13,13 @@ fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.3
 stereo reservation helpers (`LOG2_FRAC_TABLE` lookup + `intensity_rsv`
 + `reserve_stereo`), the §4.3.4.5 time-frequency change parameters
 (per-band `tf_change` + the gated global `tf_select` + the four
-tabulated TF-adjustment tables 60–63), the §4.3.4.3 spreading
-parameter (PDF `{7, 2, 21, 2}/32` + Table 59 `f_r` lookup + closed-
-form rotation-gain helpers), the §4.3.7.1 post-filter (three tap
-shapes in f32 + Q15 + gain reconstruction + per-sample / slice filter
-response), and the §4.3.7.2 single-pole de-emphasis filter
+tabulated TF-adjustment tables 60–63), the §4.3.4.5 Hadamard
+transform primitives (orthonormal radix-2 WHT in natural and sequency
+order + the `apply_tf_resolution_change` orchestrator), the §4.3.4.3
+spreading parameter (PDF `{7, 2, 21, 2}/32` + Table 59 `f_r` lookup +
+closed-form rotation-gain helpers), the §4.3.7.1 post-filter (three
+tap shapes in f32 + Q15 + gain reconstruction + per-sample / slice
+filter response), and the §4.3.7.2 single-pole de-emphasis filter
 (`α_p = 0.8500061035`, in both f32 and Q15) are now wired up. The
 Laplace decoder + `e_prob_model` table remain queued for a future
 round (numeric CSV is now staged at
@@ -174,6 +176,36 @@ Time-frequency change parameters (RFC 6716 §4.3.4.5 + §4.3.1):
   `TABLE_62_TRANSIENT_SEL0`, `TABLE_63_TRANSIENT_SEL1`),
   `[i8; 2] × 4` rows indexed by LM ∈ `{0,1,2,3}`
   (= 2.5 / 5 / 10 / 20 ms) and `tf_change` ∈ `{0, 1}`.
+
+Hadamard transform primitives (RFC 6716 §4.3.4.5 final paragraph):
+
+* `walsh_hadamard_inplace(samples, levels)` — in-place orthonormal
+  forward Walsh–Hadamard transform in natural (Hadamard) order. The
+  radix-2 butterfly cascade with per-level `1/√2` scaling, so the
+  matrix is orthonormal and the L2 norm is preserved.
+* `walsh_hadamard_sequency_inplace(samples, levels)` — same transform
+  in sequency (Walsh) order. Natural-order butterfly cascade followed
+  by the textbook `bit_reverse(gray(s))` permutation so that the
+  zero-sequency (DC) bin lands at index 0 and the maximum-sequency
+  bin lands at index `2^levels - 1`. Used by the time-resolution-
+  increase branch per §4.3.4.5 ("the decoder uses the 'sequency
+  order' because the input vector is sorted in time").
+* `apply_tf_resolution_change(band, tf_adjustment, nb_blocks)` —
+  orchestrator over the interleaved `nb_blocks × subvec` band
+  layout. `tf_adjustment < 0` applies `|tf_adjustment|` sequency-
+  ordered WHT levels to each sub-vector (increase time resolution);
+  `tf_adjustment > 0` applies `|tf_adjustment|` natural-order WHT
+  levels across the interleaved blocks (increase frequency
+  resolution); `tf_adjustment == 0` is a no-op. Returns `false` and
+  leaves `band` unchanged when the shape constraints are violated
+  (non-power-of-two block count or sub-vector length, or a request
+  exceeding the available WHT levels in either direction).
+* `HADAMARD_LEVEL_SCALE = 1/√2` — the per-level normalization that
+  makes the radix-2 butterfly orthonormal. Documented as a
+  decoder-side decision because §4.3.4.5 is silent on the scaling
+  convention; chosen to keep the unit-norm band shape vectors
+  invariant across TF resolution changes so the §4.3.6
+  denormalization sees the same shape regardless of `tf_adjustment`.
 
 Spreading parameter (RFC 6716 §4.3.4.3 + Table 56 + Table 59):
 

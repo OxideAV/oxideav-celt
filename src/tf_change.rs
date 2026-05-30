@@ -34,9 +34,12 @@
 //!   `transient` flag itself. We are decoder-only here; the caller
 //!   passes `is_transient` in from the [`crate::frame_header`]
 //!   prefix walk.
-//! * The actual Hadamard transform that implements the TF resolution
-//!   change in the shape decode path (RFC 6716 §4.3.4.5 final
-//!   paragraph). That is band-decode work for a later round.
+//! * The shape-decode pipeline that feeds band data into the Hadamard
+//!   transform. The transform itself now lives in
+//!   [`crate::hadamard`] (radix-2 WHT butterflies + sequency-order
+//!   permutation + the `apply_tf_resolution_change` orchestrator);
+//!   the call site that splices it into the per-band decode path is
+//!   band-decode work for a later round.
 //! * Band budget reservation accounting. The §4.3.4.5 prose does
 //!   not itself describe a bit-budget gate for `tf_change`; the
 //!   per-band bits are spent unconditionally within the §4.3.3
