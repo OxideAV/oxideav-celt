@@ -4,6 +4,13 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-celt/compare/v0.1.6...v0.1.7) - 2026-05-30
+
+### Other
+
+- round-10 §4.3.3 stereo reservation: LOG2_FRAC_TABLE + intensity_rsv + reserve_stereo (RFC 6716)
+- round-9 §4.3.7.1 post-filter + §4.3.7.2 de-emphasis (RFC 6716)
+
 ### Added
 
 * **Round-10 §4.3.3 stereo reservation helpers (2026-05-30):**
