@@ -2,33 +2,36 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-05-31
+## Status — 2026-06-01
 
-**Round-11.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-12.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
 refinement decoder + finalize step, the §4.3.3 bit-allocation scalar
 fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.3
 stereo reservation helpers (`LOG2_FRAC_TABLE` lookup + `intensity_rsv`
-+ `reserve_stereo`), the §4.3.4.5 time-frequency change parameters
-(per-band `tf_change` + the gated global `tf_select` + the four
-tabulated TF-adjustment tables 60–63), the §4.3.4.5 Hadamard
-transform primitives (orthonormal radix-2 WHT in natural and sequency
-order + the `apply_tf_resolution_change` orchestrator), the §4.3.4.3
-spreading parameter (PDF `{7, 2, 21, 2}/32` + Table 59 `f_r` lookup +
-closed-form rotation-gain helpers), the §4.3.7.1 post-filter (three
-tap shapes in f32 + Q15 + gain reconstruction + per-sample / slice
++ `reserve_stereo`), the §4.3.3 per-band `cap[]` machinery (the full
+168-entry `CACHE_CAPS50` table + `compute_band_caps`) and the §4.3.3
+band-boost dynalloc-logp loop (`decode_band_boosts` →
+`BoostResult { boost, total_boost, total_bits_remaining }`), the
+§4.3.4.5 time-frequency change parameters (per-band `tf_change` +
+the gated global `tf_select` + the four tabulated TF-adjustment
+tables 60–63), the §4.3.4.5 Hadamard transform primitives
+(orthonormal radix-2 WHT in natural and sequency order + the
+`apply_tf_resolution_change` orchestrator), the §4.3.4.3 spreading
+parameter (PDF `{7, 2, 21, 2}/32` + Table 59 `f_r` lookup + closed-
+form rotation-gain helpers), the §4.3.7.1 post-filter (three tap
+shapes in f32 + Q15 + gain reconstruction + per-sample / slice
 filter response), and the §4.3.7.2 single-pole de-emphasis filter
 (`α_p = 0.8500061035`, in both f32 and Q15) are now wired up. The
 Laplace decoder + `e_prob_model` table remain queued for a future
 round (numeric CSV is now staged at
 `docs/audio/celt/tables/e_prob_model.csv` so the work is no longer
-docs-gap-blocked). The band-boost loop (which depends on the
-`cache_caps50[]` per-band cap cache, CSV also now staged at
-`docs/audio/celt/tables/cache_caps50.csv`) is similarly unblocked
-from a docs standpoint but pending implementation. The band decode,
-PVQ, and MDCT paths still come later.
+docs-gap-blocked). The full §4.3.3 budget walk (`total_bits`
+initialization from `ec_tell_frac()` + anti-collapse / skip
+reservations chaining into the existing `reserve_stereo`) and the
+band-decode / PVQ / MDCT paths still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -121,6 +124,33 @@ Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
   every gated-off field. The orchestrator does not touch the
   range decoder for gated-off fields, so caller-side
   `ec_tell_frac()` accounting stays accurate.
+
+Per-band caps and band boosts (RFC 6716 §4.3.3 + clean-room
+narrative §§2.2–2.3):
+
+* `CACHE_CAPS50: [[u8; 21]; 8]` — the §4.3.3 per-band maximum-
+  allocation cache (`cache.caps`), 168 entries arranged as
+  `CACHE_CAPS50[2*LM + stereo][band]` for `LM ∈ {0,1,2,3}` ×
+  `stereo ∈ {0,1}`. Numeric values reproduced from
+  `docs/audio/celt/tables/cache_caps50.csv`.
+* `compute_band_caps(lm, stereo, channels, bins_per_band, caps) -> bool`
+  applies the §4.3.3 conversion `cap[band] = (cache.caps[i] + 64) *
+  channels * N[band] / 4`. Output saturates to `i16::MAX` defensively
+  in the unlikely overflow corner; returns `false` for `lm > 3` /
+  `channels ∉ {1,2}` / length mismatches.
+* `decode_band_boosts(dec, start, end, bins_per_band, caps, total_bits)
+  -> Option<BoostResult>` runs the §4.3.3 dynalloc-logp loop (RFC 6716
+  lines 6339–6360) literally. Per-band quanta
+  `min(8*N, max(48, N))`, starting `dynalloc_logp = 6` falling to
+  `1` mid-band on the first accepted boost and stepping down one
+  notch per boosted band (floored at `2`). The §4.3.3 "at very low
+  rates ... inner loop may not run even once" path is exercised
+  explicitly — `total_bits` below the initial guard ⇒ zero boosts
+  emitted, the range decoder is not consulted.
+* `BoostResult { boost: Vec<i32>, total_boost: i32,
+  total_bits_remaining: i32 }` — per-band 1/8-bit boosts plus the
+  `total_boost` accumulator the §4.3.3 alloc-trim gate consumes
+  (`ec_tell_frac() + 48 <= total_bits - total_boost`).
 
 Fine-energy refinement (RFC 6716 §4.3.2.2):
 

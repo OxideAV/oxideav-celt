@@ -6,6 +6,48 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-12 §4.3.3 `cache_caps50` + band-boost decode (2026-06-01):**
+  the §4.3.3 per-band maximum-allocation `cap[]` machinery and the
+  matching band-boost dynalloc-logp loop. `CACHE_CAPS50: [[u8; 21]; 8]`
+  reproduces the 168-entry Feist-facts table now staged at
+  `docs/audio/celt/tables/cache_caps50.csv`, indexed as
+  `CACHE_CAPS50[2*LM + stereo][band]`. `compute_band_caps(lm, stereo,
+  channels, bins_per_band, caps)` applies the §4.3.3 conversion
+  `cap = (cache.caps[i] + 64) * channels * N / 4` (RFC 6716 line
+  6310), with i16 saturation in the unlikely overflow corner and
+  defensive rejection of `lm > 3` / `channels ∉ {1,2}` / length
+  mismatches. `decode_band_boosts(dec, start, end, bins_per_band,
+  caps, total_bits)` runs the §4.3.3 dynalloc loop (RFC 6716 lines
+  6339–6360) literally: per-band quanta `min(8*N, max(48, N))`,
+  starting `dynalloc_logp = 6` falling to `1` mid-band on the first
+  accepted boost and stepping down at-most one notch per
+  boosted-band (clamped at the §4.3.3 floor of 2), with the §4.3.3
+  loop guard `tell + dynalloc_loop_logp < total_bits + total_boost
+  && boost < cap[band]`. `BoostResult { boost, total_boost,
+  total_bits_remaining }` packages the per-band boosts plus the
+  `total_boost` accumulator the §4.3.3 alloc-trim gate consumes
+  (`ec_tell_frac() + 48 <= total_bits - total_boost`). The §4.3.3
+  "at very low rates ... inner loop may not run even once" path is
+  exercised explicitly (`total_bits` below the initial guard ⇒ zero
+  boosts emitted, range decoder untouched). Closes the
+  `cache_caps50` docs-gap blocker previously flagged in
+  `bit_allocation` module docs.
+
+  9 new unit tests pin: `CACHE_CAPS50` layout (8 rows × 21 bands)
+  matches the staged CSV with spot-checks at corners (rows 0/7,
+  bands 0/8/20); `compute_band_caps` applies the §4.3.3
+  `(cache+64)*ch*N/4` formula bit-exactly at LM=2 mono; stereo
+  correctly doubles via `channels` for both low-band (cache=224) and
+  mid-band (cache=240) rows; malformed inputs (LM>3, channels∉{1,2},
+  length mismatch, caps > NUM_BANDS) cleanly return false; the
+  band-boost low-rate path emits zero boosts and does not touch the
+  decoder; a one-biased stream (`0xFF` buffer) lands at least one
+  boost with sum equal to `total_boost`; the cap ceiling clamps a
+  band's boost to ≤ `cap[band]`; malformed inputs return None; and
+  the quanta formula `min(8*N, max(48, N))` divides per-band boosts
+  exactly for `N ∈ {1, 4, 6, 8, 16, 32, 64}` (expected quanta
+  `{8, 32, 48, 48, 48, 48, 64}`).
+
 * **Round-11 §4.3.4.5 Hadamard-transform primitives (2026-05-31):** the
   three pure helpers the §4.3.4.5 TF-resolution-change step needs once
   the per-band shape vectors come on-line. `walsh_hadamard_inplace`
