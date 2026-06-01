@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-01):** round-12. The bit-exact CELT/SILK range
+//! **Status (2026-06-02):** round-13. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -20,7 +20,13 @@
 //! the running budget. The §4.3.3 per-band cap[] machinery
 //! (`CACHE_CAPS50` table + `compute_band_caps`) and the §4.3.3
 //! band-boost dynalloc-logp loop (`decode_band_boosts`) are now wired
-//! up, closing the `cache_caps50` docs-gap blocker. The §4.3.4.5
+//! up, closing the `cache_caps50` docs-gap blocker. The §4.3.3
+//! initial-reservations budget walk
+//! (`compute_initial_reservations` → `InitialReservations`) chains
+//! the `total_initial` init + anti-collapse + skip + intensity +
+//! dual-stereo reservations into one call and synthesises the
+//! `BandAllocationGates` for the existing band-allocation decoder.
+//! The §4.3.4.5
 //! time-frequency change parameters (per-band `tf_change` + the gated
 //! global `tf_select` + the four TF-adjustment tables 60–63) plus the
 //! §4.3.4.5 Hadamard transform primitives (orthonormal radix-2 WHT in
@@ -50,6 +56,7 @@
 
 use oxideav_core::RuntimeContext;
 
+pub mod allocation_budget;
 pub mod band_cap;
 pub mod bit_allocation;
 pub mod coarse_energy;
@@ -62,6 +69,9 @@ pub mod range_decoder;
 pub mod spread;
 pub mod tf_change;
 
+pub use allocation_budget::{
+    compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
+};
 pub use band_cap::{compute_band_caps, decode_band_boosts, BoostResult, CACHE_CAPS50};
 pub use bit_allocation::{
     decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,

@@ -6,6 +6,73 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-13 §4.3.3 initial-reservations budget walk (2026-06-02):**
+  the chained §4.3.3 / clean-room narrative §2.5 budget walk that
+  takes `(frame_bytes, ec_tell_frac, is_transient, lm, stereo,
+  coded_bands)` and emits an `InitialReservations` carrier with the
+  `total_initial` budget, the four `*_rsv` 1/8-bit reservations
+  (anti-collapse, skip, intensity, dual-stereo), the running `total`
+  budget at the band-boost loop's entry point, and the threaded
+  `coded_bands` / `stereo` flags. `compute_initial_reservations` runs
+  the four §2.5 steps in fixed order: `total = frame_bytes*64 -
+  ec_tell_frac - 1`; `anti_collapse_rsv = 8` iff transient AND `LM >
+  1` AND `total >= (LM+2)*8`, with `total >= 0` clamp; `skip_rsv = 8`
+  iff `total > 8`; stereo intensity_rsv (via `LOG2_FRAC_TABLE`); and
+  `dual_stereo_rsv = 8` iff stereo AND `total > 8` after intensity.
+  `InitialReservations::gates_for_band_allocation(ec_tell_frac_now,
+  total_boost)` synthesises the `BandAllocationGates` the existing
+  `decode_band_allocation` orchestrator needs, including the §4.3.3
+  trim gate `ec_tell_frac() + 48 <= total_initial - total_boost`
+  that consumes the band-boost loop's `total_boost` accumulator.
+
+  Exposed at the crate root: `compute_initial_reservations`,
+  `InitialReservations`, `RSV_BIT_8TH = 8`, `RSV_INITIAL_SLACK_8TH =
+  1`. The walk is purely arithmetic — it does not consult the range
+  decoder, so a caller running its own step-by-step §4.3.3
+  accounting can drop this in without altering `ec_tell_frac()`
+  trajectory.
+
+  Defensive corners: `ec_tell_frac` larger than the raw frame budget
+  yields a negative `total_initial` and zero reservations across the
+  board; `lm > 3` saturates to `lm = 3` for the anti-collapse gate;
+  the i32 budget arithmetic uses an i64 multiply to keep a
+  pathological `frame_bytes` near `u32::MAX` from wrapping.
+
+  20 new unit tests pin: `RSV_BIT_8TH = 8` and `RSV_INITIAL_SLACK_8TH
+  = 1` constants; high-rate stereo 20 ms transient fires every
+  reservation (anti-collapse + skip + intensity = 36 + dual = 8); mono
+  transient fires anti-collapse + skip but never intensity or dual;
+  non-transient skips anti-collapse regardless of LM/budget; `LM ∈
+  {0, 1}` blocks the anti-collapse gate; the `total >= (LM+2)*8`
+  budget gate is exact at LM=2 (threshold 32, accepts `total =
+  32`, rejects `total = 31`); LM clamp at `lm > 3` saturates to 3;
+  the skip gate's `total > 8` boundary at LM=0 non-transient
+  (accepts `total = 9`, rejects `total = 8`); very-low-rate budget
+  (`total_initial = 5`) drops every reservation; intensity drops
+  when budget cannot cover `LOG2_FRAC_TABLE[21] = 36`; the
+  dual-stereo `> 8` boundary at LM=0 non-transient stereo 4-band
+  (accepts `total = 9`, rejects `total = 8`); the `total =
+  total_initial - total_reserved()` identity across a (frame,
+  tell, transient, lm, stereo, coded_bands) grid (skipping cases
+  where the anti-collapse clamp engaged); `ec_tell_frac` larger
+  than the frame budget gives all-zero reservations defensively;
+  `gates_for_band_allocation` fires every gate at low `ec_tell_frac`
+  and zero `total_boost`; a `total_boost` large enough to push the
+  trim RHS below `ec_tell_frac + 48` gates trim off (and only trim);
+  a mono frame gates intensity + dual off regardless of
+  `total_boost`; an intensity reservation dropped during the walk
+  (budget tight) gates intensity off in the band-allocation gates;
+  a dual reservation dropped (boundary case) gates dual off; and a
+  composition smoke test stitches the walk to a live
+  `RangeDecoder::tell_frac()` after a single decoded symbol.
+
+  No external library source consulted. Every step is transcribed
+  from the clean-room narrative at
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.5
+  (which paraphrases RFC 6716 §4.3.3) and from RFC 6716 §4.3.3
+  itself at `docs/audio/opus/rfc6716-opus.txt`. Lib test count 178 →
+  198 (+20).
+
 * **Round-12 §4.3.3 `cache_caps50` + band-boost decode (2026-06-01):**
   the §4.3.3 per-band maximum-allocation `cap[]` machinery and the
   matching band-boost dynalloc-logp loop. `CACHE_CAPS50: [[u8; 21]; 8]`

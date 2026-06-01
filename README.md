@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-01
+## Status — 2026-06-02
 
-**Round-12.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-13.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -15,6 +15,11 @@ stereo reservation helpers (`LOG2_FRAC_TABLE` lookup + `intensity_rsv`
 168-entry `CACHE_CAPS50` table + `compute_band_caps`) and the §4.3.3
 band-boost dynalloc-logp loop (`decode_band_boosts` →
 `BoostResult { boost, total_boost, total_bits_remaining }`), the
+§4.3.3 initial-reservations budget walk
+(`compute_initial_reservations` chains `total_initial` init,
+anti-collapse, skip, intensity, and dual-stereo reservations into
+one call and emits an `InitialReservations` carrier ready to feed
+the band-boost loop and the band-allocation orchestrator), the
 §4.3.4.5 time-frequency change parameters (per-band `tf_change` +
 the gated global `tf_select` + the four tabulated TF-adjustment
 tables 60–63), the §4.3.4.5 Hadamard transform primitives
@@ -28,10 +33,9 @@ filter response), and the §4.3.7.2 single-pole de-emphasis filter
 Laplace decoder + `e_prob_model` table remain queued for a future
 round (numeric CSV is now staged at
 `docs/audio/celt/tables/e_prob_model.csv` so the work is no longer
-docs-gap-blocked). The full §4.3.3 budget walk (`total_bits`
-initialization from `ec_tell_frac()` + anti-collapse / skip
-reservations chaining into the existing `reserve_stereo`) and the
-band-decode / PVQ / MDCT paths still come later.
+docs-gap-blocked). The Table-57 static-allocation search, the
+per-band minimum / trim-offset machinery, the reallocation loop,
+and the band-decode / PVQ / MDCT paths still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -124,6 +128,42 @@ Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
   every gated-off field. The orchestrator does not touch the
   range decoder for gated-off fields, so caller-side
   `ec_tell_frac()` accounting stays accurate.
+
+Initial reservations budget walk (RFC 6716 §4.3.3 + clean-room
+narrative §2.5):
+
+* `RSV_BIT_8TH = 8` (1 bit = 8 1/8-bits) — the quantum for each of
+  the three binary reservations (`anti_collapse_rsv`, `skip_rsv`,
+  `dual_stereo_rsv`).
+* `RSV_INITIAL_SLACK_8TH = 1` — the conservative slack subtracted
+  from the raw frame-size budget at the start of the §2.5 walk.
+* `compute_initial_reservations(frame_bytes, ec_tell_frac,
+  is_transient, lm, stereo, coded_bands) -> InitialReservations`
+  chains the §2.5 four-step reservation walk in one call:
+  1. `total_initial = frame_bytes * 64 - ec_tell_frac - 1` (frame
+     size in 1/8 bits, less the bits decoded so far, less the
+     conservative slack).
+  2. `anti_collapse_rsv = 8` iff transient AND `LM > 1` AND
+     `total >= (LM+2)*8`; clamp `total >= 0` afterwards.
+  3. `skip_rsv = 8` iff `total > 8` after anti-collapse.
+  4. Stereo intensity_rsv (via `LOG2_FRAC_TABLE`) + dual_stereo_rsv
+     (8 iff stereo and budget > 8 after intensity); mono frames
+     skip both.
+* `InitialReservations { total_initial, anti_collapse_rsv,
+  skip_rsv, intensity_rsv, dual_stereo_rsv, total, coded_bands,
+  stereo }` packages the running budget at the point the band-boost
+  loop should start (`total`) alongside every individual reservation
+  for caller cross-checks. `total_reserved()` returns the sum and
+  satisfies the identity `total = total_initial - total_reserved()`.
+* `InitialReservations::gates_for_band_allocation(ec_tell_frac_now,
+  total_boost) -> BandAllocationGates` synthesises the four-field
+  gate booleans `decode_band_allocation` needs:
+  - `trim_gated = ec_tell_frac_now + 48 <= total_initial - total_boost`.
+  - `skip_gated = (skip_rsv == 8)`.
+  - `intensity_gated = stereo AND intensity_rsv > 0`.
+  - `dual_gated = stereo AND dual_stereo_rsv == 8`.
+  The `total_boost` argument is supplied by the band-boost loop's
+  `BoostResult::total_boost` once it has run.
 
 Per-band caps and band boosts (RFC 6716 §4.3.3 + clean-room
 narrative §§2.2–2.3):
