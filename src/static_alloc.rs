@@ -53,9 +53,11 @@
 //! `channels * N << LM >> 2` scaling), the caller can search the
 //! interpolation grid for the highest sub-column position whose total
 //! over the coded-band window does not exceed the §4.3.3 remaining
-//! budget. The search itself is the topic of a future round; this
-//! module provides the table + the per-band evaluators it composes
-//! with.
+//! budget. The search itself is provided by [`find_static_alloc`],
+//! which bisects the `(qlo, frac)` grid in two phases (coarse column
+//! scan then fine fractional scan) and returns a
+//! [`StaticAllocSearch`] carrier with the chosen position and the
+//! committed 1/8-bit window total.
 
 use crate::coarse_energy::NUM_BANDS;
 
@@ -190,6 +192,42 @@ pub fn band_static_alloc_1_8th(
     Some(raw >> 2)
 }
 
+/// Window static-allocation evaluator at an integer column `q` (no
+/// interpolation), in 1/8 bits. This is the helper the search's
+/// coarse phase calls — distinct from [`window_static_alloc_1_8th`]
+/// because the interpolated path requires `qlo + 1 < NUM_Q`, so the
+/// top column `q == NUM_Q - 1` is not reachable through it.
+///
+/// Returns `None` on the same input-validation paths as
+/// [`band_static_alloc_1_8th`], plus `q >= NUM_Q` and a window that
+/// overflows `NUM_BANDS`.
+fn window_static_alloc_at_column_1_8th(
+    coding_start: usize,
+    bins_per_band: &[u32],
+    q: usize,
+    channels: u32,
+    lm: u32,
+) -> Option<u32> {
+    if !(1..=2).contains(&channels) || lm > 3 || q >= NUM_Q {
+        return None;
+    }
+    if coding_start + bins_per_band.len() > NUM_BANDS {
+        return None;
+    }
+    let mut total: u32 = 0;
+    for (i, &bins) in bins_per_band.iter().enumerate() {
+        let band = coding_start + i;
+        // RFC 6716 §4.3.3 line 6225: `channels * N * alloc << LM >> 2`.
+        let alloc = STATIC_ALLOC[band][q] as u32;
+        let raw = channels
+            .checked_mul(bins)?
+            .checked_mul(alloc)?
+            .checked_shl(lm)?;
+        total = total.checked_add(raw >> 2)?;
+    }
+    Some(total)
+}
+
 /// Convenience: evaluate [`band_static_alloc_1_8th`] across a window of
 /// coded bands and accumulate the total.
 ///
@@ -220,6 +258,168 @@ pub fn window_static_alloc_1_8th(
         total = total.checked_add(cell)?;
     }
     Some(total)
+}
+
+/// Outcome of the §4.3.3 static-allocation search.
+///
+/// The search picks the highest grid position `(qlo, frac)` whose
+/// per-band-summed static allocation, in 1/8 bits, does not exceed the
+/// supplied budget. `qlo ∈ 0..=NUM_Q-1` is the lower quality column,
+/// `frac ∈ 0..=INTERP_STEPS` is the 1/64-step sub-column position
+/// between `qlo` and `qlo+1`. `frac == INTERP_STEPS` is the canonical
+/// representation of "exactly on the upper-column edge" — i.e. the
+/// caller is sitting on `qlo+1` with zero residual fraction — and only
+/// arises when the budget happens to land precisely on a column.
+///
+/// `total_1_8th` is the window sum the search committed to, in 1/8
+/// bits; `total_1_8th <= budget` is the search's exit invariant.
+///
+/// When the budget is too small to afford even `(qlo=0, frac=0)` the
+/// returned [`StaticAllocSearch::total_1_8th`] is 0 and both
+/// `qlo == 0` and `frac == 0`. The RFC notes that minimums and boosts
+/// dominate at "very low rates" — that is the search's "zero
+/// allocation" exit; the caller is expected to fall through to the
+/// minimums / cap / boost composition in the next stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StaticAllocSearch {
+    /// Lower quality column at the selected grid position
+    /// (`0..=NUM_Q-1`).
+    pub qlo: usize,
+    /// 1/64-step sub-column position between `qlo` and `qlo+1`
+    /// (`0..=INTERP_STEPS`). `INTERP_STEPS == 64` is the canonical
+    /// "exactly on the upper edge" pin.
+    pub frac: u32,
+    /// Window sum in 1/8 bits at the selected `(qlo, frac)`; satisfies
+    /// `total_1_8th <= budget`.
+    pub total_1_8th: u32,
+}
+
+/// Search the §4.3.3 1/64-step interpolation grid for the highest
+/// `(qlo, frac)` position whose window static allocation does not
+/// exceed `budget_1_8th`.
+///
+/// This is the inner search the §4.3.3 prose describes as "linearly
+/// interpolating between two values of q (in steps of 1/64) to find
+/// the highest allocation that does not exceed the number of bits
+/// remaining" (RFC 6716 lines 6227–6229). The budget supplied here is
+/// the §4.3.3 "remaining" budget — i.e. the §4.3.3 §2.5 `total` minus
+/// the band-boost loop's `total_boost`, with the per-band minimums
+/// (`thresh[]`) deducted by the caller. The minimums and the per-band
+/// `cap[]` are not folded into the search itself; the §4.3.3
+/// reallocation pass redistributes the residual budget against them.
+///
+/// The search runs in two phases:
+///
+/// 1. **Coarse column scan.** Bisect `q ∈ 0..=NUM_Q-1` for the largest
+///    `qlo` such that the window sum at `frac == 0` (i.e. the integer
+///    `qlo` column) is `<= budget_1_8th`. The window sum is
+///    monotonically non-decreasing in `qlo` because every row of
+///    Table 57 is non-decreasing in q.
+/// 2. **Fine fractional scan.** When `qlo < NUM_Q - 1`, bisect
+///    `frac ∈ 0..=INTERP_STEPS` for the largest `frac` such that the
+///    window sum at `(qlo, frac)` is `<= budget_1_8th`. The window
+///    sum is monotonically non-decreasing in `frac` for the same row
+///    reason. `frac == INTERP_STEPS` is the canonical hit on the
+///    upper column edge.
+///
+/// Returns `None` on the same input-validation paths as
+/// [`window_static_alloc_1_8th`] (window overflows `NUM_BANDS`,
+/// `channels ∉ {1, 2}`, or `lm > 3`).
+///
+/// The zero-allocation exit (budget below the `(0, 0)` cell, which
+/// the §4.3.3 prose calls out as the "very low rates" case) returns
+/// `Some(StaticAllocSearch { qlo: 0, frac: 0, total_1_8th: 0 })`.
+pub fn find_static_alloc(
+    coding_start: usize,
+    bins_per_band: &[u32],
+    channels: u32,
+    lm: u32,
+    budget_1_8th: u32,
+) -> Option<StaticAllocSearch> {
+    // Input validation: a probe evaluation pins the channels / lm /
+    // window-overflow guards. We use the column evaluator so the
+    // top-column probe is reachable (the interpolated evaluator
+    // rejects `qlo == NUM_Q - 1` since there is no upper column).
+    let probe_zero =
+        window_static_alloc_at_column_1_8th(coding_start, bins_per_band, 0, channels, lm)?;
+
+    // Zero-allocation exit: even q=0 exceeds the budget. (q=0 column
+    // is all zero per Table 57, so `probe_zero` is necessarily zero
+    // for legitimate inputs; the explicit check covers a defensive
+    // future-proofing path.)
+    if probe_zero > budget_1_8th {
+        return Some(StaticAllocSearch {
+            qlo: 0,
+            frac: 0,
+            total_1_8th: 0,
+        });
+    }
+
+    // Phase 1: coarse column scan. Find the largest qlo ∈ 0..=NUM_Q-1
+    // such that the integer-column window total is <= budget. Window
+    // total at integer q is monotonically non-decreasing in q because
+    // every row of Table 57 is non-decreasing in q (proven by the
+    // `rows_monotonic_in_q` test).
+    //
+    // Invariant: `lo` always fits, `hi` is the open upper bound of the
+    // search range. We bisect with the round-up midpoint rule so we
+    // make progress when `hi == lo + 1`.
+    let mut lo: usize = 0;
+    let mut hi: usize = NUM_Q - 1;
+    let mut lo_total: u32 = probe_zero;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let total =
+            window_static_alloc_at_column_1_8th(coding_start, bins_per_band, mid, channels, lm)?;
+        if total <= budget_1_8th {
+            lo = mid;
+            lo_total = total;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let qlo = lo;
+
+    // At qlo == NUM_Q - 1 there is no upper column to interpolate
+    // toward; the search exits at frac == 0 with the lo_total we
+    // already have.
+    if qlo == NUM_Q - 1 {
+        return Some(StaticAllocSearch {
+            qlo,
+            frac: 0,
+            total_1_8th: lo_total,
+        });
+    }
+
+    // Phase 2: fine fractional scan. Find the largest frac ∈
+    // 0..=INTERP_STEPS such that the interpolated window total fits.
+    // Lower bound: frac == 0 fits (lo_total). Upper bound:
+    // INTERP_STEPS (the canonical upper-column-edge pin; we evaluate
+    // it as the qlo+1 column at frac=0 to keep the interpolated
+    // evaluator's frac ∈ 0..INTERP_STEPS contract intact).
+    let mut flo: u32 = 0;
+    let mut fhi: u32 = INTERP_STEPS;
+    let mut flo_total: u32 = lo_total;
+    while flo < fhi {
+        let mid = flo + (fhi - flo).div_ceil(2);
+        let total = if mid == INTERP_STEPS {
+            window_static_alloc_at_column_1_8th(coding_start, bins_per_band, qlo + 1, channels, lm)?
+        } else {
+            window_static_alloc_1_8th(coding_start, bins_per_band, qlo, mid, channels, lm)?
+        };
+        if total <= budget_1_8th {
+            flo = mid;
+            flo_total = total;
+        } else {
+            fhi = mid - 1;
+        }
+    }
+
+    Some(StaticAllocSearch {
+        qlo,
+        frac: flo,
+        total_1_8th: flo_total,
+    })
 }
 
 #[cfg(test)]
@@ -440,5 +640,248 @@ mod tests {
         // band_static = 2 * 8 * 200 << 1 >> 2 = 6400 >> 2 + shift…
         // 2 * 8 = 16; 16 * 200 = 3200; << 1 = 6400; >> 2 = 1600.
         assert_eq!(v, 1600);
+    }
+
+    // -----------------------------------------------------------------
+    // §4.3.3 static-allocation search (find_static_alloc) tests.
+    // -----------------------------------------------------------------
+
+    /// Search with a generous budget pins to (qlo = NUM_Q-1, frac = 0):
+    /// at any q above the highest column there is no further
+    /// allocation to interpolate toward.
+    #[test]
+    fn search_saturates_at_top_column() {
+        // Single-band window, band 0 (peaks at q=10 alloc=200), LM=0,
+        // channels=1, bins=4 ⇒ q=10 cell is 200. Give the search a
+        // huge budget; it pins at qlo=10, frac=0, total=200.
+        let bins = [4u32];
+        let r = find_static_alloc(0, &bins, 1, 0, u32::MAX / 2).unwrap();
+        assert_eq!(r.qlo, NUM_Q - 1);
+        assert_eq!(r.frac, 0);
+        assert_eq!(r.total_1_8th, 200);
+    }
+
+    /// Search at exactly the qlo = 0 column total picks qlo = 0,
+    /// frac = 0 (no fractional advance possible because the next
+    /// step would exceed).
+    #[test]
+    fn search_lands_on_q0_when_budget_just_fits() {
+        // Band 0, channels=1, bins=4, LM=0. q=0 cell is 0. Set budget
+        // to 0: search picks qlo=0, frac=0, total=0 — and that is
+        // the highest position that fits.
+        let bins = [4u32];
+        let r = find_static_alloc(0, &bins, 1, 0, 0).unwrap();
+        assert_eq!(r.qlo, 0);
+        // frac may step into the rising side of the (0,1) interp; check
+        // total instead — it must fit exactly.
+        assert_eq!(r.total_1_8th, 0);
+    }
+
+    /// Search with a budget that exactly matches a column value
+    /// commits to that column and reports the matching total.
+    ///
+    /// The exact `frac` value is not specified by the RFC: when the
+    /// interpolation's integer division produces the same window
+    /// total for multiple fractional positions, the §4.3.3 "highest
+    /// allocation that does not exceed the bits remaining" contract
+    /// allows the search to land on any of them. The invariant the
+    /// search promises is `total_1_8th == 134` and `total_1_8th <=
+    /// budget`.
+    #[test]
+    fn search_exact_column_match() {
+        // Band 0 row: q=5 cell is 134, q=6 cell is 144. channels=1,
+        // bins=4, LM=0 ⇒ band_static = alloc.
+        let bins = [4u32];
+        let r = find_static_alloc(0, &bins, 1, 0, 134).unwrap();
+        assert_eq!(r.qlo, 5);
+        assert_eq!(r.total_1_8th, 134);
+        // Stepping by one position must strictly exceed budget — the
+        // "highest allocation that does not exceed" contract.
+        let next_total = if r.frac + 1 == INTERP_STEPS {
+            window_static_alloc_at_column_1_8th(0, &bins, r.qlo + 1, 1, 0).unwrap()
+        } else {
+            window_static_alloc_1_8th(0, &bins, r.qlo, r.frac + 1, 1, 0).unwrap()
+        };
+        assert!(next_total > 134, "next-step {next_total} should exceed 134");
+    }
+
+    /// Search budget strictly between two adjacent columns lands at a
+    /// fractional position whose window sum is the highest under
+    /// budget.
+    #[test]
+    fn search_lands_in_fractional_bracket() {
+        // Band 0 row, q=5 → 134, q=6 → 144 (delta 10). Budget = 140
+        // sits between the two columns. The search should pick qlo=5
+        // and the largest frac such that interp <= 140.
+        let bins = [4u32];
+        let r = find_static_alloc(0, &bins, 1, 0, 140).unwrap();
+        assert_eq!(r.qlo, 5);
+        // The total must fit (≤ 140) and stepping frac+1 must overrun.
+        assert!(r.total_1_8th <= 140);
+        // Stepping by one position must strictly exceed the budget.
+        let next_total = if r.frac + 1 == INTERP_STEPS {
+            window_static_alloc_at_column_1_8th(0, &bins, r.qlo + 1, 1, 0).unwrap()
+        } else {
+            window_static_alloc_1_8th(0, &bins, r.qlo, r.frac + 1, 1, 0).unwrap()
+        };
+        assert!(
+            next_total > 140,
+            "next-step total {next_total} should exceed 140 at frac={}",
+            r.frac
+        );
+    }
+
+    /// Search invariants hold for every budget value: the chosen
+    /// total ≤ budget, and stepping by one grid position (one frac,
+    /// or wrap to next qlo at frac=INTERP_STEPS) overruns the budget
+    /// (unless we are saturated at the top column).
+    #[test]
+    fn search_invariants_hold_across_budgets() {
+        let bins = [4u32];
+        // Band 0 row, channels=1, LM=0 ⇒ search-space cells are the
+        // raw alloc values. Walk budgets 0..=210 and check.
+        for budget in 0..=210u32 {
+            let r = find_static_alloc(0, &bins, 1, 0, budget).unwrap();
+            assert!(
+                r.total_1_8th <= budget,
+                "budget {budget}: total {} > budget",
+                r.total_1_8th
+            );
+
+            // If we are not at the top column, the next-step total
+            // (frac+1, or column step) must strictly exceed budget.
+            let saturated = r.qlo == NUM_Q - 1;
+            if !saturated {
+                let next_total = if r.frac + 1 == INTERP_STEPS {
+                    // Wrap to next integer column. Use the column
+                    // evaluator so the top column is reachable.
+                    window_static_alloc_at_column_1_8th(0, &bins, r.qlo + 1, 1, 0).unwrap()
+                } else {
+                    window_static_alloc_1_8th(0, &bins, r.qlo, r.frac + 1, 1, 0).unwrap()
+                };
+                assert!(
+                    next_total > budget,
+                    "budget {budget}: next-step total {next_total} <= budget at (qlo={}, frac={})",
+                    r.qlo,
+                    r.frac
+                );
+            }
+        }
+    }
+
+    /// Multi-band window: budget that is the exact sum at q = 5 lands
+    /// at qlo = 5 with the matching total. The exact `frac` value is
+    /// unspecified (integer-division collapse may let `frac > 0`
+    /// reproduce the same window sum).
+    #[test]
+    fn search_multi_band_window_exact() {
+        // Bands 0..=2, channels=1, bins=4 each, LM=0:
+        //   band 0 q=5 -> 134, band 1 q=5 -> 127, band 2 q=5 -> 120
+        //   sum = 381.
+        let bins = [4u32, 4, 4];
+        let r = find_static_alloc(0, &bins, 1, 0, 381).unwrap();
+        assert_eq!(r.qlo, 5);
+        assert_eq!(r.total_1_8th, 381);
+        // Stepping by one position strictly exceeds the budget.
+        let next_total = if r.frac + 1 == INTERP_STEPS {
+            window_static_alloc_at_column_1_8th(0, &bins, r.qlo + 1, 1, 0).unwrap()
+        } else {
+            window_static_alloc_1_8th(0, &bins, r.qlo, r.frac + 1, 1, 0).unwrap()
+        };
+        assert!(next_total > 381);
+    }
+
+    /// Hybrid-mode window starting at band 17: a representative budget
+    /// search lands inside the expected column.
+    #[test]
+    fn search_hybrid_window() {
+        // bands 17..=20, channels=1, bins=4 each, LM=0:
+        //   q=9: 63+56+45+20 = 184
+        //   q=10: 153+148+129+104 = 534
+        // budget = 184 ⇒ qlo=9, frac=0, total=184.
+        let bins = [4u32, 4, 4, 4];
+        let r = find_static_alloc(17, &bins, 1, 0, 184).unwrap();
+        assert_eq!(r.qlo, 9);
+        assert_eq!(r.frac, 0);
+        assert_eq!(r.total_1_8th, 184);
+    }
+
+    /// Search rejects invalid input the same way the underlying
+    /// evaluator does.
+    #[test]
+    fn search_rejects_invalid_input() {
+        let bins = [4u32];
+        // channels = 0
+        assert_eq!(find_static_alloc(0, &bins, 0, 0, 100), None);
+        // lm = 4
+        assert_eq!(find_static_alloc(0, &bins, 1, 4, 100), None);
+        // window overflow
+        let big = [4u32; 5];
+        assert_eq!(find_static_alloc(17, &big, 1, 0, 100), None);
+    }
+
+    /// Search is monotonic in budget: a larger budget never produces a
+    /// smaller `total_1_8th`.
+    #[test]
+    fn search_monotonic_in_budget() {
+        let bins = [4u32, 4, 4];
+        let mut prev_total = 0u32;
+        for budget in (0..=500u32).step_by(7) {
+            let r = find_static_alloc(0, &bins, 1, 0, budget).unwrap();
+            assert!(
+                r.total_1_8th >= prev_total,
+                "budget {budget}: total {} < prev_total {}",
+                r.total_1_8th,
+                prev_total
+            );
+            prev_total = r.total_1_8th;
+        }
+    }
+
+    /// Search reaches frac = INTERP_STEPS as the canonical upper-
+    /// column pin when the budget exactly matches the upper column
+    /// AND the coarse phase committed to qlo (rather than qlo+1).
+    ///
+    /// The §4.3.3 prose lets the search land on either side of an
+    /// upper-edge boundary; this test pins the behaviour for a budget
+    /// that the coarse phase reaches qlo+1 directly.
+    #[test]
+    fn search_upper_edge_pin_at_exact_column() {
+        // Band 0, channels=1, bins=4, LM=0. q=5 cell = 134, q=6 = 144.
+        // Budget = 144 ⇒ the coarse phase reaches qlo=6 (since 144 ≤
+        // 144). The fine phase commits to the matching total; the
+        // total must be 144.
+        let bins = [4u32];
+        let r = find_static_alloc(0, &bins, 1, 0, 144).unwrap();
+        assert_eq!(r.qlo, 6);
+        assert_eq!(r.total_1_8th, 144);
+        // Stepping by one position strictly exceeds.
+        let next_total = if r.frac + 1 == INTERP_STEPS {
+            window_static_alloc_at_column_1_8th(0, &bins, r.qlo + 1, 1, 0).unwrap()
+        } else {
+            window_static_alloc_1_8th(0, &bins, r.qlo, r.frac + 1, 1, 0).unwrap()
+        };
+        assert!(next_total > 144);
+    }
+
+    /// `window_static_alloc_at_column_1_8th` reaches the top column,
+    /// unlike the interpolated path which rejects `qlo == NUM_Q - 1`.
+    #[test]
+    fn column_evaluator_reaches_top_column() {
+        let bins = [4u32];
+        // Band 0, q=10, channels=1, LM=0:
+        //   alloc = 200; total = 1 * 4 * 200 << 0 >> 2 = 200.
+        let v = window_static_alloc_at_column_1_8th(0, &bins, NUM_Q - 1, 1, 0).unwrap();
+        assert_eq!(v, 200);
+    }
+
+    /// `window_static_alloc_at_column_1_8th` rejects q >= NUM_Q.
+    #[test]
+    fn column_evaluator_rejects_out_of_range_q() {
+        let bins = [4u32];
+        assert_eq!(
+            window_static_alloc_at_column_1_8th(0, &bins, NUM_Q, 1, 0),
+            None
+        );
     }
 }

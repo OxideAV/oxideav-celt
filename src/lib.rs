@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-03):** round-15. The bit-exact CELT/SILK range
+//! **Status (2026-06-04):** round-16. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -49,10 +49,14 @@
 //! `band_static_alloc_1_8th` (the `channels * N * alloc << LM >> 2`
 //! formula folded with the 1/64-step linear interpolation between
 //! adjacent quality columns) and the `window_static_alloc_1_8th`
-//! window sum the static-allocation search driver composes with.
-//! The Table 57 static-allocation search itself, the reallocation
-//! loop, the fine-energy / shape split, band decode, PVQ, and MDCT
-//! machinery still come later.
+//! window sum the static-allocation search driver composes with. The
+//! §4.3.3 inner static-allocation search (`find_static_alloc` →
+//! `StaticAllocSearch { qlo, frac, total_1_8th }`) bisects the 1/64-
+//! step interpolation grid for the highest `(qlo, frac)` whose window
+//! total in 1/8 bits does not exceed the supplied "remaining" budget.
+//! The reallocation loop (concurrent skip decoding), the fine-energy
+//! / shape split, band decode, PVQ, and MDCT machinery still come
+//! later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -123,8 +127,8 @@ pub use spread::{
     DEFAULT_SPREAD,
 };
 pub use static_alloc::{
-    band_static_alloc_1_8th, interp_alloc_1_32nd, window_static_alloc_1_8th, INTERP_STEPS, NUM_Q,
-    STATIC_ALLOC,
+    band_static_alloc_1_8th, find_static_alloc, interp_alloc_1_32nd, window_static_alloc_1_8th,
+    StaticAllocSearch, INTERP_STEPS, NUM_Q, STATIC_ALLOC,
 };
 pub use tf_change::{
     decode_tf_changes, decode_tf_parameters, decode_tf_select, tf_adjustment, tf_select_matters,

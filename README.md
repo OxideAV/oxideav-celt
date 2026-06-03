@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-03
+## Status — 2026-06-04
 
-**Round-15.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-16.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -43,10 +43,18 @@ cites), and the §4.3.3 Table 57 static-allocation matrix
 `band_static_alloc_1_8th` (the `channels * N * alloc << LM >> 2`
 formula folded with the 1/64-step linear interpolation between
 adjacent quality columns) and the `window_static_alloc_1_8th` window
-sum used by the static-allocation search driver are now wired up.
-The Table-57 static-allocation search itself, the reallocation loop,
-the fine-energy / shape split, and the band-decode / PVQ / MDCT
-paths still come later.
+sum used by the static-allocation search driver, and the §4.3.3
+inner static-allocation search (`find_static_alloc` →
+`StaticAllocSearch { qlo, frac, total_1_8th }` — bisects the 1/64-
+step interpolation grid for the highest grid position whose window
+total fits the remaining 1/8-bit budget) are now wired up.
+The §4.3.3 inner static-allocation search (`find_static_alloc` →
+`StaticAllocSearch { qlo, frac, total_1_8th }`) bisects the 1/64-
+step interpolation grid for the highest `(qlo, frac)` whose window
+total in 1/8 bits does not exceed the supplied "remaining" budget.
+The reallocation loop (concurrent skip decoding), the fine-energy
+/ shape split, and the band-decode / PVQ / MDCT paths still come
+later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -409,6 +417,22 @@ Static allocation table (RFC 6716 §4.3.3, Table 57):
   (the §4.3.3 "highest allocation that does not exceed the bits
   remaining" inner search composes by calling this for increasing
   `(qlo, frac)` until the budget is exceeded).
+* `find_static_alloc(coding_start, bins_per_band, channels, lm,
+  budget_1_8th) -> Option<StaticAllocSearch>` runs the §4.3.3 inner
+  search. Bisects in two phases — a coarse column scan over
+  `q ∈ 0..=NUM_Q-1` for the largest `qlo` whose integer-column
+  window total fits the budget, then a fine fractional scan over
+  `frac ∈ 0..=INTERP_STEPS` for the highest sub-column position
+  whose interpolated window total fits. Returns
+  `StaticAllocSearch { qlo, frac, total_1_8th }` with `total_1_8th
+  <= budget_1_8th` and (away from saturation) stepping by one grid
+  position strictly exceeds the budget. The §4.3.3 "very low rates"
+  zero-allocation exit returns
+  `StaticAllocSearch { qlo: 0, frac: 0, total_1_8th: 0 }`. The
+  canonical upper-column-edge pin (`frac == INTERP_STEPS`) is
+  evaluated as `qlo+1` at frac=0 so the interpolated evaluator's
+  `frac ∈ 0..INTERP_STEPS` contract stays intact and the top column
+  (`qlo == NUM_Q - 1`) is reachable.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.

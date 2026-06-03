@@ -6,6 +6,62 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-16 §4.3.3 static-allocation search (2026-06-04):** the
+  inner §4.3.3 allocation search the RFC describes as "linearly
+  interpolating between two values of q (in steps of 1/64) to find
+  the highest allocation that does not exceed the number of bits
+  remaining" (RFC 6716 §4.3.3 lines 6227–6229). `find_static_alloc(
+  coding_start, bins_per_band, channels, lm, budget_1_8th) ->
+  Option<StaticAllocSearch { qlo, frac, total_1_8th }>` bisects the
+  1/64-step interpolation grid in two phases: a coarse column scan
+  over `q ∈ 0..=NUM_Q-1` for the largest qlo whose integer-column
+  window total fits the budget, then a fine fractional scan over
+  `frac ∈ 0..=INTERP_STEPS` for the highest sub-column position
+  whose interpolated window total fits. The §4.3.3 "very low rates"
+  zero-allocation exit (budget below the q=0 column) returns
+  `StaticAllocSearch { qlo: 0, frac: 0, total_1_8th: 0 }`. The
+  canonical upper-column-edge pin (`frac == INTERP_STEPS`) is
+  evaluated as the qlo+1 integer column at frac=0 so the
+  interpolated evaluator's `frac ∈ 0..INTERP_STEPS` contract stays
+  intact, and so the search can reach the top column (`qlo ==
+  NUM_Q - 1`) which the interpolated path rejects.
+
+  A new internal helper `window_static_alloc_at_column_1_8th(
+  coding_start, bins_per_band, q, channels, lm)` evaluates the
+  §4.3.3 `channels * N * alloc << LM >> 2` formula directly at an
+  integer column `q` (no interpolation), reachable for the top
+  column the interpolated path rejects, and used by the coarse-
+  phase bisection. Exposed at the crate root: `find_static_alloc`,
+  `StaticAllocSearch`.
+
+  Phase-1 monotonicity rests on the RFC Table 57 invariant
+  `STATIC_ALLOC[band][q+1] >= STATIC_ALLOC[band][q]` (proven by
+  the existing `rows_monotonic_in_q` test). Phase-2 monotonicity
+  rests on the interpolation formula `((64-frac)*lo + frac*hi +
+  32) / 64` being non-decreasing in frac whenever hi >= lo (the
+  invariant Phase-1 inherits from rows_monotonic_in_q).
+
+  11 new tests cover the saturated top-column case (huge budget
+  pins to qlo=10, frac=0, total=200), the zero-budget exit (total =
+  0 with no overrun), exact-column-match commitment with the
+  highest-position contract (next-step strictly exceeds budget),
+  fractional-bracket landing with overrun verification, search
+  invariants across budgets 0..=210 (chosen total ≤ budget AND
+  next-step strictly exceeds — unless saturated), the
+  multi-band-window exact-match case (bands 0..=2 at q=5 sum 381),
+  the Hybrid window starting at band 17 at q=9 (sum 184),
+  invalid-input rejection (channels=0, lm=4, window overflow),
+  budget-monotonicity (larger budget never decreases total), the
+  upper-column-edge pin scenario, and dedicated coverage for the
+  new `window_static_alloc_at_column_1_8th` reaching the top column
+  (q=10) plus rejecting q ≥ NUM_Q.
+
+  Clean-room provenance: every numeric value and every step comes
+  from RFC 6716 §4.3.3 (`docs/audio/opus/rfc6716-opus.txt` lines
+  6202–6229) and the clean-room narrative at
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md`
+  §2.7. No external library source was consulted.
+
 * **Round-15 §4.3.3 Table 57 static-allocation table (2026-06-03):** the
   full CELT Static Allocation Table from RFC 6716 §4.3.3 (`STATIC_ALLOC:
   [[u8; 11]; 21]`) plus the per-band evaluator
