@@ -6,6 +6,35 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-15 §4.3.3 Table 57 static-allocation table (2026-06-03):** the
+  full CELT Static Allocation Table from RFC 6716 §4.3.3 (`STATIC_ALLOC:
+  [[u8; 11]; 21]`) plus the per-band evaluator
+  `band_static_alloc_1_8th(band, qlo, frac, channels, bins_per_channel,
+  lm)` that folds the §4.3.3 formula `channels * N * alloc[band][q] <<
+  LM >> 2` with the 1/64-step linear interpolation between adjacent
+  quality columns. Companion `interp_alloc_1_32nd(band, qlo, frac)`
+  exposes the interpolated 1/32-bit-per-bin coefficient on its own (so
+  callers can compose it with non-default scaling). `window_static_
+  alloc_1_8th(coding_start, bins_per_band, qlo, frac, channels, lm)`
+  sums across a coded-band window for the static-allocation search
+  driver. Table 57 is transcribed verbatim from the RFC body
+  (`docs/audio/opus/rfc6716-opus.txt` lines 6234–6286) — unlike
+  `e_prob_model` / `cache_caps50` / `LOG2_FRAC_TABLE`, the §4.3.3
+  static-allocation matrix lives entirely inside the RFC, so no
+  staging round was needed. Exposed at the crate root: `STATIC_ALLOC`,
+  `NUM_Q = 11`, `INTERP_STEPS = 64`, `interp_alloc_1_32nd`,
+  `band_static_alloc_1_8th`, `window_static_alloc_1_8th`. 13 new
+  tests cover the table shape (21 × 11), the q=0 all-zero column, the
+  q=10 endpoints (200 saturation through band 7, then descending to
+  104 at band 20), per-row monotonicity in q, interp anchor (frac=0
+  recovers lower column) + bracket inclusion + monotonic frac (when
+  the row is rising), the §4.3.3 hand-checked evaluations at
+  (band 0, q=5, channels=1, N=4, LM=0) and stereo / LM=1 doublings,
+  out-of-range rejection on channels / lm / band / qlo / frac, window
+  sum over two adjacent bands and over the four-band Hybrid window at
+  q=9 (cells 63, 56, 45, 20), and the interp half-step rounding
+  constants.
+
 * **Round-14 §4.3.3 §2.6 minimums + trim_offsets + Table 55 (2026-06-03):**
   the per-band hard-minimum shape allocation `compute_thresh` and the
   per-band trim-derived offset `compute_trim_offsets` (RFC 6716 §4.3.3

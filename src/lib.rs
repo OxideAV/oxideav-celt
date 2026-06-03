@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-03):** round-14. The bit-exact CELT/SILK range
+//! **Status (2026-06-03):** round-15. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -43,9 +43,16 @@
 //! shapes (three §4.3.7.1 tapsets in f32 + Q15) plus gain
 //! reconstruction and per-sample / slice filter response, and the
 //! §4.3.7.2 single-pole de-emphasis filter (`α_p = 0.8500061035`),
-//! are now wired up. The Table 57 static-allocation search, the
-//! reallocation loop, the fine-energy / shape split, band decode,
-//! PVQ, and MDCT machinery still come later.
+//! are now wired up. The §4.3.3 Table 57 CELT Static Allocation
+//! Table (`STATIC_ALLOC[21][11]`) is transcribed verbatim from the
+//! RFC body, alongside the per-band evaluator
+//! `band_static_alloc_1_8th` (the `channels * N * alloc << LM >> 2`
+//! formula folded with the 1/64-step linear interpolation between
+//! adjacent quality columns) and the `window_static_alloc_1_8th`
+//! window sum the static-allocation search driver composes with.
+//! The Table 57 static-allocation search itself, the reallocation
+//! loop, the fine-energy / shape split, band decode, PVQ, and MDCT
+//! machinery still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -75,6 +82,7 @@ pub mod hadamard;
 pub mod post_filter;
 pub mod range_decoder;
 pub mod spread;
+pub mod static_alloc;
 pub mod tf_change;
 
 pub use allocation_budget::{
@@ -113,6 +121,10 @@ pub use range_decoder::RangeDecoder;
 pub use spread::{
     decode_spread, pre_rotation_stride, rotation_gain_ratio, rotation_gain_squared_ratio, Spread,
     DEFAULT_SPREAD,
+};
+pub use static_alloc::{
+    band_static_alloc_1_8th, interp_alloc_1_32nd, window_static_alloc_1_8th, INTERP_STEPS, NUM_Q,
+    STATIC_ALLOC,
 };
 pub use tf_change::{
     decode_tf_changes, decode_tf_parameters, decode_tf_select, tf_adjustment, tf_select_matters,

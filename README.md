@@ -4,7 +4,7 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-06-03
 
-**Round-14.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-15.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -38,9 +38,15 @@ allocation (`compute_thresh`) and the per-band `trim_offsets[]`
 derivation (`compute_trim_offsets`) are now wired up, alongside the
 full §4.3 Table 55 MDCT-bin layout (`BAND_BINS_LM` for all four LM
 values + `SHORT_FRAME_BAND_BINS` for the LM=0 column the §2.6 prose
-cites). The Table-57 static-allocation search, the reallocation
-loop, the fine-energy / shape split, and the band-decode / PVQ /
-MDCT paths still come later.
+cites), and the §4.3.3 Table 57 static-allocation matrix
+(`STATIC_ALLOC[band][q]`, 21 × 11) with the §4.3.3 per-band evaluator
+`band_static_alloc_1_8th` (the `channels * N * alloc << LM >> 2`
+formula folded with the 1/64-step linear interpolation between
+adjacent quality columns) and the `window_static_alloc_1_8th` window
+sum used by the static-allocation search driver are now wired up.
+The Table-57 static-allocation search itself, the reallocation loop,
+the fine-energy / shape split, and the band-decode / PVQ / MDCT
+paths still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -377,6 +383,32 @@ Per-band minimum + trim-offset helpers (RFC 6716 §4.3.3 §2.6, lines
   window picks up the correct LM=0 reference cell.
 * `EIGHTH_BIT_QUANTUM = 8`, `NUM_LM = 4` constants pin the unit
   and row count.
+
+Static allocation table (RFC 6716 §4.3.3, Table 57):
+
+* `STATIC_ALLOC: [[u8; 11]; 21]` — the CELT Static Allocation Table
+  transcribed verbatim from RFC 6716 §4.3.3 (`docs/audio/opus/
+  rfc6716-opus.txt` lines 6234–6286). Indexed `STATIC_ALLOC[band][q]`;
+  units are 1/32 bit per MDCT bin. `band ∈ 0..21`, `q ∈ 0..11`.
+* `NUM_Q = 11`, `INTERP_STEPS = 64` pin the quality-column count and
+  the 1/64-step interpolation grid.
+* `interp_alloc_1_32nd(band, qlo, frac) -> Option<u32>` returns the
+  per-band interpolated 1/32-bit-per-bin coefficient at sub-column
+  position `frac ∈ 0..=63` between adjacent quality columns `qlo`
+  and `qlo + 1` (RFC 6716 §4.3.3 lines 6227–6229; round-to-nearest
+  with a 32-half-bit additive constant).
+* `band_static_alloc_1_8th(band, qlo, frac, channels, bins_per_channel,
+  lm) -> Option<u32>` folds in the §4.3.3 `channels * N * alloc <<
+  LM >> 2` scaling, returning the per-band static allocation in 1/8
+  bits. Rejects `channels ∉ {1, 2}` / `lm > 3` and saturates
+  defensively against `u32` overflow on the multiply (the legitimate
+  range is well inside `u32`).
+* `window_static_alloc_1_8th(coding_start, bins_per_band, qlo, frac,
+  channels, lm) -> Option<u32>` sums the per-band static allocation
+  across a coded-band window for the static-allocation search driver
+  (the §4.3.3 "highest allocation that does not exceed the bits
+  remaining" inner search composes by calling this for increasing
+  `(qlo, frac)` until the budget is exceeded).
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
