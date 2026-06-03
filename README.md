@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-02
+## Status — 2026-06-03
 
-**Round-13.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-14.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -33,9 +33,14 @@ filter response), and the §4.3.7.2 single-pole de-emphasis filter
 Laplace decoder + `e_prob_model` table remain queued for a future
 round (numeric CSV is now staged at
 `docs/audio/celt/tables/e_prob_model.csv` so the work is no longer
-docs-gap-blocked). The Table-57 static-allocation search, the
-per-band minimum / trim-offset machinery, the reallocation loop,
-and the band-decode / PVQ / MDCT paths still come later.
+docs-gap-blocked). The §4.3.3 §2.6 per-band hard-minimum shape
+allocation (`compute_thresh`) and the per-band `trim_offsets[]`
+derivation (`compute_trim_offsets`) are now wired up, alongside the
+full §4.3 Table 55 MDCT-bin layout (`BAND_BINS_LM` for all four LM
+values + `SHORT_FRAME_BAND_BINS` for the LM=0 column the §2.6 prose
+cites). The Table-57 static-allocation search, the reallocation
+loop, the fine-energy / shape split, and the band-decode / PVQ /
+MDCT paths still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -344,6 +349,34 @@ De-emphasis (RFC 6716 §4.3.7.2):
   reset.
 * `deemphasize_in_place_f32(out, y_prev) -> y_prev_next` —
   one-shot convenience wrapper.
+
+Per-band minimum + trim-offset helpers (RFC 6716 §4.3.3 §2.6, lines
+6431–6460):
+
+* `BAND_BINS_LM: [[u32; 21]; 4]` — RFC 6716 §4.3 Table 55 — the
+  per-channel MDCT-bin count for every band at every CELT frame
+  size (`LM = 0..=3` for 2.5/5/10/20 ms). Each row sums to
+  `100 << LM` (the 0–20 kHz coded range); the underlying MDCT
+  has `120 << LM` bins per channel.
+* `SHORT_FRAME_BAND_BINS: [u32; 21]` — the LM = 0 column of
+  `BAND_BINS_LM`, exposed as a stand-alone constant because the
+  §2.6 prose explicitly cites "the number of MDCT bins in the
+  shortest frame size for this mode" in the `trim_offsets`
+  derivation.
+* `compute_thresh(channels, bins_per_band, out) -> bool` — the
+  §4.3.3 hard-minimum per-band shape allocation, in 1/8 bit units:
+  `max((24 * N[band]) / 16, 8 * channels)`. Works over the
+  caller-supplied coded-band window so Hybrid mode (bands 17..=20)
+  composes the same way as pure CELT (bands 0..=20).
+* `compute_trim_offsets(alloc_trim, lm, channels, coding_start,
+  bins_per_band, out) -> bool` — the §4.3.3 per-band trim-derived
+  offset, in 1/8 bit units, including the width-1 (single-bin-per-
+  channel) downward adjustment that diminishes the allocation by
+  one bit. The "absolute band index" used to index
+  `SHORT_FRAME_BAND_BINS` is `coding_start + i` so the Hybrid
+  window picks up the correct LM=0 reference cell.
+* `EIGHTH_BIT_QUANTUM = 8`, `NUM_LM = 4` constants pin the unit
+  and row count.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.

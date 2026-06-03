@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-02):** round-13. The bit-exact CELT/SILK range
+//! **Status (2026-06-03):** round-14. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -26,6 +26,12 @@
 //! the `total_initial` init + anti-collapse + skip + intensity +
 //! dual-stereo reservations into one call and synthesises the
 //! `BandAllocationGates` for the existing band-allocation decoder.
+//! The §4.3.3 §2.6 per-band hard-minimum shape allocation
+//! (`compute_thresh`) and the per-band `trim_offsets[]` derivation
+//! (`compute_trim_offsets`) are now wired up, alongside the
+//! §4.3 Table 55 MDCT-bin layout (`BAND_BINS_LM` for all four LM
+//! values + `SHORT_FRAME_BAND_BINS` for the LM=0 column the §2.6 prose
+//! cites).
 //! The §4.3.4.5
 //! time-frequency change parameters (per-band `tf_change` + the gated
 //! global `tf_select` + the four TF-adjustment tables 60–63) plus the
@@ -37,8 +43,9 @@
 //! shapes (three §4.3.7.1 tapsets in f32 + Q15) plus gain
 //! reconstruction and per-sample / slice filter response, and the
 //! §4.3.7.2 single-pole de-emphasis filter (`α_p = 0.8500061035`),
-//! are now wired up. The full §4.3.3 budget walk, band decode, PVQ,
-//! and MDCT machinery still come later.
+//! are now wired up. The Table 57 static-allocation search, the
+//! reallocation loop, the fine-energy / shape split, band decode,
+//! PVQ, and MDCT machinery still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -58,6 +65,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod allocation_budget;
 pub mod band_cap;
+pub mod band_minimums;
 pub mod bit_allocation;
 pub mod coarse_energy;
 pub mod deemphasis;
@@ -73,6 +81,10 @@ pub use allocation_budget::{
     compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
 };
 pub use band_cap::{compute_band_caps, decode_band_boosts, BoostResult, CACHE_CAPS50};
+pub use band_minimums::{
+    compute_thresh, compute_trim_offsets, BAND_BINS_LM, EIGHTH_BIT_QUANTUM, NUM_LM,
+    SHORT_FRAME_BAND_BINS,
+};
 pub use bit_allocation::{
     decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,
     decode_skip_flag, intensity_rsv, reserve_stereo, BandAllocation, BandAllocationGates,

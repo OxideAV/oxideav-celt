@@ -6,6 +6,50 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-14 §4.3.3 §2.6 minimums + trim_offsets + Table 55 (2026-06-03):**
+  the per-band hard-minimum shape allocation `compute_thresh` and the
+  per-band trim-derived offset `compute_trim_offsets` (RFC 6716 §4.3.3
+  lines 6431–6460), plus the full §4.3 Table 55 MDCT-bin layout as
+  `BAND_BINS_LM[lm][band]` (`[[u32; 21]; 4]`, indexed by `LM ∈ 0..=3`
+  and band `0..=20`) and the `SHORT_FRAME_BAND_BINS` LM=0 column the
+  §2.6 trim_offsets prose explicitly cites. The §2.6 hard-minimum is
+  `thresh[band] = max((24 * N[band]) / 16, 8 * channels)` in 1/8-bit
+  units, the lower bound being "one bit per channel" and the bin term
+  being "48 128th bits per MDCT bin". The §2.6 trim_offset for the
+  i-th coded band is `((alloc_trim - 5 - LM) * channels *
+  SHORT_FRAME_BAND_BINS[coding_start + i] * (window_len - i) *
+  (1 << LM) * 8) / 64`, then `-= 8 * channels` when the band has only
+  one MDCT bin per channel — the §2.6 prose "width 1 bands receive
+  greater benefit from the coarse energy coding" downward adjustment.
+
+  Both helpers operate on the caller-supplied coded-band window
+  (`bins_per_band.len() == coding_end - coding_start`); the absolute
+  band index used to index `SHORT_FRAME_BAND_BINS` is
+  `coding_start + i`, so Hybrid mode (`coding_start = 17`) picks up
+  the correct LM=0 reference cells (the §4.3 / §2.6 distinction
+  between window-relative and absolute band index that the §2.6
+  prose glosses over).
+
+  Exposed at the crate root: `compute_thresh`, `compute_trim_offsets`,
+  `BAND_BINS_LM`, `SHORT_FRAME_BAND_BINS`, `EIGHTH_BIT_QUANTUM = 8`,
+  `NUM_LM = 4`. 16 new tests cover Table 55 row sums (`100 << lm`),
+  the per-LM doubling pattern, Table 55 spot checks at every regime
+  boundary (1-bin / 2-bin / 4-bin / 6-bin / 8-bin / 12-bin / 18-bin /
+  22-bin bands), `compute_thresh` mono + stereo lower-bound vs
+  bin-term regime splits at LM=0 + LM=3, `compute_trim_offsets`
+  default-trim (alloc_trim=5) zero-offset + width-1 adjustments mono
+  + stereo, `compute_trim_offsets` worked examples at alloc_trim=10
+  mono LM=0, symmetry around alloc_trim=5, Hybrid window
+  (coding_start=17) absolute-index lookups, and invalid-input
+  rejection across alloc_trim, lm, channels, window over-run, and
+  length-mismatch corners.
+
+  Clean-room provenance: every numeric value and every formula comes
+  from RFC 6716 §4.3 / §4.3.3 (`docs/audio/opus/rfc6716-opus.txt`)
+  and the clean-room narrative at
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.6.
+  No external library source was consulted.
+
 * **Round-13 §4.3.3 initial-reservations budget walk (2026-06-02):**
   the chained §4.3.3 / clean-room narrative §2.5 budget walk that
   takes `(frame_bytes, ec_tell_frac, is_transient, lm, stereo,
