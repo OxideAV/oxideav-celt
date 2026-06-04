@@ -6,6 +6,73 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-17 §4.3.4.2 PVQ codebook + shape decoder (2026-06-04):**
+  the §4.3.4.2 Pyramid Vector Quantizer codebook size `V(N, K)` and
+  the per-band shape decoder. `v_count(n, k)` evaluates the §4.3.4.2
+  recurrence `V(N, K) = V(N-1, K) + V(N, K-1) + V(N-1, K-1)` with
+  base cases `V(N, 0) = 1` and `V(0, K) = 0` for `K > 0`. The carry-
+  one-row implementation runs in `O(N · K)` time and `O(K)` memory
+  with `u64` intermediates so the §4.3.4.4 32-bit codebook budget is
+  enforced cleanly: results above `u32::MAX` saturate to
+  `V_COUNT_SATURATION = u32::MAX` rather than wrap. `decode_index_to_pulses(
+  index, n, k) -> Option<Vec<i32>>` runs the §4.3.4.2 per-position
+  reconstruction loop on a caller-supplied index in `[0, V(N, K))`
+  and returns the signed integer pulse vector whose absolute-value
+  sum is exactly `K`. `decode_pulses(dec, n, k)` composes
+  `dec_uint(V(N, K))` (§4.1.5) with `decode_index_to_pulses`; a
+  sticky range-decoder error propagates as `None`. `normalize_to_unit_l2(
+  pulses)` divides by the f64 L2 norm so the output `f32` vector
+  lies on the unit hypersphere; the all-zero input degrades to
+  all-zero output rather than producing NaN. `decode_unit_shape(
+  dec, n, k)` is the convenience composition that returns the
+  unit-norm `Vec<f32>` ready to feed the §4.3.4.3 spreading rotation.
+  Exposed at the crate root: `v_count`, `decode_index_to_pulses`,
+  `decode_pulses`, `normalize_to_unit_l2`, `decode_unit_shape`,
+  `V_COUNT_SATURATION`.
+
+  27 new unit tests pin: `V(0, 0) = 1`, `V(0, K > 0) = 0`,
+  `V(N, 0) = 1`; hand-computed `V(N, K)` for `(N, K) ∈ {(1, 1) = 2,
+  (1, 2) = 2, (2, 1) = 4, (2, 2) = 8, (3, 1) = 6, (3, 2) = 18,
+  (4, 1) = 8, (4, 2) = 32}` from the §4.3.4.2 recurrence;
+  `V(3, 4) = 66` vs `V(4, 3) = 88` (the recurrence is not symmetric
+  in `N` ↔ `K`); the recurrence `V(N, K) = V(N-1, K) + V(N, K-1) +
+  V(N-1, K-1)` holds across a 12 × 12 grid; monotonicity in `K`
+  (fixed `N`) and in `N` (fixed `K`); `V(180, 180)` saturates to
+  `V_COUNT_SATURATION`; the `K = 0` codeword is the unique
+  all-zero vector regardless of `N` and reading a higher index is
+  rejected; `N = 0` paired with `K > 0` is rejected; out-of-range
+  indices (`V(2, 1) = 4` index 4, `V(3, 2) = 18` index 18) return
+  `None`; `V(1, 1) = 2` produces `{+1, -1}` codewords; the
+  `sum(|X|) == K` and `|X[j]| <= K` invariants hold for every
+  index in every `(N, K)` with `N ≤ 6` and `K ≤ 5`; the index ↔
+  codeword map is a bijection (no duplicate decoded vectors across
+  every legal index for `N ≤ 5`, `K ≤ 4`); the decoded codeword
+  set matches a brute-force enumeration of integer vectors with
+  `sum |X| = K` for `N ≤ 3`, `K ≤ 3`; the (test-only) `v_column`
+  helper matches `v_count` pointwise across a small grid;
+  `decode_pulses` integrated with `RangeDecoder` produces a
+  well-formed codeword (`sum(|X|) == K`, `|X[j]| <= K`);
+  `K = 0` is a no-op on the range decoder (`tell()` does not
+  regress) and returns the all-zero vector; `N = 0`, `K > 0`
+  returns `None`; `decode_pulses` against a saturated codebook
+  size returns `None`; `normalize_to_unit_l2` returns the all-zero
+  vector for all-zero input, returns the input unchanged for the
+  already-unit `[1, 0, 0, 0]`, and produces unit-L2-norm output
+  for every codeword at `(N, K) ∈ [1, 4]²` (within `1e-5` f64
+  tolerance); sign preservation on a mixed-sign input;
+  `decode_unit_shape` composition matches `normalize_to_unit_l2 ∘
+  decode_pulses` step-for-step on the same range-decoder seed;
+  `decode_unit_shape` with `K = 0` returns the all-zero vector.
+
+  Clean-room provenance: every step comes from RFC 6716 §4.3.4.2
+  (`docs/audio/opus/rfc6716-opus.txt` lines 6504–6536). The
+  recurrence, the base cases, the per-position reconstruction
+  loop, and the final unit-L2-norm normalisation are all
+  reproduced from the IETF text alone. The reference
+  implementation source file the RFC delegates to is outside the
+  workspace clean-room allow-list and was not consulted. Lib
+  test count 241 → 268 (+27).
+
 * **Round-16 §4.3.3 static-allocation search (2026-06-04):** the
   inner §4.3.3 allocation search the RFC describes as "linearly
   interpolating between two values of q (in steps of 1/64) to find

@@ -54,9 +54,16 @@
 //! `StaticAllocSearch { qlo, frac, total_1_8th }`) bisects the 1/64-
 //! step interpolation grid for the highest `(qlo, frac)` whose window
 //! total in 1/8 bits does not exceed the supplied "remaining" budget.
-//! The reallocation loop (concurrent skip decoding), the fine-energy
-//! / shape split, band decode, PVQ, and MDCT machinery still come
-//! later.
+//! The §4.3.4.2 PVQ codebook size `V(N, K)` and per-band shape
+//! decoder (`v_count`, `decode_index_to_pulses`, `decode_pulses`,
+//! `normalize_to_unit_l2`, `decode_unit_shape`) reproduce the codebook
+//! recurrence `V(N, K) = V(N-1, K) + V(N, K-1) + V(N-1, K-1)` and the
+//! §4.3.4.2 per-position reconstruction loop; the decoded integer
+//! pulse vector is normalised to unit L2 norm so the §4.3.4.3
+//! spreading rotation can consume it directly. The reallocation loop
+//! (concurrent skip decoding), the fine-energy / shape split, the
+//! §4.3.4.1 bits-to-pulses search with the band-balance accumulator,
+//! and the MDCT machinery still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -84,6 +91,7 @@ pub mod fine_energy;
 pub mod frame_header;
 pub mod hadamard;
 pub mod post_filter;
+pub mod pvq;
 pub mod range_decoder;
 pub mod spread;
 pub mod static_alloc;
@@ -120,6 +128,10 @@ pub use post_filter::{
     apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,
     tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN,
     POST_FILTER_TAPS_F32, POST_FILTER_TAPS_Q15, TAPS_PER_SET,
+};
+pub use pvq::{
+    decode_index_to_pulses, decode_pulses, decode_unit_shape, normalize_to_unit_l2, v_count,
+    V_COUNT_SATURATION,
 };
 pub use range_decoder::RangeDecoder;
 pub use spread::{

@@ -4,7 +4,7 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-06-04
 
-**Round-16.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-17.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -52,8 +52,16 @@ The §4.3.3 inner static-allocation search (`find_static_alloc` →
 `StaticAllocSearch { qlo, frac, total_1_8th }`) bisects the 1/64-
 step interpolation grid for the highest `(qlo, frac)` whose window
 total in 1/8 bits does not exceed the supplied "remaining" budget.
-The reallocation loop (concurrent skip decoding), the fine-energy
-/ shape split, and the band-decode / PVQ / MDCT paths still come
+The §4.3.4.2 Pyramid Vector Quantizer codebook size `V(N, K)` and
+per-band shape decoder (`v_count` + `decode_index_to_pulses` +
+`decode_pulses` + `normalize_to_unit_l2` + `decode_unit_shape`)
+reproduce the §4.3.4.2 recurrence `V(N, K) = V(N-1, K) + V(N, K-1)
++ V(N-1, K-1)` and the per-position reconstruction loop, then
+normalise the decoded integer pulse vector to unit L2 norm so the
+§4.3.4.3 spreading rotation can consume it directly. The
+reallocation loop (concurrent skip decoding), the fine-energy /
+shape split, the §4.3.4.1 bits-to-pulses search with the
+band-balance accumulator, and the MDCT machinery still come
 later.
 
 Range decoder (RFC 6716 §4.1):
@@ -433,6 +441,34 @@ Static allocation table (RFC 6716 §4.3.3, Table 57):
   evaluated as `qlo+1` at frac=0 so the interpolated evaluator's
   `frac ∈ 0..INTERP_STEPS` contract stays intact and the top column
   (`qlo == NUM_Q - 1`) is reachable.
+
+Pyramid Vector Quantizer (RFC 6716 §4.3.4.2):
+
+* `v_count(n, k)` — the §4.3.4.2 codebook size `V(N, K)` computed
+  from the recurrence `V(N, K) = V(N-1, K) + V(N, K-1) +
+  V(N-1, K-1)` with base cases `V(N, 0) = 1` and `V(0, K) = 0` for
+  `K > 0`. Returns `u32`; saturates to `V_COUNT_SATURATION = u32::MAX`
+  when the recurrence would overflow (§4.3.4.4 splits large bands
+  before this happens in legal traffic).
+* `decode_index_to_pulses(index, n, k)` — runs the §4.3.4.2
+  per-position reconstruction loop on a caller-supplied index in
+  `[0, V(N, K))`. Returns the signed integer pulse vector
+  `X[0..N]` whose absolute-value sum is exactly `K`. Returns `None`
+  for out-of-range index, `N = 0` paired with `K > 0`, or a
+  saturated codebook size.
+* `decode_pulses(dec, n, k)` — composes `dec_uint(V(N, K))`
+  (§4.1.5) with `decode_index_to_pulses`. Returns `None` on a
+  sticky range-decoder error.
+* `normalize_to_unit_l2(pulses)` — divides by the f64 L2 norm so
+  the output `f32` vector lies on the unit hypersphere per
+  §4.3.4.2 final paragraph; the all-zero input degrades to the
+  all-zero output rather than producing a NaN.
+* `decode_unit_shape(dec, n, k)` — convenience composition of the
+  two above, returning the unit-norm `Vec<f32>` ready to feed the
+  §4.3.4.3 spreading rotation.
+* `V_COUNT_SATURATION = u32::MAX` — sentinel for the over-budget
+  codebook case (callers that hit it must split per §4.3.4.4
+  before retrying).
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
