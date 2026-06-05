@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-04):** round-16. The bit-exact CELT/SILK range
+//! **Status (2026-06-05):** round-18. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -60,10 +60,20 @@
 //! recurrence `V(N, K) = V(N-1, K) + V(N, K-1) + V(N-1, K-1)` and the
 //! §4.3.4.2 per-position reconstruction loop; the decoded integer
 //! pulse vector is normalised to unit L2 norm so the §4.3.4.3
-//! spreading rotation can consume it directly. The reallocation loop
-//! (concurrent skip decoding), the fine-energy / shape split, the
-//! §4.3.4.1 bits-to-pulses search with the band-balance accumulator,
-//! and the MDCT machinery still come later.
+//! spreading rotation can consume it directly. The §4.3.4.1
+//! bits-to-pulses search + balance accumulator
+//! (`bits_to_pulses_search`, `BalanceAccumulator`,
+//! `bits_to_pulses_band_loop`) are now wired up: the per-band `K`
+//! search picks the largest pulse count whose `V(N, K)` codebook
+//! cost does not exceed the supplied 1/8-bit target ("nearest to
+//! target, not exceeding it; ties round down"), and the running
+//! balance carries the truncation residue forward with the §4.3.4.1
+//! share divisors (`3` general, `2` second-to-last, `1` last). The
+//! cost-of-(N, K) function is decoupled and supplied by the caller;
+//! a closed-form `cost_log2_v_count_8th` estimator based on
+//! `ceil(log2(V(N, K)))` ships as the default. The reallocation loop
+//! (concurrent skip decoding), the fine-energy / shape split, and
+//! the MDCT machinery still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -85,6 +95,7 @@ pub mod allocation_budget;
 pub mod band_cap;
 pub mod band_minimums;
 pub mod bit_allocation;
+pub mod bits_to_pulses;
 pub mod coarse_energy;
 pub mod deemphasis;
 pub mod fine_energy;
@@ -109,6 +120,11 @@ pub use bit_allocation::{
     decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,
     decode_skip_flag, intensity_rsv, reserve_stereo, BandAllocation, BandAllocationGates,
     DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE,
+};
+pub use bits_to_pulses::{
+    bits_to_pulses_band_loop, bits_to_pulses_search, cost_log2_v_count_8th, BalanceAccumulator,
+    BitsToPulses, DEFAULT_BALANCE_DIVISOR, EIGHTH_BITS_PER_BIT, K_SEARCH_CAP, LAST_BALANCE_DIVISOR,
+    SECOND_TO_LAST_BALANCE_DIVISOR,
 };
 pub use coarse_energy::{
     apply_intra_prediction, decode_coarse_energy, CoarseEnergyState, INTRA_ALPHA_Q15,

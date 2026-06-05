@@ -6,6 +6,62 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-18 §4.3.4.1 bits-to-pulses search + balance accumulator
+  (2026-06-05):** the §4.3.4.1 per-band `K` search and the running
+  1/8-bit balance accumulator that adjusts subsequent bands'
+  targets. `bits_to_pulses_search(n, target_8th, cost_fn) ->
+  BitsToPulses` picks the largest `K ∈ [0, K_SEARCH_CAP]` whose
+  reported `cost_fn(n, k)` does not exceed `target_8th`. The
+  §4.3.4.1 "rounding down on tie" rule is enforced implicitly by
+  the cost-monotone-in-K property — the search advances upward and
+  stops at the last `K` within budget. `BalanceAccumulator`
+  maintains the running 1/8-bit balance; `adjusted_target(raw,
+  divisor)` folds the share into a candidate target with
+  round-toward-zero division and a non-negative clamp;
+  `update(raw, bits_used)` adds the residue into the running
+  balance. `bits_to_pulses_band_loop(band_n, band_target_8th,
+  cost_fn) -> (Vec<BitsToPulses>, BalanceAccumulator)` chains the
+  search across a band sequence with the §4.3.4.1 share divisors:
+  `DEFAULT_BALANCE_DIVISOR = 3` for the general case,
+  `SECOND_TO_LAST_BALANCE_DIVISOR = 2` for band `nbands - 2`, and
+  `LAST_BALANCE_DIVISOR = 1` (whole balance) for the last band.
+  `cost_log2_v_count_8th(n, k)` is the default closed-form cost
+  estimator: the §4.1.5 `dec_uint(V(N, K))` worst-case cost in 1/8
+  bits (`ceil(log2(V(N, K))) * 8`), with `K = 0` free and saturated
+  codebooks returning `u32::MAX`. The cost-of-(N, K) function is
+  decoupled and supplied by the caller, so the same orchestrator
+  runs unchanged against the bit-exact per-(N, K) cost cache when
+  the docs gap on that table closes. `K_SEARCH_CAP = 128` pins a
+  deterministic worst-case on the inner loop. Exposed at the crate
+  root: `bits_to_pulses_search`, `bits_to_pulses_band_loop`,
+  `cost_log2_v_count_8th`, `BalanceAccumulator`, `BitsToPulses`,
+  `DEFAULT_BALANCE_DIVISOR`, `SECOND_TO_LAST_BALANCE_DIVISOR`,
+  `LAST_BALANCE_DIVISOR`, `EIGHTH_BITS_PER_BIT`, `K_SEARCH_CAP`.
+
+  30 new unit tests pin: `V(N, 0)` is free at every N; hand-
+  computed worst-case costs at `(N, K) ∈ {(1, 1), (2, 1), (2, 2),
+  (3, 2)}` match the `ceil(log2(V)) * 8` estimator; cost is
+  monotonically non-decreasing in K across a 8 × 12 grid (the
+  property the search relies on); search at zero target picks
+  `K = 0`; search at `N = 0` returns `K = 0` for every target;
+  search at `N = 1`, target 8 walks the cost plateau (V(1, K) = 2
+  for all K ≥ 1) up to `K_SEARCH_CAP`; search at sub-K1-cost
+  target picks `K = 0`; search never overshoots the budget across
+  a 8 × 200 grid; search picks the largest K within budget across
+  the same grid; the K-search cap is reachable under a generous
+  budget. Balance: fresh accumulator is zero; zero balance is the
+  identity on target; positive balance adds the divisor share;
+  negative balance debits the target; huge debit saturates to
+  zero; `update` records the residue; `reset` zeros it;
+  round-toward-zero division convention pinned at +7/3 ⇒ +2 and
+  -7/3 ⇒ -2. Band loop: length mismatch ⇒ None; empty input
+  ⇒ empty output + zero balance; single band uses
+  `LAST_BALANCE_DIVISOR`; two bands use `(2, 1)` divisors in
+  order; three bands use `(3, 2, 1)` in order — every hand-
+  computed `(K, bits_used, balance)` triple is verified explicitly;
+  band loop never overshoots any band's adjusted target over a
+  5-band mixed-N grid; custom cost functions compose.
+
 * **Round-17 §4.3.4.2 PVQ codebook + shape decoder (2026-06-04):**
   the §4.3.4.2 Pyramid Vector Quantizer codebook size `V(N, K)` and
   the per-band shape decoder. `v_count(n, k)` evaluates the §4.3.4.2

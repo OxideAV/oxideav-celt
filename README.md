@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-04
+## Status — 2026-06-05
 
-**Round-17.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-18.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -58,11 +58,17 @@ per-band shape decoder (`v_count` + `decode_index_to_pulses` +
 reproduce the §4.3.4.2 recurrence `V(N, K) = V(N-1, K) + V(N, K-1)
 + V(N-1, K-1)` and the per-position reconstruction loop, then
 normalise the decoded integer pulse vector to unit L2 norm so the
-§4.3.4.3 spreading rotation can consume it directly. The
-reallocation loop (concurrent skip decoding), the fine-energy /
-shape split, the §4.3.4.1 bits-to-pulses search with the
-band-balance accumulator, and the MDCT machinery still come
-later.
+§4.3.4.3 spreading rotation can consume it directly. The §4.3.4.1
+bits-to-pulses search + balance accumulator
+(`bits_to_pulses_search` + `BalanceAccumulator` +
+`bits_to_pulses_band_loop`) reproduce the §4.3.4.1 K-search rule
+("nearest to target, not exceeding it; ties round down") with a
+caller-supplied cost-of-(N, K) closure, and chain it across a band
+sequence with the §4.3.4.1 share divisors 3 / 2 / 1 for the
+general / second-to-last / last band; the running 1/8-bit balance
+absorbs the residue. The reallocation loop (concurrent skip
+decoding), the fine-energy / shape split, and the MDCT machinery
+still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -469,6 +475,42 @@ Pyramid Vector Quantizer (RFC 6716 §4.3.4.2):
 * `V_COUNT_SATURATION = u32::MAX` — sentinel for the over-budget
   codebook case (callers that hit it must split per §4.3.4.4
   before retrying).
+
+Bits-to-pulses search and balance accumulator (RFC 6716 §4.3.4.1):
+
+* `cost_log2_v_count_8th(n, k)` — the §4.1.5 `dec_uint(V(N, K))`
+  worst-case cost in 1/8-bit units (`ceil(log2(V(N, K))) * 8`).
+  `K = 0` is free; saturated codebook sizes return `u32::MAX` so the
+  search short-circuits cleanly. This is the closed-form estimator
+  the search composes with by default; the bit-exact per-(N, K) cost
+  cache the §4.3.4.1 reference uses is delegated to a source file
+  outside the workspace clean-room allow-list, so this round ships
+  the spec-grounded shape against the worst-case estimator.
+* `bits_to_pulses_search(n, target_8th, cost_fn) -> BitsToPulses` —
+  for a single band, picks the largest `K ∈ [0, K_SEARCH_CAP]` whose
+  reported cost does not exceed `target_8th`. The §4.3.4.1
+  "rounding down if exactly halfway" tie-breaker is implicit: the
+  search never advances past the lower of a tied pair because the
+  cost-monotone-in-K property keeps it within budget. `n = 0` or
+  `target_8th = 0` returns `K = 0` directly.
+* `BalanceAccumulator { balance_8th }` — the running 1/8-bit
+  balance the §4.3.4.1 band loop maintains. `adjusted_target(raw,
+  divisor) = raw + balance / divisor` folds the share into a
+  candidate target (round-toward-zero division, the natural i32 `/`
+  semantics; saturates non-negatively at zero). `update(raw,
+  bits_used)` accumulates `raw - bits_used` into the running
+  balance. `reset()` zeros it for a §4.5.2 decoder reset.
+* `bits_to_pulses_band_loop(band_n, band_target_8th, cost_fn)`
+  orchestrates the §4.3.4.1 walk across a sequence of bands,
+  applying the share divisors `DEFAULT_BALANCE_DIVISOR = 3` to
+  bands `0..nbands - 2`, `SECOND_TO_LAST_BALANCE_DIVISOR = 2` to
+  band `nbands - 2`, and `LAST_BALANCE_DIVISOR = 1` to band
+  `nbands - 1` per the §4.3.4.1 prose ("one third / half / whole
+  balance"). Returns the per-band `(K, bits_used_8th)` plus the
+  final balance.
+* `K_SEARCH_CAP = 128` pins a deterministic worst-case on the inner
+  loop. The §4.3.4.4 band-splitting machinery (a future round) keeps
+  the legitimate per-band `K` well inside this bound.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
