@@ -6,6 +6,27 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-20 §4.3.4.4 PVQ band-split gating + recursion geometry
+  (2026-06-07):** the §4.3.4.4 trigger ("maximum codebook size 32
+  bits") and the recursive halving tree the higher-level band-decode
+  walker traverses to reach leaf-PVQ sub-bands.
+  `band_needs_split(n, k) -> bool` returns `true` iff `V(N, K)` would
+  not fit in 32 bits (reusing `pvq::v_count`'s saturation flag);
+  `split_dimensions(n) -> (N_lo, N_hi)` halves the band per the
+  §4.3.4.4 "two sub-vectors of size N/2" rule, with the smaller half
+  on the low index when `N` is odd; `max_split_levels(lm)` pins the
+  `LM + 1` recursion cap with a defensive clamp at `MAX_LM = 3`;
+  `BandSplitNode { Leaf { n }, Split { lo, hi } }` is the recursive
+  tree descriptor with `total_n` / `leaf_count` / `depth` /
+  `for_each_leaf` / `leaf_dims` walkers; `plan_band_split(n, k, lm)`
+  descends until the leaf codebook fits in 32 bits or the
+  `LM + 1` cap is hit. The quantized split-gain parameter that
+  redistributes the relative L2 norm across the two halves is queued
+  as a docs gap (the RFC 6716 §4.3.4.4 prose defers the precise
+  precision/PDF to the reference). Exposed at the crate root:
+  `band_needs_split`, `split_dimensions`, `max_split_levels`,
+  `plan_band_split`, `BandSplitNode`, `MAX_LM`.
+
 * **Round-19 §4.3.4.3 spreading rotation chain (2026-06-07):** the
   §4.3.4.3 N-D rotation by `theta = pi * g_r^2 / 4` applied to a
   unit-norm PVQ shape vector, with the `(pi/2 - theta)` pre-rotation

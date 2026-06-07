@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-07):** round-19. The bit-exact CELT/SILK range
+//! **Status (2026-06-07):** round-20. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -79,8 +79,17 @@
 //! to a unit-norm PVQ shape vector, with per-time-block independence
 //! and the `(pi/2 - theta)` interleaved pre-rotation at stride
 //! `round(sqrt(N/nb_blocks))` when blocks span at least 8 samples.
-//! The reallocation loop (concurrent skip decoding), the fine-energy
-//! / shape split, and the MDCT machinery still come later.
+//! The §4.3.4.4 PVQ band-split gating + recursion geometry
+//! (`band_needs_split`, `split_dimensions`, `max_split_levels`,
+//! `plan_band_split` → `BandSplitNode`) detects when `V(N, K)` would
+//! exceed the 32-bit codebook budget and synthesises the recursive
+//! halving tree (capped at `LM + 1` levels per the §4.3.4.4 prose)
+//! the band-decode walker traverses to reach leaf-PVQ sub-bands.
+//! The quantized split-gain parameter that redistributes the L2 norm
+//! across the two halves is queued as a docs gap (the §4.3.4.4 prose
+//! defers the precise precision/PDF to the reference). The
+//! reallocation loop (concurrent skip decoding), the fine-energy /
+//! shape split, and the MDCT machinery still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -101,6 +110,7 @@ use oxideav_core::RuntimeContext;
 pub mod allocation_budget;
 pub mod band_cap;
 pub mod band_minimums;
+pub mod band_split;
 pub mod bit_allocation;
 pub mod bits_to_pulses;
 pub mod coarse_energy;
@@ -123,6 +133,9 @@ pub use band_cap::{compute_band_caps, decode_band_boosts, BoostResult, CACHE_CAP
 pub use band_minimums::{
     compute_thresh, compute_trim_offsets, BAND_BINS_LM, EIGHTH_BIT_QUANTUM, NUM_LM,
     SHORT_FRAME_BAND_BINS,
+};
+pub use band_split::{
+    band_needs_split, max_split_levels, plan_band_split, split_dimensions, BandSplitNode, MAX_LM,
 };
 pub use bit_allocation::{
     decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,

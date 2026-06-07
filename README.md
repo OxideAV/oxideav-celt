@@ -4,7 +4,7 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-06-07
 
-**Round-19.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-20.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -73,8 +73,17 @@ applies the `theta = pi * g_r^2 / 4` N-D forward + reverse 2-D
 rotation chain to a unit-norm PVQ shape vector, with per-time-block
 independence and the `(pi/2 - theta)` interleaved pre-rotation at
 stride `round(sqrt(N/nb_blocks))` when each time block spans at
-least 8 samples. The reallocation loop (concurrent skip decoding),
-the fine-energy / shape split, and the MDCT machinery still come
+least 8 samples. The §4.3.4.4 PVQ band-split gating + recursion
+geometry (`band_needs_split` + `split_dimensions` +
+`max_split_levels` + `plan_band_split` → `BandSplitNode`) detects
+when `V(N, K)` would exceed the 32-bit codebook budget and
+synthesises the recursive halving tree (capped at `LM + 1` levels
+per §4.3.4.4) the band-decode walker traverses to reach the leaf
+PVQ sub-bands. The quantized split-gain parameter that splits the
+relative L2 norm across the two halves is queued as a docs gap
+(the §4.3.4.4 prose defers the precise precision/PDF to the
+reference). The reallocation loop (concurrent skip decoding), the
+fine-energy / shape split, and the MDCT machinery still come
 later.
 
 Range decoder (RFC 6716 §4.1):
@@ -557,6 +566,37 @@ Bits-to-pulses search and balance accumulator (RFC 6716 §4.3.4.1):
 * `K_SEARCH_CAP = 128` pins a deterministic worst-case on the inner
   loop. The §4.3.4.4 band-splitting machinery (a future round) keeps
   the legitimate per-band `K` well inside this bound.
+
+PVQ band-split gating and recursion geometry (RFC 6716 §4.3.4.4,
+page 118):
+
+* `band_needs_split(n, k) -> bool` returns `true` iff `V(N, K)`
+  would not fit in 32 bits — the §4.3.4.4 trigger ("the maximum
+  size allowed for codebooks is 32 bits"). `K = 0` and `N = 0` are
+  never-split base cases.
+* `split_dimensions(n) -> (N_lo, N_hi)` returns the §4.3.4.4
+  "two sub-vectors of size N/2" split: `(N/2, N/2)` for even `N`,
+  `(N/2, N/2 + 1)` for odd `N`, `(0, 0)` for `N <= 1`. The lower
+  index gets the smaller half so the leaf-PVQ walk sees a
+  deterministic ordering.
+* `max_split_levels(lm) -> u32` returns the §4.3.4.4 recursion
+  cap `LM + 1`. `lm` is clamped to `MAX_LM = 3` defensively.
+* `BandSplitNode { Leaf { n }, Split { lo, hi } }` is the
+  recursive descriptor of how a band decomposes into a tree of
+  leaf-PVQ sub-bands. Helpers `total_n` / `leaf_count` / `depth`
+  / `for_each_leaf` / `leaf_dims` walk the tree without exposing
+  the recursion.
+* `plan_band_split(n, k, lm) -> BandSplitNode` descends the
+  recursion from the given `(N, K, LM)` halving the band on each
+  step until `band_needs_split` is `false`, the depth reaches
+  `LM + 1`, or `N` drops to `<= 1`. The quantized split-gain
+  parameter the §4.3.4.4 prose mentions to redistribute the L2
+  norm across the two halves is a docs gap (the RFC narrative
+  defers it to the reference implementation); the geometry tree
+  emitted here is wired up to a gain-aware leaf walker without
+  re-shaping when the gain decode lands.
+* `MAX_LM = 3` pins the canonical CELT frame-size range
+  (`LM ∈ {0, 1, 2, 3}` ↔ 2.5/5/10/20 ms frame durations).
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
