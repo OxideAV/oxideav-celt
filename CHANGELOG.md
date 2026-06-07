@@ -6,6 +6,33 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-19 §4.3.4.3 spreading rotation chain (2026-06-07):** the
+  §4.3.4.3 N-D rotation by `theta = pi * g_r^2 / 4` applied to a
+  unit-norm PVQ shape vector, with the `(pi/2 - theta)` pre-rotation
+  for blocks of 8+ samples. `rotation_angle_f64(spread, n, k) -> f64`
+  computes the angle from `g_r = N / (N + f_r * K)` with `Spread::None`
+  collapsing to zero; `apply_2d_rotation(x_i, x_j, cos_theta,
+  sin_theta) -> (f32, f32)` is the single 2-D `R(i, j)` primitive
+  (`x_i' = cos*x_i + sin*x_j`, `x_j' = -sin*x_i + cos*x_j`);
+  `apply_nd_rotation(samples, theta)` walks the §4.3.4.3 forward chain
+  `R(x_0, x_1), R(x_1, x_2), ..., R(x_{n-2}, x_{n-1})` then the
+  mirrored reverse chain "back and forth" per the spec ordering;
+  `apply_nd_rotation_multi_block(samples, nb_blocks, theta)` runs the
+  chain independently on each time block laid out interleaved as
+  `samples[b + nb_blocks * i]` (the layout the §4.3.4.5 Hadamard
+  routines already use); `apply_pre_rotation(samples, nb_blocks,
+  theta)` gates on `nb_blocks > 1` AND per-block sample count ≥ 8,
+  then applies the `(pi/2 - theta)` rotation to each stride-
+  interleaved sub-sequence `S_k = { stride * n + k }` with
+  `stride = round(sqrt(N/nb_blocks))` per the §4.3.4.3 "extra
+  rotation" rule; `apply_spread(spread, samples, k, nb_blocks)` is
+  the full §4.3.4.3 orchestrator (`Spread::None` is a no-op; L2 norm
+  preservation is verified across the pass). Exposed at the crate
+  root: `apply_2d_rotation`, `apply_nd_rotation`,
+  `apply_nd_rotation_multi_block`, `apply_pre_rotation`,
+  `apply_spread`, `rotation_angle_f64`,
+  `EXTRA_ROTATION_MIN_BLOCK_SAMPLES`.
+
 * **Round-18 §4.3.4.1 bits-to-pulses search + balance accumulator
   (2026-06-05):** the §4.3.4.1 per-band `K` search and the running
   1/8-bit balance accumulator that adjusts subsequent bands'

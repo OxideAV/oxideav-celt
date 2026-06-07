@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-05
+## Status — 2026-06-07
 
-**Round-18.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-19.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -66,9 +66,16 @@ bits-to-pulses search + balance accumulator
 caller-supplied cost-of-(N, K) closure, and chain it across a band
 sequence with the §4.3.4.1 share divisors 3 / 2 / 1 for the
 general / second-to-last / last band; the running 1/8-bit balance
-absorbs the residue. The reallocation loop (concurrent skip
-decoding), the fine-energy / shape split, and the MDCT machinery
-still come later.
+absorbs the residue. The §4.3.4.3 spreading rotation chain
+(`apply_spread`, `apply_nd_rotation`, `apply_nd_rotation_multi_block`,
+`apply_pre_rotation`, `apply_2d_rotation`, `rotation_angle_f64`)
+applies the `theta = pi * g_r^2 / 4` N-D forward + reverse 2-D
+rotation chain to a unit-norm PVQ shape vector, with per-time-block
+independence and the `(pi/2 - theta)` interleaved pre-rotation at
+stride `round(sqrt(N/nb_blocks))` when each time block spans at
+least 8 samples. The reallocation loop (concurrent skip decoding),
+the fine-energy / shape split, and the MDCT machinery still come
+later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -337,6 +344,45 @@ Spreading parameter (RFC 6716 §4.3.4.3 + Table 56 + Table 59):
   or empty band).
 * `DEFAULT_SPREAD = Spread::Normal` is the bulk-probability fallback
   for callers that skip the CELT side of the bitstream entirely.
+
+Spreading rotation (RFC 6716 §4.3.4.3 page 117):
+
+* `rotation_angle_f64(spread, n, k) -> f64` — the §4.3.4.3 rotation
+  angle `theta = pi * g_r^2 / 4` computed from the closed-form
+  `g_r = N / (N + f_r * K)`. Returns `0.0` for `Spread::None` and for
+  the degenerate `N = 0` band. The squaring and the division run in
+  f64 to keep the result well below f32 precision loss.
+* `apply_2d_rotation(x_i, x_j, cos_theta, sin_theta) -> (f32, f32)`
+  — the single 2-D rotation primitive (`cos / sin / -sin / cos`)
+  the §4.3.4.3 prose names `R(i, j)`. `cos_theta` / `sin_theta` are
+  precomputed once per band.
+* `apply_nd_rotation(samples, theta)` — the §4.3.4.3 N-D rotation
+  chain on a single time block. Forward pass `R(x_0, x_1),
+  R(x_1, x_2), ..., R(x_{n-2}, x_{n-1})`, then reverse pass
+  `R(x_{n-2}, x_{n-1}), ..., R(x_0, x_1)` per the "back and forth"
+  ordering. `theta == 0.0` or `len < 2` is a no-op.
+* `apply_nd_rotation_multi_block(samples, nb_blocks, theta)` —
+  applies the chain independently per time block on a buffer
+  interleaved as `samples[b + nb_blocks * i]` for block `b`,
+  in-block index `i` (the layout the §4.3.4.5 Hadamard transform
+  uses). Returns `false` on shape-constraint violations
+  (`nb_blocks == 0`, divisibility failure).
+* `apply_pre_rotation(samples, nb_blocks, theta)` — the §4.3.4.3
+  "extra rotation" by `(pi/2 - theta)`, applied BEFORE the main
+  rotation on each stride-interleaved sub-sequence
+  `S_k = { stride * n + k }, n = 0..N/stride - 1`, with stride
+  `round(sqrt(N/nb_blocks))`. Gated off when `nb_blocks <= 1` or
+  the per-block sample count drops below
+  `EXTRA_ROTATION_MIN_BLOCK_SAMPLES = 8`. Returns `false` when the
+  pre-rotation does not apply so the caller can skip straight to
+  the main rotation.
+* `apply_spread(spread, samples, k, nb_blocks)` — full §4.3.4.3
+  orchestrator. Computes `theta`, runs the gated pre-rotation, and
+  applies the main per-block rotation chain. `Spread::None` is a
+  no-op; the L2 norm of a unit-norm input is preserved across the
+  pass (orthonormal composition).
+* `EXTRA_ROTATION_MIN_BLOCK_SAMPLES = 8` pins the §4.3.4.3
+  "8 samples or more" guard from page 117.
 
 Post-filter (RFC 6716 §4.3.7.1):
 
