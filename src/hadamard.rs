@@ -61,13 +61,11 @@
 //! cascade implemented here is the standard fast WHT, written from
 //! first principles against the matrix definition
 //! `H_2 = [[1, 1], [1, -1]]`, `H_{2n} = H_2 ⊗ H_n` (Kronecker
-//! product). No external library source was consulted (libopus /
-//! libcelt / FFmpeg / any third-party Rust crate for Opus or for
-//! Walsh–Hadamard remain off-limits per the workspace clean-room
-//! policy). The sequency-order permutation is the textbook
-//! `gray(bit_reverse(i))` mapping that converts Hadamard order into
-//! Walsh / sequency order — a standard result from any DSP textbook
-//! covering the Walsh transform.
+//! product); no external library source was consulted. The
+//! sequency-order permutation is the textbook `gray(bit_reverse(i))`
+//! mapping that converts Hadamard order into Walsh / sequency order
+//! — a standard result from any DSP textbook covering the Walsh
+//! transform.
 
 /// Per-level normalization scale: `1/sqrt(2)`. See module docs for the
 /// rationale; the band shape vectors are unit-norm so we choose the

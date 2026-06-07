@@ -469,9 +469,7 @@ All notable changes to `oxideav-celt` are recorded here.
   textbook material that predates CELT by decades (Hadamard 1893,
   Walsh 1923). The radix-2 butterfly cascade was written from first
   principles against the matrix definition `H_2 = [[1,1],[1,-1]]`,
-  `H_{2n} = H_2 ⊗ H_n`. No external library source consulted (this
-  includes libopus, libcelt, FFmpeg / libav*, any third-party Rust
-  crate for Opus or for Walsh–Hadamard, and any web resource). The
+  `H_{2n} = H_2 ⊗ H_n`; no external library source consulted. The
   sequency-order permutation `bit_reverse(gray(s))` is the standard
   result from any DSP textbook covering the Walsh transform.
 
