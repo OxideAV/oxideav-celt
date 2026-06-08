@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-08
+## Status — 2026-06-09
 
-**Round-21.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-22.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -610,6 +610,32 @@ page 118):
   re-shaping when the gain decode lands.
 * `MAX_LM = 3` pins the canonical CELT frame-size range
   (`LM ∈ {0, 1, 2, 3}` ↔ 2.5/5/10/20 ms frame durations).
+
+Band denormalization (RFC 6716 §4.3.6):
+
+* `log_energy_q8_to_amplitude_f32(log_energy_q8) -> f32` returns the
+  per-sample amplitude factor `A = sqrt(2^(E_q8 / 256)) = 2^(E_q8 / 512)`
+  in f32, working in the same Q8 base-2 log-energy representation
+  [`CoarseEnergyState::prev_q8`] carries.
+* `scale_band_f32(shape, amplitude, out)` and
+  `scale_band_in_place_f32(samples, amplitude)` multiply each sample by
+  a precomputed amplitude; useful when one band is denormalized
+  repeatedly across multiple MDCT blocks at the same energy.
+* `denormalize_band_f32(shape, log_energy_q8, out)` and
+  `denormalize_band_in_place_f32(samples, log_energy_q8)` apply the
+  §4.3.6 per-band multiplicative step (`output[i] = shape[i] *
+  sqrt(2^(E_q8 / 256))`).
+* `denormalize_bands_f32(shapes, log_energies_q8, out)` walks 21 bands
+  and concatenates the denormalized shapes into `out`;
+  `denormalize_bands_in_place_f32(samples, bins_per_band,
+  log_energies_q8)` operates on a single contiguous buffer instead.
+* `Q8_DENOM = 256.0` and `SQRT_Q8_DENOM = 512.0` pin the Q8 unit on
+  the log-energy axis.
+
+The §4.3.6 prose ("each decoded normalized band is multiplied by the
+square root of the decoded energy") is one sentence; the §4.3.2.1 Q8
+log-2 representation and the `sqrt(2^E) = 2^(E/2)` identity supply the
+arithmetic with no normative source-file delegation.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.

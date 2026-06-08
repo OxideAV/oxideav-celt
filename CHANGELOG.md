@@ -6,6 +6,61 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-22 §4.3.6 band denormalization (2026-06-09):** the §4.3.6
+  multiplicative pass that scales each PVQ-decoded unit-norm shape
+  vector by `sqrt(2^(E_q8 / 256))` so the inverse MDCT consumes
+  energy-correct MDCT-domain samples. RFC 6716 §4.3.6 specifies the
+  step in a single prose sentence ("each decoded normalized band is
+  multiplied by the square root of the decoded energy") and delegates
+  the implementation entry point name only; the arithmetic follows from
+  the §4.3.2.1 Q8 base-2 log-energy representation
+  ([`CoarseEnergyState::prev_q8`]) plus the elementary identity
+  `sqrt(2^E) = 2^(E/2)`. `log_energy_q8_to_amplitude_f32(log_energy_q8)`
+  returns the per-sample amplitude factor (`2^(E_q8 / 512)`);
+  `scale_band_f32` / `scale_band_in_place_f32` apply a precomputed
+  amplitude; `denormalize_band_f32` / `denormalize_band_in_place_f32`
+  combine the two for the per-band §4.3.6 step;
+  `denormalize_bands_f32(shapes, log_energies_q8, out)` walks the full
+  21-band envelope into a concatenated output buffer and
+  `denormalize_bands_in_place_f32(samples, bins_per_band,
+  log_energies_q8)` is the contiguous-buffer in-place variant.
+  Constants `Q8_DENOM = 256.0`, `SQRT_Q8_DENOM = 512.0` pin the Q8
+  fractional-bit count and the sqrt-amplitude divisor. Exposed at the
+  crate root: `log_energy_q8_to_amplitude_f32`, `scale_band_f32`,
+  `scale_band_in_place_f32`, `denormalize_band_f32`,
+  `denormalize_band_in_place_f32`, `denormalize_bands_f32`,
+  `denormalize_bands_in_place_f32`, `Q8_DENOM`, `SQRT_Q8_DENOM`.
+
+  22 new unit tests pin: the Q8 unit constants (`Q8_DENOM = 256`,
+  `SQRT_Q8_DENOM = 512 = 2 * Q8_DENOM`); `E_q8 = 0` yields amplitude
+  1.0 (unit-energy identity); a single Q8 integer log-2 step scales
+  amplitude by `sqrt(2)`; two integer log-2 steps double the
+  amplitude; symmetric negative two-step halves it; multiplicative
+  composition `A(E1+E2) = A(E1)*A(E2)` across a 7×5 grid;
+  `scale_band_f32` scales each sample and rejects length mismatch
+  while leaving `out` untouched; `scale_band_in_place_f32` matches
+  the copying variant on the same input; per-band energy preservation
+  invariant — the squared L2 norm of a denormalized unit-shape band
+  equals the linear energy `2^(E_q8/256)` — across a 9-point
+  energy sweep; `denormalize_band_f32` zero-energy identity;
+  `denormalize_band_in_place_f32` agreement with the copying form;
+  `denormalize_band_f32` length-mismatch rejection;
+  `denormalize_bands_f32` 21-band walk in band order;
+  `denormalize_bands_f32` length-mismatch rejections (wrong shape
+  count, wrong output length); `denormalize_bands_in_place_f32` on
+  the canonical LM=0 layout (sum of per-band bin counts =
+  `100 << 0 = 100`) preserves the per-band energy invariant after
+  scaling each unit-norm band by amplitude `sqrt(2)`;
+  length-mismatch rejection leaves the input buffer untouched;
+  band-ordering preservation under alternating energies; empty bands
+  pass through without advancing the output cursor (the §4.3.4.4
+  band-split leaf case); all-zero per-band energies leave the
+  concatenated shape buffer unchanged.
+
+  Pure clean-room derivation. The §4.3.6 prose is a single
+  sentence; the arithmetic is elementary. No external library source
+  consulted. Lib test count 349 → 371 (+22).
+
 * **Round-21 §4.3.2.1 `e_prob_model` Laplace-parameter table
   (2026-06-08):** the 4 × 2 × 21 = 168-pair coarse-energy Laplace
   probability model, transcribed verbatim from

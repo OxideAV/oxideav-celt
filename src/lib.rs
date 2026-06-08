@@ -2,7 +2,7 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-08):** round-21. The bit-exact CELT/SILK range
+//! **Status (2026-06-09):** round-22. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
@@ -93,7 +93,12 @@
 //! the band-decode walker traverses to reach leaf-PVQ sub-bands.
 //! The quantized split-gain parameter that redistributes the L2 norm
 //! across the two halves is queued as a docs gap (the §4.3.4.4 prose
-//! defers the precise precision/PDF to the reference). The
+//! defers the precise precision/PDF to the reference). The §4.3.6
+//! band denormalization (the per-sample multiplicative pass that
+//! scales each PVQ-decoded unit-norm shape by `sqrt(2^(E_q8 / 256))`
+//! before the inverse MDCT) is wired up as pure arithmetic against
+//! caller-supplied Q8 log-energies, so it composes cleanly once the
+//! `ec_laplace_decode` docs gap on the coarse-energy path closes. The
 //! reallocation loop (concurrent skip decoding), the fine-energy /
 //! shape split, and the MDCT machinery still come later.
 //!
@@ -121,6 +126,7 @@ pub mod bit_allocation;
 pub mod bits_to_pulses;
 pub mod coarse_energy;
 pub mod deemphasis;
+pub mod denormalization;
 pub mod e_prob_model;
 pub mod fine_energy;
 pub mod frame_header;
@@ -159,6 +165,11 @@ pub use coarse_energy::{
     INTRA_BETA_Q15, NUM_BANDS,
 };
 pub use deemphasis::{deemphasize_in_place_f32, Deemphasis, ALPHA_P_F32, ALPHA_P_Q15};
+pub use denormalization::{
+    denormalize_band_f32, denormalize_band_in_place_f32, denormalize_bands_f32,
+    denormalize_bands_in_place_f32, log_energy_q8_to_amplitude_f32, scale_band_f32,
+    scale_band_in_place_f32, Q8_DENOM, SQRT_Q8_DENOM,
+};
 pub use e_prob_model::{
     prob_decay, ProbDecay, E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER,
     PRED_INTRA,
