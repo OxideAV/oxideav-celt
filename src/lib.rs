@@ -2,15 +2,21 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-07):** round-20. The bit-exact CELT/SILK range
+//! **Status (2026-06-08):** round-21. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
 //! coarse-energy scaffolding (21-band layout from Table 55 + intra
-//! prediction filter with `α=0, β=4915/32768`) is in place; the
-//! Laplace decoder + `e_prob_model` table remain queued for a future
-//! round (numeric CSV now staged at
-//! `docs/audio/celt/tables/e_prob_model.csv`). The §4.3.2.2
+//! prediction filter with `α=0, β=4915/32768`) is in place. The
+//! §4.3.2.1 `e_prob_model` Laplace-parameter table is now transcribed
+//! verbatim (`E_PROB_MODEL[lm][intra][band] -> ProbDecay { prob,
+//! decay }`, 4 × 2 × 21 = 168 Q8 pairs from
+//! `docs/audio/celt/tables/e_prob_model.csv`) with the
+//! `prob_decay(lm, intra, band)` accessor that folds the `bool intra`
+//! flag onto the staged CSV's `0 = inter / 1 = intra` middle axis;
+//! the `ec_laplace_decode` algorithm itself remains queued for a
+//! future round (the RFC narrative does not state the per-symbol
+//! decode recurrence). The §4.3.2.2
 //! fine-energy refinement decoder + finalize step is bit-exact. The
 //! §4.3.3 bit-allocation field decoders (alloc.trim, skip,
 //! intensity-band, dual-stereo) are exposed standalone, gated on
@@ -115,6 +121,7 @@ pub mod bit_allocation;
 pub mod bits_to_pulses;
 pub mod coarse_energy;
 pub mod deemphasis;
+pub mod e_prob_model;
 pub mod fine_energy;
 pub mod frame_header;
 pub mod hadamard;
@@ -152,6 +159,10 @@ pub use coarse_energy::{
     INTRA_BETA_Q15, NUM_BANDS,
 };
 pub use deemphasis::{deemphasize_in_place_f32, Deemphasis, ALPHA_P_F32, ALPHA_P_Q15};
+pub use e_prob_model::{
+    prob_decay, ProbDecay, E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER,
+    PRED_INTRA,
+};
 pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, finalize_extra_bits, fine_correction_q14,
     fine_correction_qn, FinalizePriority, FinalizeResult, MAX_FINE_BITS,

@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-07
+## Status — 2026-06-08
 
-**Round-20.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-21.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -30,10 +30,15 @@ form rotation-gain helpers), the §4.3.7.1 post-filter (three tap
 shapes in f32 + Q15 + gain reconstruction + per-sample / slice
 filter response), and the §4.3.7.2 single-pole de-emphasis filter
 (`α_p = 0.8500061035`, in both f32 and Q15) are now wired up. The
-Laplace decoder + `e_prob_model` table remain queued for a future
-round (numeric CSV is now staged at
-`docs/audio/celt/tables/e_prob_model.csv` so the work is no longer
-docs-gap-blocked). The §4.3.3 §2.6 per-band hard-minimum shape
+§4.3.2.1 `e_prob_model` Laplace-parameter table is now transcribed
+verbatim (`E_PROB_MODEL[lm][intra][band] -> ProbDecay { prob,
+decay }`, 4 × 2 × 21 = 168 Q8 pairs from
+`docs/audio/celt/tables/e_prob_model.csv`), with the matching
+`prob_decay(lm, intra, band)` accessor that folds the `bool intra`
+flag onto the staged CSV's `0 = inter / 1 = intra` middle axis; the
+`ec_laplace_decode` algorithm itself remains queued for a future
+round (the RFC 6716 §4.3.2.1 narrative gives only the Laplace
+distribution shape, not the per-symbol decode recurrence). The §4.3.3 §2.6 per-band hard-minimum shape
 allocation (`compute_thresh`) and the per-band `trim_offsets[]`
 derivation (`compute_trim_offsets`) are now wired up, alongside the
 full §4.3 Table 55 MDCT-bin layout (`BAND_BINS_LM` for all four LM
@@ -134,11 +139,19 @@ Coarse-energy scaffold (RFC 6716 §4.3.2.1):
   with the temporal arm vanishing.
 * `decode_coarse_energy(dec, state, intra, lm)` is the locked-in
   public entry point; it currently returns `Error::NotImplemented`
-  because the `e_prob_model` table and the `ec_laplace_decode`
-  algorithm are docs-gap-blocked (the RFC delegates them to a
-  source file outside the workspace clean-room allow-list). The
-  gap'd path is asserted not to disturb the range decoder or the
-  carried state so that future rounds compose cleanly.
+  because the `ec_laplace_decode` algorithm is docs-gap-blocked
+  (the RFC narrative gives only the Laplace-distribution shape,
+  not the per-symbol decode recurrence). The gap'd path is asserted
+  not to disturb the range decoder or the carried state so that
+  future rounds compose cleanly.
+* `E_PROB_MODEL[lm][intra][band] -> ProbDecay { prob, decay }` —
+  the §4.3.2.1 Laplace-parameter table, 4 × 2 × 21 = 168 Q8 pairs,
+  transcribed verbatim from `docs/audio/celt/tables/e_prob_model.csv`.
+  `prob_decay(lm, intra, band) -> Option<ProbDecay>` folds the
+  `bool intra` flag onto the staged CSV's `0 = inter / 1 = intra`
+  middle axis. Constants `NUM_LM_FRAME_SIZES = 4`,
+  `NUM_PREDICTION_TYPES = 2`, `PRED_INTER = 0`, `PRED_INTRA = 1`
+  formalise the table's three axes.
 
 Stereo reservation helpers (RFC 6716 §4.3.3 + clean-room narrative
 §2.5):

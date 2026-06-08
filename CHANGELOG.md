@@ -6,6 +6,29 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-21 §4.3.2.1 `e_prob_model` Laplace-parameter table
+  (2026-06-08):** the 4 × 2 × 21 = 168-pair coarse-energy Laplace
+  probability model, transcribed verbatim from
+  `docs/audio/celt/tables/e_prob_model.csv` (staged 2026-06 from the
+  IETF clean-room corpus, structural narrative at
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §1.2).
+  Exposed at the crate root as `E_PROB_MODEL[lm][intra][band]
+  -> ProbDecay { prob, decay }` with the matching `prob_decay(lm,
+  intra, band) -> Option<ProbDecay>` accessor that folds the
+  `bool intra` flag onto the staged CSV's `0 = inter / 1 = intra`
+  middle axis. Both `prob` and `decay` are Q8 unsigned bytes per the
+  staged `e_prob_model.meta`. Constants `NUM_LM_FRAME_SIZES = 4`,
+  `NUM_PREDICTION_TYPES = 2`, `PRED_INTER = 0`, `PRED_INTRA = 1`
+  formalise the table's three axes. Eight unit tests pin the shape
+  (`4 * 2 * 21 = 168` pairs), the four corner cells against the CSV,
+  the accessor's `bool -> axis-index` mapping, the out-of-range
+  `None` discipline, the absence of zero `prob` / zero `decay`
+  entries (the staged CSV's smallest values, `prob = 21` and
+  `decay = 6`, are pinned), and a `LM`-axis-shape regression
+  sentinel. The `ec_laplace_decode` algorithm itself remains queued
+  for a future round (the RFC 6716 §4.3.2.1 narrative gives only the
+  Laplace-distribution shape, not the per-symbol decode recurrence).
+
 * **Round-20 §4.3.4.4 PVQ band-split gating + recursion geometry
   (2026-06-07):** the §4.3.4.4 trigger ("maximum codebook size 32
   bits") and the recursive halving tree the higher-level band-decode
