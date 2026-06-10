@@ -99,8 +99,14 @@
 //! before the inverse MDCT) is wired up as pure arithmetic against
 //! caller-supplied Q8 log-energies, so it composes cleanly once the
 //! `ec_laplace_decode` docs gap on the coarse-energy path closes. The
+//! §4.3.4 → §4.3.6 single non-split band-decode orchestrator
+//! (`decode_band_shape` → `BandShape`) chains the simplest-case decode
+//! chain in §4.3 bitstream order: PVQ unit-shape decode
+//! (§4.3.4.1/§4.3.4.2) → spreading rotation (§4.3.4.3) → time-frequency
+//! resolution change (§4.3.4.5) → denormalization (§4.3.6). The
 //! reallocation loop (concurrent skip decoding), the fine-energy /
-//! shape split, and the MDCT machinery still come later.
+//! shape split, the §4.3.4.4 split-gain band-split path, and the MDCT
+//! machinery still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -120,6 +126,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod allocation_budget;
 pub mod band_cap;
+pub mod band_decode;
 pub mod band_minimums;
 pub mod band_split;
 pub mod bit_allocation;
@@ -143,6 +150,7 @@ pub use allocation_budget::{
     compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
 };
 pub use band_cap::{compute_band_caps, decode_band_boosts, BoostResult, CACHE_CAPS50};
+pub use band_decode::{decode_band_shape, BandShape};
 pub use band_minimums::{
     compute_thresh, compute_trim_offsets, BAND_BINS_LM, EIGHTH_BIT_QUANTUM, NUM_LM,
     SHORT_FRAME_BAND_BINS,

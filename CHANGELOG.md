@@ -6,6 +6,56 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-23 §4.3.4 → §4.3.6 single-band shape-decode orchestrator
+  (2026-06-10):** the simplest-case per-band decode chain — for a band
+  whose `V(N, K)` codebook fits in 32 bits, so no §4.3.4.4 split is
+  required — wired up as a fixed composition of the RFC-grounded
+  primitives the prior rounds built. RFC 6716 §4.3.4 (lines 6462–6474)
+  describes the chain: bits → pulses (§4.3.4.1) → codebook size
+  (§4.3.4.2) → uniform index → vector → unit norm. The unit-norm shape
+  is then transformed in §4.3 bitstream order by the §4.3.4.3 spreading
+  rotation, the §4.3.4.5 time-frequency resolution change, and the
+  §4.3.6 denormalization. `decode_band_shape(dec, n, k, spread,
+  nb_blocks, tf_adjustment, log_energy_q8) -> Option<BandShape>` runs
+  the chain: `decode_unit_shape` (§4.3.4.1/§4.3.4.2) → `apply_spread`
+  (§4.3.4.3) → `apply_tf_resolution_change` (§4.3.4.5, skipped when
+  `tf_adjustment == 0`) → `denormalize_band_in_place_f32` (§4.3.6).
+  `BandShape { samples, k }` carries the denormalized MDCT-domain band
+  samples plus the consumed pulse count `K`. `None` is returned when the
+  PVQ decode fails (saturated codebook ⇒ caller must split per §4.3.4.4,
+  `N == 0` with `K > 0`, a sticky range-decoder error, or an
+  out-of-range index) or when the spreading / TF shape constraints are
+  violated (`nb_blocks == 0`, a band length not divisible by
+  `nb_blocks`, or a TF request exceeding the available Hadamard levels).
+  The §4.3.4.4 split-gain band-split path and the stereo joint-coding
+  path remain out of scope for the same docs-gap reason flagged in
+  round 20 (the §4.3.4.4 prose defers the split-gain precision/PDF to
+  the reference). Exposed at the crate root: `decode_band_shape`,
+  `BandShape`.
+
+  13 new unit tests pin: a `0xFF…`-seeded decode at `(N=4, K=3)`,
+  no-spread / no-TF, energy `E_q8 = 512` (amplitude 2.0) yields a band
+  whose L2 norm equals the amplitude (the §4.3.4.3/§4.3.4.5 passes
+  preserve the unit norm, §4.3.6 scales it); zero energy (`E_q8 = 0`)
+  yields a unit-norm band; an aggressive spread preserves the band
+  energy; a `−1` TF resolution change (2 blocks × 4 samples) preserves
+  the norm; a `+1` TF change (4 blocks × 2 samples,
+  frequency-resolution-increase branch) preserves the norm; `N == 0`
+  with `K > 0` returns `None`; a saturated codebook (`V(180, 180)`)
+  returns `None` (caller must split); `nb_blocks == 0` returns `None`;
+  an indivisible band length (`N = 6`, `nb_blocks = 4`) returns `None`;
+  an oversized TF request (`tf = −2` on 2-sample sub-vectors) returns
+  `None`; negative energy (`E_q8 = −512`, amplitude 0.25) attenuates the
+  band to the sub-unity amplitude; `BandShape::k` round-trips the
+  supplied pulse count; `K == 0` decodes the all-zero band (no
+  pseudo-random fill — that is the separate gap'd §4.3.5 anti-collapse
+  stage) and consumes no PVQ index (`V(N, 0) = 1`, `tell()` unchanged).
+
+  Pure clean-room composition. Every step is an RFC 6716-grounded
+  primitive from a prior round; the chain ordering follows the §4.3
+  bitstream / decode order. No external library source consulted; no new
+  numeric constant introduced. Lib test count 371 → 384 (+13).
+
 * **Round-22 §4.3.6 band denormalization (2026-06-09):** the §4.3.6
   multiplicative pass that scales each PVQ-decoded unit-norm shape
   vector by `sqrt(2^(E_q8 / 256))` so the inverse MDCT consumes

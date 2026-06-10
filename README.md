@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-09
+## Status — 2026-06-10
 
-**Round-22.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-23.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -87,9 +87,14 @@ per §4.3.4.4) the band-decode walker traverses to reach the leaf
 PVQ sub-bands. The quantized split-gain parameter that splits the
 relative L2 norm across the two halves is queued as a docs gap
 (the §4.3.4.4 prose defers the precise precision/PDF to the
-reference). The reallocation loop (concurrent skip decoding), the
-fine-energy / shape split, and the MDCT machinery still come
-later.
+reference). The §4.3.4 → §4.3.6 single non-split band-decode
+orchestrator (`decode_band_shape` → `BandShape`) chains the simplest-
+case decode in §4.3 bitstream order: PVQ unit-shape decode
+(§4.3.4.1/§4.3.4.2) → spreading rotation (§4.3.4.3) → time-frequency
+resolution change (§4.3.4.5) → denormalization (§4.3.6). The
+reallocation loop (concurrent skip decoding), the fine-energy / shape
+split, the §4.3.4.4 split-gain band-split path, and the MDCT machinery
+still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -636,6 +641,34 @@ The §4.3.6 prose ("each decoded normalized band is multiplied by the
 square root of the decoded energy") is one sentence; the §4.3.2.1 Q8
 log-2 representation and the `sqrt(2^E) = 2^(E/2)` identity supply the
 arithmetic with no normative source-file delegation.
+
+Single-band shape-decode orchestrator (RFC 6716 §4.3.4 → §4.3.6):
+
+* `decode_band_shape(dec, n, k, spread, nb_blocks, tf_adjustment,
+  log_energy_q8) -> Option<BandShape>` runs the simplest-case per-band
+  decode chain for a band whose `V(N, K)` codebook fits in 32 bits (no
+  §4.3.4.4 split required), in §4.3 bitstream order: `decode_unit_shape`
+  (§4.3.4.1 bits-to-pulses + §4.3.4.2 codebook index → vector → unit
+  norm) → `apply_spread` (§4.3.4.3 spreading rotation) →
+  `apply_tf_resolution_change` (§4.3.4.5 TF change, skipped when
+  `tf_adjustment == 0`) → `denormalize_band_in_place_f32` (§4.3.6).
+  Each of the §4.3.4.3 / §4.3.4.5 passes is L2-norm-preserving, so the
+  §4.3.6 step sees the unit-norm shape and scales it to the decoded
+  energy.
+* `BandShape { samples, k }` carries the denormalized MDCT-domain band
+  samples (length `N`, interleaved across `nb_blocks` time blocks) plus
+  the consumed pulse count `K`.
+* Returns `None` when the PVQ decode fails (saturated codebook ⇒ caller
+  must split per §4.3.4.4, `N == 0` with `K > 0`, a sticky range-decoder
+  error, or an out-of-range index) or when the spreading / TF shape
+  constraints are violated (`nb_blocks == 0`, a band length not
+  divisible by `nb_blocks`, or a TF request exceeding the available
+  Hadamard levels).
+* The §4.3.4.4 split-gain band-split path and the stereo joint-coding
+  path remain out of scope for the same docs-gap reason flagged in the
+  §4.3.4.4 geometry round (the precise split-gain precision/PDF is
+  deferred to the reference). Callers gate on `band_needs_split(n, k)`
+  before invoking this orchestrator.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
