@@ -104,9 +104,15 @@
 //! chain in §4.3 bitstream order: PVQ unit-shape decode
 //! (§4.3.4.1/§4.3.4.2) → spreading rotation (§4.3.4.3) → time-frequency
 //! resolution change (§4.3.4.5) → denormalization (§4.3.6). The
-//! reallocation loop (concurrent skip decoding), the fine-energy /
-//! shape split, the §4.3.4.4 split-gain band-split path, and the MDCT
-//! machinery still come later.
+//! §4.3.7 inverse MDCT machinery (the Vorbis-derived power-of-sine
+//! window in closed form, validated against the staged
+//! `window120.csv` / `window240.csv` data extractions; the low-overlap
+//! window construction with its hop-`N` power-complementarity
+//! invariant; the direct-form `1/2`-scaled IMDCT + its `4/N` forward
+//! companion; and the streaming weighted-overlap-add synthesis state
+//! `MdctSynthesis`) is wired up. The reallocation loop (concurrent
+//! skip decoding), the fine-energy / shape split, and the §4.3.4.4
+//! split-gain band-split path still come later.
 //!
 //! Every other public API path returns [`Error::NotImplemented`].
 //!
@@ -138,6 +144,7 @@ pub mod e_prob_model;
 pub mod fine_energy;
 pub mod frame_header;
 pub mod hadamard;
+pub mod mdct;
 pub mod post_filter;
 pub mod pvq;
 pub mod range_decoder;
@@ -190,6 +197,10 @@ pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
 pub use hadamard::{
     apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
     HADAMARD_LEVEL_SCALE,
+};
+pub use mdct::{
+    build_low_overlap_window_f32, build_window_half_f32, celt_window_f32, imdct_naive_f32,
+    mdct_naive_f32, MdctSynthesis, BASIC_WINDOW_HALF, BASIC_WINDOW_LEN,
 };
 pub use post_filter::{
     apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,

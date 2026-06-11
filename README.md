@@ -2,9 +2,9 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-10
+## Status — 2026-06-11
 
-**Round-23.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-24.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
 precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
 layout + intra prediction filter), the §4.3.2.2 fine-energy
@@ -91,10 +91,16 @@ reference). The §4.3.4 → §4.3.6 single non-split band-decode
 orchestrator (`decode_band_shape` → `BandShape`) chains the simplest-
 case decode in §4.3 bitstream order: PVQ unit-shape decode
 (§4.3.4.1/§4.3.4.2) → spreading rotation (§4.3.4.3) → time-frequency
-resolution change (§4.3.4.5) → denormalization (§4.3.6). The
-reallocation loop (concurrent skip decoding), the fine-energy / shape
-split, the §4.3.4.4 split-gain band-split path, and the MDCT machinery
-still come later.
+resolution change (§4.3.4.5) → denormalization (§4.3.6). The §4.3.7
+inverse MDCT machinery — the Vorbis-derived power-of-sine window in
+closed form (validated against the staged `window120.csv` /
+`window240.csv` data extractions), the low-overlap window
+construction with its hop-`N` power-complementarity invariant, the
+direct-form `1/2`-scaled IMDCT plus its `4/N` forward companion, and
+the streaming weighted-overlap-add synthesis state (`MdctSynthesis`)
+— is wired up. The reallocation loop (concurrent skip decoding), the
+fine-energy / shape split, and the §4.3.4.4 split-gain band-split
+path still come later.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -669,6 +675,36 @@ Single-band shape-decode orchestrator (RFC 6716 §4.3.4 → §4.3.6):
   §4.3.4.4 geometry round (the precise split-gain precision/PDF is
   deferred to the reference). Callers gate on `band_needs_split(n, k)`
   before invoking this orchestrator.
+
+Inverse MDCT and low-overlap window (RFC 6716 §4.3.7):
+
+* `celt_window_f32(n, overlap)` — the §4.3.7 Vorbis-derived window
+  coefficient `W(n) = sin((pi/2) * sin((pi/2) * (n + 1/2) / L)^2)`
+  (the square applies to the inner sine; the staged
+  `docs/audio/opus/tables/window120.csv` / `window240.csv` data
+  extractions match this reading to full printed precision and rule
+  out the outer-square reading). `build_window_half_f32(overlap)`
+  emits the full rising half (the staged tables' layout).
+* `build_low_overlap_window_f32(n, overlap)` — the §4.3.7 low-overlap
+  construction: zero-pad the basic window and insert ones in the
+  middle (`[0 × (N-L)/2 | rise | 1 × (N-L) | fall | 0 × (N-L)/2]`),
+  preserving the [PRINCEN86] power complementarity
+  `w(i)^2 + w(i+N)^2 = 1` at hop `N`. `N = L` degenerates to the
+  basic full-overlap 240-sample window (`BASIC_WINDOW_LEN = 240`,
+  `BASIC_WINDOW_HALF = 120`).
+* `imdct_naive_f32(spectrum, out)` — the §4.3.7 inverse MDCT, direct
+  form: `N` frequency samples in, `2*N` time samples out, scaling by
+  the literal §4.3.7 `1/2`. Accumulates in f64.
+* `mdct_naive_f32(time, out)` — the forward companion with the `4/N`
+  analysis normalization, the unique choice making the `1/2`-scaled
+  inverse a unit-gain weighted-overlap-add round trip (§4.3.7 leaves
+  the encoder side unconstrained; this exists for the future encoder
+  and round-trip validation).
+* `MdctSynthesis` — streaming weighted-overlap-add state: per frame,
+  IMDCT → synthesis window → overlap-add against the previous frame's
+  saved tail → emit `N` samples (`frame`), with `reset()` for the
+  §4.5.2 decoder reset. Feeds the §4.3.7.1 post-filter ("output of
+  the inverse MDCT (after weighted overlap-add)").
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.

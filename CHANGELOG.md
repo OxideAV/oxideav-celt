@@ -6,6 +6,73 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-24 §4.3.7 inverse MDCT + low-overlap window (2026-06-11):**
+  the MDCT-machinery tail of the decode chain. RFC 6716 §4.3.7 states
+  the inverse MDCT "has no special characteristics" — `N` frequency
+  samples in, `2*N` time samples out, scaling by `1/2` — and gives the
+  basic (full-overlap) 240-sample Vorbis-derived window formula plus
+  the low-overlap construction recipe ("zero-padding the basic window
+  and inserting ones in the middle, such that the resulting window
+  still satisfies power complementarity").
+
+  `celt_window_f32(n, overlap)` evaluates
+  `W(n) = sin((pi/2) * sin((pi/2) * (n + 1/2) / L)^2)`. The RFC's
+  ASCII art leaves the placement of the square ambiguous; the staged
+  data-only extractions `docs/audio/opus/tables/window120.csv` /
+  `window240.csv` match the inner-square (Vorbis power-of-sine)
+  reading to full printed precision at every sampled position and do
+  not match the outer-square reading anywhere, so the inner-square
+  reading is pinned. `build_window_half_f32(overlap)` emits the rising
+  half (the staged tables' layout); `build_low_overlap_window_f32(n,
+  overlap)` builds the `2*N`-sample synthesis window
+  `[0 × (N-L)/2 | rise | 1 × (N-L) | fall | 0 × (N-L)/2]`, which
+  satisfies the [PRINCEN86] power complementarity
+  `w(i)^2 + w(i+N)^2 = 1` exactly at hop `N` and degenerates to the
+  basic 240-sample window at `N = L` (`BASIC_WINDOW_LEN = 240`,
+  `BASIC_WINDOW_HALF = 120`).
+
+  `imdct_naive_f32(spectrum, out)` is the direct-form `O(N^2)` inverse
+  with the literal §4.3.7 `1/2` scaling
+  (`y(n) = (1/2) Σ_k X(k) cos((pi/N)(n + 1/2 + N/2)(k + 1/2))`, f64
+  accumulation); `mdct_naive_f32(time, out)` is the forward companion
+  with the `4/N` analysis normalization — the unique choice making the
+  `1/2`-scaled inverse a unit-gain weighted-overlap-add round trip
+  (§4.3.7 leaves the analysis side unconstrained; documented as a
+  decoder-crate convention). `MdctSynthesis` is the streaming
+  weighted-overlap-add state (§4.3.7.1 "output of the inverse MDCT
+  (after weighted overlap-add)"): per `frame()`, IMDCT → synthesis
+  window → overlap-add against the previous frame's saved tail → emit
+  `N` samples; `reset()` zeroes the tail for the §4.5.2 decoder reset.
+  Exposed at the crate root: `celt_window_f32`,
+  `build_window_half_f32`, `build_low_overlap_window_f32`,
+  `imdct_naive_f32`, `mdct_naive_f32`, `MdctSynthesis`,
+  `BASIC_WINDOW_LEN`, `BASIC_WINDOW_HALF`.
+
+  17 new unit tests pin: the window formula against five sampled
+  staged `window120.csv` values (`n = 0, 29, 59, 89, 119`) and five
+  sampled `window240.csv` values (`n = 0, 59, 119, 179, 239`) at
+  `1e-7`; strict monotonicity of the rising half within `(0, 1]`;
+  exact rising-half power complementarity
+  (`W(n)^2 + W(L-1-n)^2 = 1`); the low-overlap segment structure at
+  `(N=480, L=120)` (180 zeros, rise, 360 ones, fall, 180 zeros);
+  degeneration to the basic 240-sample window at full overlap;
+  hop-`N` power complementarity for `N ∈ {120, 240, 480, 960}` at
+  `L = 120`; geometry rejection (`N = 0`, `L = 0`, `L > N`, odd
+  padding); IMDCT/MDCT length-contract rejection; zero spectrum ⇒
+  zero output; IMDCT of a basis vector equals the closed-form
+  `1/2`-scaled cosine; IMDCT linearity; windowed-overlap-add perfect
+  reconstruction (analysis window → MDCT → IMDCT → synthesis window →
+  overlap-add, steady-state ≤ 1e-4) for both the full-overlap
+  `N = 120` and the low-overlap `(N=240, L=120)` geometries; streaming
+  `MdctSynthesis` equality with the offline overlap-add; and shape
+  rejection + `reset()` semantics on the streaming state.
+
+  Pure clean-room: the window formula, basic length, low-overlap
+  recipe, output length, and inverse scaling are RFC 6716 §4.3.7
+  narrative; the MDCT is a public textbook transform; the staged
+  window CSVs are data-only extractions used as validators. Lib test
+  count 384 → 401 (+17).
+
 * **Round-23 §4.3.4 → §4.3.6 single-band shape-decode orchestrator
   (2026-06-10):** the simplest-case per-band decode chain — for a band
   whose `V(N, K)` codebook fits in 32 bits, so no §4.3.4.4 split is
