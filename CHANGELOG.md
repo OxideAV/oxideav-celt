@@ -4,6 +4,28 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1,8](https://github.com/OxideAV/oxideav-celt/compare/v0.1.7...v0.1.8) - 2026-06-12
+
+### Other
+
+- round-25 §4.3.2.1 ec_laplace_decode + coarse-energy decode (RFC 6716 Appendix A)
+- round-24 §4.3.7 inverse MDCT + low-overlap window (RFC 6716)
+- round-23 §4.3.4 → §4.3.6 single-band shape-decode orchestrator (RFC 6716)
+- round-22 §4.3.6 band denormalization (RFC 6716)
+- round-21 §4.3.2.1 e_prob_model Laplace-parameter table (RFC 6716)
+- scrub pre-existing enumerated denial in hadamard.rs + CHANGELOG
+- round-20 §4.3.4.4 PVQ band-split gating + recursion geometry (RFC 6716)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round-19 §4.3.4.3 spreading rotation chain (RFC 6716)
+- round-18 §4.3.4.1 bits-to-pulses search + balance accumulator (RFC 6716)
+- round-17 §4.3.4.2 PVQ codebook + per-band shape decoder (RFC 6716)
+- round-16 §4.3.3 static-allocation search (RFC 6716)
+- round-15 §4.3.3 Table 57 static-allocation table (RFC 6716)
+- round-14 §4.3.3 §2.6 minimums + trim_offsets + Table 55 (RFC 6716)
+- round-13 §4.3.3 initial-reservations budget walk (RFC 6716)
+- round-12 §4.3.3 cache_caps50 + band-boost decode (RFC 6716)
+- round-11 §4.3.4.5 Hadamard transform primitives (RFC 6716)
+
 ### Changed
 
 * **Round-25 (2026-06-12) — coarse-energy module reshaped to the
