@@ -206,8 +206,8 @@ pub fn fine_correction_q14(f: u32, b_bits: u32) -> i32 {
 /// ```
 ///
 /// `n` must be at least `b_bits + 1` to keep the shift non-negative.
-/// Callers that want Q8 (matching the coarse-energy scaffolding's
-/// `prev_q8` convention) call this with `n = 8`; Q14 callers should
+/// Callers that want Q8 (matching the [`crate::denormalization`]
+/// log-energy axis) call this with `n = 8`; Q14 callers should
 /// prefer [`fine_correction_q14`] which short-circuits the runtime
 /// branch.
 pub fn fine_correction_qn(f: u32, b_bits: u32, n: u32) -> i64 {

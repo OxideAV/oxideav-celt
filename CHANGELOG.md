@@ -4,7 +4,88 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+* **Round-25 (2026-06-12) — coarse-energy module reshaped to the
+  normative decode path (breaking):** `CoarseEnergyState` now carries
+  `energy: [[f32; NUM_BANDS]; MAX_CHANNELS]` (per-channel base-2
+  log-energies, the normative floating-point representation) instead
+  of the former mono Q8 scaffold field `prev_q8`, and gains
+  `reset()`. `decode_coarse_energy` gained the
+  `(start, end, channels)` window/channel parameters and returns
+  `Result<(), Error>` (the envelope lands in the state) instead of
+  the former `Result<Vec<i16>, Error>` `NotImplemented` stub. The
+  scaffold helper `apply_intra_prediction` is removed: it pinned a
+  geometric-decay frequency-arm recursion that does not match the
+  §4.3.2.1 filter inversion (`prev += (1 - beta) * q`, no decay on
+  the accumulator) now implemented — and roundtrip-validated —
+  inside `decode_coarse_energy` itself. `Error` gained the
+  `InvalidParameter` variant for out-of-range `lm` / band-window /
+  channel-count arguments.
+
 ### Added
+
+* **Round-25 §4.3.2.1 `ec_laplace_decode` + coarse-energy decode
+  (2026-06-12):** the crate's "lacks ec_laplace_decode recurrence"
+  tail. RFC 6716 §4.3.2.1 delegates the Laplace decode recurrence and
+  the coarse-energy walk to its own Appendix A reference listing
+  (`laplace.c`, `quant_bands.c`), which is embedded in the RFC's text
+  as a base64 tarball; the §A.1 extraction (SHA-1-verified against
+  the value §A.1 prints) makes it part of the staged spec, so both
+  routines are transcribed from it directly.
+
+  `laplace::ec_laplace_decode(dec, fs0, decay)` (RFC 6716 Appendix A
+  `laplace.c`): one 15-bit `ec_decode_bin` probe, the zero span
+  (`fm < fs0`), the geometric magnitude walk (`fs * decay >> 15` per
+  step with the `LAPLACE_MINP = 1` floor folded in), the uniform
+  far-tail (`di = (fm - fl) >> 1` once the geometric part bottoms
+  out; `LAPLACE_NMIN = 16` deltas guaranteed per direction), sign
+  from the lower (negative) / upper (positive) half of each span,
+  and the `ec_dec_update(fl, min(fl + fs, 32768), 32768)` commit.
+  `RangeDecoder` exposes the crate-internal `dec_update` pairing and
+  a new public `storage_bits()` (frame size in bits, the §4.3.2.1
+  budget).
+
+  `coarse_energy::decode_coarse_energy(dec, state, intra, lm, start,
+  end, channels)` (RFC 6716 Appendix A `quant_bands.c`,
+  `unquant_coarse_energy`): per band × channel (band-major,
+  channel-minor), budget-keyed dispatch on `storage_bits() - tell()`
+  — ≥ 15 bits → Laplace with `E_PROB_MODEL[lm][intra][band]` scaled
+  `prob << 7` (Q8→Q15) / `decay << 6` (Q8→Q14); ≥ 2 → 2-bit zig-zag
+  over `SMALL_ENERGY_ICDF = {2, 1, 0}` (`qi ∈ {0, ±1}`); ≥ 1 → one
+  `{1,1}/2` bit (`qi ∈ {0, -1}`); else implicit `qi = -1` without
+  touching the decoder — then the normative floating-point
+  reconstruction `E[b] = coef * max(-9.0, E_prev[b]) + prev + q`,
+  `prev += (1 - beta) * q` (the `max(-9.0, ·)` floor is §4.3.2.1's
+  "prediction is clamped internally" sentence). Inter coefficients
+  `PRED_COEF_Q15 = [29440, 26112, 21248, 16384]` / `BETA_COEF_Q15 =
+  [30147, 22282, 12124, 6554]` (Appendix A `quant_bands.c`); intra
+  `α = 0, β = 4915/32768` (§4.3.2.1 prose). Exposed at the crate
+  root: `ec_laplace_decode`, `LAPLACE_LOG_MINP`, `LAPLACE_MINP`,
+  `LAPLACE_NMIN`, `decode_coarse_energy`, `CoarseEnergyState`,
+  `MAX_CHANNELS`, `PRED_COEF_Q15`, `BETA_COEF_Q15`,
+  `SMALL_ENERGY_ICDF`.
+
+  Validation: `tests/laplace_roundtrip.rs` carries a TEST-ONLY range
+  encoder transcribed from RFC 6716 Appendix A `entenc.c` plus the
+  Appendix A `ec_laplace_encode`, and inverts the decoder
+  bit-for-bit: every `(prob, decay)` cell of `E_PROB_MODEL` (4 × 2 ×
+  21) roundtrips a signed-value pattern with the encoder/decoder
+  `tell()` trajectories equal at every symbol; the uniform far-tail
+  clamp roundtrips at ±20000 (decoder lands on the encoder-committed
+  clamped value); a pinned anchor stream
+  (`[0x27, 0x14, 0x5D, 0xDA, 0xEE]` for `[0, 1, -1, 3, -7, 12, 0,
+  -2]` at `(fs0, decay) = (9216, 8128)`) guards both coder halves
+  against drift; full `decode_coarse_energy` roundtrips cover mono ×
+  all four LM × both prediction modes, stereo with distinct
+  per-channel errors and a below-floor history slot, the hybrid
+  17..21 window, a 4-byte budget-starved frame crossing every
+  fallback tier, and a 0..=24-byte storage sweep — all compared
+  bit-exactly (f32 equality) against an independent evaluation of
+  the reconstruction recursion. 11 new lib tests (Laplace recurrence
+  bounds/determinism/budget accounting + the rewritten coarse-energy
+  unit suite incl. the -9.0 floor and hybrid-window isolation) + 8
+  integration tests. Lib test count 401 → 411; total 419.
 
 * **Round-24 §4.3.7 inverse MDCT + low-overlap window (2026-06-11):**
   the MDCT-machinery tail of the decode chain. RFC 6716 §4.3.7 states

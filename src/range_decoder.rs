@@ -104,6 +104,16 @@ impl<'a> RangeDecoder<'a> {
         dec
     }
 
+    /// Size of the backing frame buffer in bits.
+    ///
+    /// RFC 6716 §4.3.2.1's budget-constrained coarse-energy decode
+    /// compares the running `ec_tell()` against the total number of
+    /// bits in the frame (`storage * 8` in the Appendix A phrasing);
+    /// this accessor exposes that total.
+    pub fn storage_bits(&self) -> u32 {
+        (self.buf.len() as u32).saturating_mul(8)
+    }
+
     /// Whether this decoder has latched a `frame corrupt` error
     /// somewhere in its history. Higher-level decoders use this to
     /// abort the current frame and apply packet-loss concealment.
@@ -372,8 +382,13 @@ impl<'a> RangeDecoder<'a> {
     /// `ec_dec_update(fl, fh, ft)` (RFC 6716 §4.1.2).
     ///
     /// This both narrows the range to the chosen symbol and runs the
-    /// renormalization loop afterwards.
-    fn dec_update(&mut self, fl: u32, fh: u32, ft: u32) {
+    /// renormalization loop afterwards. Exposed crate-internally so
+    /// the §4.3.2.1 Laplace decoder ([`crate::laplace`]) can commit
+    /// the `[fl, fh)` interval it searched for after a
+    /// [`Self::decode_bin`] probe; for `ft` a power of two the
+    /// division reduces to the same shift `decode_bin` used, so the
+    /// pairing is exact.
+    pub(crate) fn dec_update(&mut self, fl: u32, fh: u32, ft: u32) {
         let s = self.rng / ft;
         self.val -= s * (ft - fh);
         if fl > 0 {

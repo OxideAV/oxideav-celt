@@ -2,12 +2,13 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-11
+## Status — 2026-06-12
 
-**Round-24.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
+**Round-25.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
-precede band-decode), the §4.3.2.1 coarse-energy scaffolding (21-band
-layout + intra prediction filter), the §4.3.2.2 fine-energy
+precede band-decode), the complete §4.3.2.1 coarse-energy decoder
+(`ec_laplace_decode` + `decode_coarse_energy`, see the dedicated
+section below), the §4.3.2.2 fine-energy
 refinement decoder + finalize step, the §4.3.3 bit-allocation scalar
 fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.3
 stereo reservation helpers (`LOG2_FRAC_TABLE` lookup + `intensity_rsv`
@@ -30,15 +31,17 @@ form rotation-gain helpers), the §4.3.7.1 post-filter (three tap
 shapes in f32 + Q15 + gain reconstruction + per-sample / slice
 filter response), and the §4.3.7.2 single-pole de-emphasis filter
 (`α_p = 0.8500061035`, in both f32 and Q15) are now wired up. The
-§4.3.2.1 `e_prob_model` Laplace-parameter table is now transcribed
+§4.3.2.1 `e_prob_model` Laplace-parameter table is transcribed
 verbatim (`E_PROB_MODEL[lm][intra][band] -> ProbDecay { prob,
 decay }`, 4 × 2 × 21 = 168 Q8 pairs from
 `docs/audio/celt/tables/e_prob_model.csv`), with the matching
 `prob_decay(lm, intra, band)` accessor that folds the `bool intra`
-flag onto the staged CSV's `0 = inter / 1 = intra` middle axis; the
-`ec_laplace_decode` algorithm itself remains queued for a future
-round (the RFC 6716 §4.3.2.1 narrative gives only the Laplace
-distribution shape, not the per-symbol decode recurrence). The §4.3.3 §2.6 per-band hard-minimum shape
+flag onto the staged CSV's `0 = inter / 1 = intra` middle axis, and
+now feeds the implemented `ec_laplace_decode` per-symbol recurrence
+(transcribed from RFC 6716 Appendix A `laplace.c`, the reference
+listing embedded in the RFC's own text and extracted per §A.1) and
+the `decode_coarse_energy` envelope walk (Appendix A
+`quant_bands.c`, `unquant_coarse_energy`). The §4.3.3 §2.6 per-band hard-minimum shape
 allocation (`compute_thresh`) and the per-band `trim_offsets[]`
 derivation (`compute_trim_offsets`) are now wired up, alongside the
 full §4.3 Table 55 MDCT-bin layout (`BAND_BINS_LM` for all four LM
@@ -117,6 +120,8 @@ Range decoder (RFC 6716 §4.1):
 * `tell()` — whole-bit budget accounting (§4.1.6.1).
 * `tell_frac()` — 1/8th-bit-precision budget accounting (§4.1.6.2),
   satisfying `tell() == ceil(tell_frac()/8)` everywhere.
+* `storage_bits()` — the total frame size in bits, the budget the
+  §4.3.2.1 coarse-energy fallback dispatch compares `tell()` against.
 * Sticky `has_error()` for the corrupt-frame path documented in
   §4.1.5.
 
@@ -135,26 +140,42 @@ CELT frame header (RFC 6716 §4.3 prefix + §4.3.5 anti-collapse):
 * `CeltFrameHeader::post_filter_gain_q15()` rebuilds the §4.3.7.1
   gain `G = 3*(gain+1)/32` in Q15 fixed-point.
 
-Coarse-energy scaffold (RFC 6716 §4.3.2.1):
+Coarse-energy decoding (RFC 6716 §4.3.2.1 + Appendix A `laplace.c`
+/ `quant_bands.c`):
 
 * `NUM_BANDS = 21` (RFC Table 55). Pure CELT codes all 21 bands;
   Hybrid mode codes only bands 17..=20 (the SILK layer covers
-  0..=16 below 8 kHz).
-* `INTRA_ALPHA_Q15 = 0`, `INTRA_BETA_Q15 = 4915` (the literal Q15
-  coefficients RFC line 6063 supplies for intra-mode prediction;
-  `4915 / 32768 ≈ 0.1500`).
-* `CoarseEnergyState::new()` holds the previous frame's per-band
-  Q8 log-energies, zero on stream open and after any decoder reset.
-* `apply_intra_prediction(errors_q8, out_q8)` runs the §4.3.2.1
-  prediction filter in its intra reduction — the β-IIR over bands
-  with the temporal arm vanishing.
-* `decode_coarse_energy(dec, state, intra, lm)` is the locked-in
-  public entry point; it currently returns `Error::NotImplemented`
-  because the `ec_laplace_decode` algorithm is docs-gap-blocked
-  (the RFC narrative gives only the Laplace-distribution shape,
-  not the per-symbol decode recurrence). The gap'd path is asserted
-  not to disturb the range decoder or the carried state so that
-  future rounds compose cleanly.
+  0..=16 below 8 kHz). `MAX_CHANNELS = 2`.
+* `ec_laplace_decode(dec, fs0, decay)` — the §4.3.2.1 per-symbol
+  Laplace decode recurrence, transcribed from RFC 6716 Appendix A
+  `laplace.c` (the reference listing embedded in the RFC's own text,
+  extracted per §A.1 and SHA-1-verified against the value §A.1
+  prints). One 15-bit `ec_decode_bin` probe, a geometric walk down
+  the decaying tail (`fs * decay >> 15` per magnitude step with the
+  `LAPLACE_MINP` floor), the uniform `LAPLACE_MINP` far-tail
+  (`LAPLACE_NMIN = 16` deltas guaranteed per direction), sign from
+  the lower/upper half of the magnitude span, and the `ec_dec_update`
+  interval commit. Validated by inverting a test-only Appendix A
+  `entenc.c`/`laplace.c` encoder transcription bit-for-bit across
+  every `E_PROB_MODEL` cell (`tests/laplace_roundtrip.rs`), including
+  the far-tail clamp and a pinned anchor stream.
+* `decode_coarse_energy(dec, state, intra, lm, start, end, channels)`
+  — the full §4.3.2.1 envelope walk (Appendix A
+  `unquant_coarse_energy`): per band × channel, budget-keyed dispatch
+  on `storage_bits() - tell()` (≥ 15 bits → Laplace with the
+  `E_PROB_MODEL[lm][intra][band]` pair scaled `prob << 7` / `decay
+  << 6`; ≥ 2 → 2-bit zig-zag over `SMALL_ENERGY_ICDF = {2, 1, 0}`;
+  ≥ 1 → one `{1,1}/2` bit; else implicit `qi = -1`), then the
+  normative-float reconstruction `E[b] = coef * max(-9.0,
+  E_prev[b]) + prev + q` with `prev += (1 - beta) * q` per channel.
+* `CoarseEnergyState { energy: [[f32; 21]; 2] }` carries the
+  per-channel base-2 log-energies (1.0 = 6 dB) across frames;
+  `reset()` zeroes it for the §4.5.2 decoder reset.
+* Prediction coefficients: intra `INTRA_ALPHA_Q15 = 0` /
+  `INTRA_BETA_Q15 = 4915` (the literal §4.3.2.1 `4915/32768`);
+  inter per-LM rows `PRED_COEF_Q15 = [29440, 26112, 21248, 16384]`
+  and `BETA_COEF_Q15 = [30147, 22282, 12124, 6554]` (Appendix A
+  `quant_bands.c`).
 * `E_PROB_MODEL[lm][intra][band] -> ProbDecay { prob, decay }` —
   the §4.3.2.1 Laplace-parameter table, 4 × 2 × 21 = 168 Q8 pairs,
   transcribed verbatim from `docs/audio/celt/tables/e_prob_model.csv`.
@@ -626,8 +647,9 @@ Band denormalization (RFC 6716 §4.3.6):
 
 * `log_energy_q8_to_amplitude_f32(log_energy_q8) -> f32` returns the
   per-sample amplitude factor `A = sqrt(2^(E_q8 / 256)) = 2^(E_q8 / 512)`
-  in f32, working in the same Q8 base-2 log-energy representation
-  [`CoarseEnergyState::prev_q8`] carries.
+  in f32, working on the Q8 rendering of the §4.3.2.1 base-2
+  log-energy axis (`CoarseEnergyState::energy` carries the normative
+  f32 form; multiply by 256 and round to land on this axis).
 * `scale_band_f32(shape, amplitude, out)` and
   `scale_band_in_place_f32(samples, amplitude)` multiply each sample by
   a precomputed amplitude; useful when one band is denormalized
@@ -719,10 +741,15 @@ The implementation references only the IETF specifications under
 * RFC 8251 — Opus Update.
 * RFC 7845 — Ogg Encapsulation for Opus (consulted for framing).
 
-Source files the RFC delegates to for normative numeric tables and
-algorithms sit outside the workspace clean-room allow-list and were
-not consulted. Black-box invocations of `opusdec` / `opusenc` are
-allowed as opaque validators only.
+RFC 6716's Appendix A reference listing is embedded in the RFC's own
+text (a base64 tarball extracted per §A.1, SHA-1-verified against the
+value §A.1 prints) and is therefore part of the staged spec; the
+§4.3.2.1 coarse-energy path cites it as "RFC 6716 Appendix A
+`<file>`". Any source outside the staged RFC text — including any
+external distribution of the same reference code — sits outside the
+workspace clean-room allow-list and was not consulted. Black-box
+invocations of `opusdec` / `opusenc` are allowed as opaque validators
+only.
 
 ## License
 

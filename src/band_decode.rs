@@ -99,8 +99,9 @@ pub struct BandShape {
 /// * `tf_adjustment` — the §4.3.4.5 per-band TF adjustment
 ///   ([`crate::tf_change::tf_adjustment`]); `0` is a no-op.
 /// * `log_energy_q8` — the §4.3.2.1/§4.3.2.2 reconstructed band energy
-///   in the Q8 base-2 log domain (the value
-///   [`crate::coarse_energy::CoarseEnergyState`] carries).
+///   in the Q8 base-2 log domain
+///   ([`crate::coarse_energy::CoarseEnergyState`] carries the
+///   normative f32 form; multiply by 256 and round to get this value).
 ///
 /// Returns `None` when the PVQ decode fails (saturated codebook —
 /// caller must split per §4.3.4.4 — `N == 0` with `K > 0`, a sticky

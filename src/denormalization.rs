@@ -30,18 +30,19 @@
 //! ## Scope
 //!
 //! This module is decoder-side only. It operates on caller-supplied
-//! shape vectors + Q8 log-energy values, so it composes cleanly with
-//! the future coarse-energy decoder once the `ec_laplace_decode`
-//! docs gap (see [`crate::coarse_energy`]) closes. No range-decoder
-//! interaction; no allocation-budget interaction.
+//! shape vectors + Q8 log-energy values, composing with the
+//! [`crate::coarse_energy`] decoder (whose normative-form f32
+//! log-energies land on this Q8 axis after a multiply by 256 and a
+//! round). No range-decoder interaction; no allocation-budget
+//! interaction.
 //!
 //! ## Provenance
 //!
 //! The §4.3.6 multiplicative step is stated in the RFC narrative as
 //! plain prose (one sentence; no normative source-file delegation).
-//! The Q8 log-2 energy representation is the same one
-//! [`crate::coarse_energy`] uses for `CoarseEnergyState::prev_q8`
-//! (RFC 6716 §4.3.2.1 lines 6031–6037). The
+//! The Q8 fixed-point log-2 energy axis is a 256-per-log2-step
+//! rendering of the §4.3.2.1 base-2 log domain (RFC 6716 §4.3.2.1
+//! lines 6031–6037) that [`crate::coarse_energy`] reconstructs. The
 //! `sqrt(2^E) = 2^(E/2)` identity is elementary arithmetic.
 
 use crate::coarse_energy::NUM_BANDS;

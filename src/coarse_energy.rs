@@ -1,4 +1,4 @@
-//! Coarse-energy decoding (RFC 6716 §4.3.2.1) — scaffold + DOCS GAP.
+//! Coarse-energy decoding (RFC 6716 §4.3.2.1).
 //!
 //! ## What this module covers
 //!
@@ -9,93 +9,81 @@
 //! that runs jointly across **time** (against the previous frame's
 //! final fine-quantised energy) and **frequency** (across bands within
 //! the current frame's coarse-quantised energies). The prediction
-//! error is then entropy-coded with a Laplace distribution whose
-//! parameters depend on the frame size and on the intra-vs-inter mode.
+//! error is entropy-coded with a Laplace distribution whose
+//! `(prob, decay)` parameters depend on the frame size and on the
+//! intra-vs-inter mode ([`crate::e_prob_model::E_PROB_MODEL`]); the
+//! per-symbol decode recurrence is [`crate::laplace::ec_laplace_decode`].
 //!
 //! Per RFC 6716 §4.3 (Table 55), the standard CELT mode operates on
 //! **21 bands** (band index 0..=20). Hybrid mode reuses the same
 //! 21-band layout but the first 17 bands (covering 0..8 kHz) are
 //! coded by the SILK layer, leaving bands 17..=20 for CELT.
 //!
-//! ## DOCS GAP: e_prob_model + ec_laplace_decode (filed 2026-05-21)
+//! ## The prediction filter
 //!
-//! RFC 6716 §4.3.2.1 normatively describes the coarse-energy
-//! mechanism but DELEGATES the actual numeric parameters and the
-//! Laplace-decoder algorithm to source files that sit outside the
-//! workspace's clean-room allow-list. The §4.3.2.1 prose names the
-//! delegation target by file name; we redact those names here to keep
-//! the comment free of forbidden-source references. The unredacted
-//! prose lives at lines 6073–6077 of
-//! `docs/audio/opus/rfc6716-opus.txt`.
+//! The §4.3.2.1 filter's 2-D z-transform is
 //!
-//! The RFC's prose gives us:
+//! ```text
+//!                (1 - alpha*z_l^-1) * (1 - z_b^-1)
+//! A(z_l, z_b) =  ---------------------------------
+//!                         1 - beta*z_b^-1
+//! ```
 //!
-//! * The 2-D z-transform of the prediction filter (eq. between lines
-//!   6055–6059).
-//! * The intra-mode prediction coefficients: `alpha=0,
-//!   beta=4915/32768` (RFC line 6063). These are the ONLY numeric
-//!   prediction coefficients the RFC supplies directly; the inter-mode
-//!   `(alpha, beta)` pairs vary with the frame size and live in
-//!   `e_prob_model[][]` (off-limits).
-//! * The coarse step's 6 dB (1.0 in base-2 log) integer resolution
-//!   (RFC line 6036).
+//! where `l` is the frame index (the time arm) and `b` is the band
+//! index (the frequency arm). Inverting the filter on the decode side
+//! gives the per-band reconstruction recursion the RFC delegates to
+//! `unquant_coarse_energy()` (RFC 6716 Appendix A `quant_bands.c`,
+//! part of the staged spec — the reference listing is embedded in the
+//! RFC's own text and extracted per §A.1):
 //!
-//! The RFC gives us NEITHER:
+//! ```text
+//! E[b]  = coef * max(-9.0, E_prev_frame[b]) + prev + q[b]
+//! prev += q[b] - beta * q[b]
+//! ```
 //!
-//! * The `e_prob_model` numeric table (per-band Laplace `expect` and
-//!   `decay` parameters × intra/inter × 4 frame sizes).
-//! * The `ec_laplace_decode` algorithm (range-coded budget-aware
-//!   Laplace integer decode with a fall-through to a uniform decoder
-//!   when the residual is large — only the RFC's narrative shape, not
-//!   the numeric steps).
+//! with `q[b]` the decoded prediction error (in integer 6 dB steps)
+//! and `prev` the running frequency-arm predictor, reset to zero at
+//! the start of every frame. The `max(-9.0, ·)` floor is the
+//! "prediction is clamped internally" sentence of §4.3.2.1 — it keeps
+//! fixed-point and floating-point implementations in the same state.
+//! The normative behaviour is the floating-point configuration
+//! (RFC 6716 Appendix A preamble), so the recursion here runs in
+//! `f32`; energies are in base-2 log units (1.0 = 6 dB).
 //!
-//! Without either piece, this round CANNOT land a bit-exact
-//! coarse-energy decoder. What we land instead, within the wall, is:
+//! ## Prediction coefficients
 //!
-//! 1. The 21-band layout (`NUM_BANDS`) per RFC Table 55.
-//! 2. The intra-mode prediction coefficients in Q15 fixed-point
-//!    (`INTRA_ALPHA_Q15`, `INTRA_BETA_Q15`), the only numeric
-//!    parameters §4.3.2.1 supplies directly.
-//! 3. The 2-D prediction filter applied as a stand-alone helper
-//!    ([`apply_intra_prediction`]) over an externally-supplied
-//!    prediction-error vector — i.e. the post-Laplace-decode path,
-//!    parameterised on Laplace output that arrives from a future
-//!    `e_prob_model`-fed round.
-//! 4. The `CoarseEnergyState` carrier struct (the running
-//!    per-band previous-frame log-energies and per-band
-//!    within-frame running prediction) so that future rounds can drop
-//!    the Laplace decoder + table in without re-shaping data flow.
-//! 5. A public entry point [`decode_coarse_energy`] that, until the
-//!    docs gap closes, returns [`Error::NotImplemented`] with a clear
-//!    pointer to this module's docstring.
+//! * Intra mode: `alpha = 0, beta = 4915/32768` — the only pair the
+//!   §4.3.2.1 prose states directly ([`INTRA_ALPHA_Q15`],
+//!   [`INTRA_BETA_Q15`]).
+//! * Inter mode: per-frame-size `(alpha, beta)` pairs from RFC 6716
+//!   Appendix A `quant_bands.c` (`pred_coef[]` / `beta_coef[]`),
+//!   transcribed as [`PRED_COEF_Q15`] / [`BETA_COEF_Q15`].
 //!
-//! Closing the gap requires the docs collaborator to commission a
-//! clean-room derivation of:
+//! ## Budget-constrained fallbacks
 //!
-//! * `e_prob_model[2][4][42]` (two modes × four LM values × 21 bands
-//!   × 2 parameters): the intra and inter Laplace parameters for
-//!   every band/frame-size combination. The shape and numeric values
-//!   are not derivable from spec PDFs alone; they need to be either
-//!   transcribed from an allowed spec source (none known to exist)
-//!   or commissioned as a clean-room behavioural-trace document
-//!   anchored to a black-box `opusdec` validator.
-//! * The `ec_laplace_decode` algorithm prose (budget-aware decode of
-//!   a Laplace-coded signed integer using `dec_uint` / `dec_icdf`
-//!   primitives, with the fall-back uniform-decode for residual
-//!   magnitudes beyond what the Laplace prefix can encode).
+//! At very low rates the Laplace symbol may not fit in the remaining
+//! frame budget. Per RFC 6716 Appendix A `quant_bands.c`
+//! (`unquant_coarse_energy`), each band/channel slot degrades through
+//! three fallbacks keyed on `budget - tell()`:
 //!
-//! Once that lands, [`decode_coarse_energy`] can be wired up to the
-//! [`apply_intra_prediction`] helper here without restructuring the
-//! state interface.
+//! * `>= 15` bits left — full Laplace decode.
+//! * `>= 2` — a 2-bit zig-zag symbol over [`SMALL_ENERGY_ICDF`]
+//!   (`qi ∈ {-1, 0, +1}`).
+//! * `>= 1` — a single `{1,1}/2` bit (`qi ∈ {-1, 0}`).
+//! * otherwise — `qi = -1` without consuming any bits.
 //!
 //! ## Clean-room provenance
 //!
-//! Every numeric value, every formula, and every field comment in
-//! this file is transcribed from RFC 6716 (`docs/audio/opus/`). The
-//! source files that the RFC delegates to for the `e_prob_model`
-//! table and the Laplace decoder algorithm sit outside the
-//! workspace's clean-room allow-list and were not consulted.
+//! Every numeric value and every step in this file is transcribed
+//! from RFC 6716: the §4.3.2.1 narrative for the model and the
+//! Appendix A reference listing (`quant_bands.c`, `laplace.c`) for
+//! the recursion and the delegated coefficient tables. The appendix
+//! is part of the staged spec at `docs/audio/opus/rfc6716-opus.txt`
+//! (extracted per §A.1, SHA-1 verified against the value printed
+//! there). No source outside the staged RFC was consulted.
 
+use crate::e_prob_model::{E_PROB_MODEL, NUM_LM_FRAME_SIZES, PRED_INTER, PRED_INTRA};
+use crate::laplace::ec_laplace_decode;
 use crate::range_decoder::RangeDecoder;
 use crate::Error;
 
@@ -106,13 +94,15 @@ use crate::Error;
 /// CELT codes all 21 bands.
 pub const NUM_BANDS: usize = 21;
 
+/// Maximum number of channels a CELT frame codes (mono or stereo,
+/// RFC 6716 §4.3).
+pub const MAX_CHANNELS: usize = 2;
+
 /// Intra-mode prediction coefficient α in Q15 fixed-point per
-/// RFC 6716 §4.3.2.1 (line 6063 of `docs/audio/opus/rfc6716-opus.txt`).
+/// RFC 6716 §4.3.2.1.
 ///
-/// The RFC states "alpha=0 ... when using intra energy". In Q15 that
-/// is the integer 0; the constant exists for symmetry with the
-/// inter-mode lookup that a future round will introduce once the
-/// `e_prob_model` docs gap closes.
+/// The RFC states "alpha=0 ... when using intra energy": the time arm
+/// of the prediction filter vanishes entirely on intra frames.
 pub const INTRA_ALPHA_Q15: i32 = 0;
 
 /// Intra-mode prediction coefficient β in Q15 fixed-point per
@@ -122,31 +112,56 @@ pub const INTRA_ALPHA_Q15: i32 = 0;
 /// is `2^15`, the Q15 numerator is the literal 4915.
 pub const INTRA_BETA_Q15: i32 = 4915;
 
-/// Q15 scale used by the prediction filter coefficients above.
+/// Inter-mode time-arm prediction coefficients α in Q15, indexed by
+/// `LM = log2(frame_size / 120) ∈ 0..=3` (RFC 6716 Appendix A
+/// `quant_bands.c`, `pred_coef[]`). §4.3.2.1 prose: "The prediction
+/// coefficients applied depend on the frame size in use when not
+/// using intra energy".
+pub const PRED_COEF_Q15: [i32; NUM_LM_FRAME_SIZES] = [29440, 26112, 21248, 16384];
+
+/// Inter-mode frequency-arm prediction coefficients β in Q15, indexed
+/// by `LM` (RFC 6716 Appendix A `quant_bands.c`, `beta_coef[]`).
+pub const BETA_COEF_Q15: [i32; NUM_LM_FRAME_SIZES] = [30147, 22282, 12124, 6554];
+
+/// Inverse-CDF table for the 2-bit low-budget fallback symbol
+/// (RFC 6716 Appendix A `quant_bands.c`, `small_energy_icdf`):
+/// PDF `{2, 1, 1}/4` over the zig-zag-coded `qi ∈ {0, -1, +1}`.
+pub const SMALL_ENERGY_ICDF: [u8; 3] = [2, 1, 0];
+
+/// Q15 scale used by the prediction-filter coefficients above.
 const Q15_ONE: i32 = 1 << 15;
 
-/// Per-band running coarse-energy state across CELT frames.
+/// The §4.3.2.1 internal prediction clamp: the previous frame's
+/// log-energy is floored at -9.0 (base-2 log units) before the time
+/// arm multiplies it (RFC 6716 Appendix A `quant_bands.c`).
+const ENERGY_FLOOR: f32 = -9.0;
+
+/// Minimum whole-bit budget headroom required to decode a full
+/// Laplace symbol for one band/channel slot (RFC 6716 Appendix A
+/// `quant_bands.c`, `unquant_coarse_energy`).
+const LAPLACE_MIN_BUDGET_BITS: u32 = 15;
+
+/// Per-band, per-channel running log-energy state across CELT frames.
 ///
-/// `prev_q8` stores the previous frame's final fine-quantised log-2
-/// energy for each band, in Q8 fixed-point relative to the reference
-/// quietest representable energy. The state is only consulted in
-/// inter-frame mode; intra frames reset the prediction's temporal arm
-/// to zero (RFC 6716 §4.3.2.1: "an 'intra' frame where the energy is
-/// coded without reference to prior frames").
+/// `energy[c][b]` is channel `c`'s band-`b` log-2 energy (1.0 = 6 dB)
+/// as of the most recently decoded frame. The §4.3.2.1 inter-frame
+/// time arm predicts against this state; the §4.3.2.2 fine and
+/// finalize refinements further adjust it downstream before the next
+/// frame's prediction runs.
 ///
 /// Decoder lifecycle:
 ///
-/// * `CoarseEnergyState::new()` on stream open (all-zero history).
-/// * After each frame's fine-quantisation step has been applied
-///   downstream, the caller writes the final per-band log-energies
-///   into `prev_q8` for the next frame's inter-mode prediction.
-/// * A decoder reset (packet loss recovery, mode switch) clears
-///   `prev_q8` to zero, matching the encoder's expected state.
+/// * [`CoarseEnergyState::new`] on stream open (all-zero history).
+/// * [`decode_coarse_energy`] reads one frame's coarse envelope and
+///   updates `energy` in place.
+/// * A decoder reset (packet-loss recovery, mode switch) calls
+///   [`CoarseEnergyState::reset`], matching the encoder's expected
+///   state.
 #[derive(Debug, Clone, Copy)]
 pub struct CoarseEnergyState {
-    /// Previous frame's final fine-quantised log-2 energy, Q8, per
-    /// band. Zero on stream open and after any decoder reset.
-    pub prev_q8: [i32; NUM_BANDS],
+    /// Per-channel, per-band base-2 log-energy from the most recent
+    /// frame. Zero on stream open and after any decoder reset.
+    pub energy: [[f32; NUM_BANDS]; MAX_CHANNELS],
 }
 
 impl CoarseEnergyState {
@@ -154,8 +169,13 @@ impl CoarseEnergyState {
     /// at zero log-energy.
     pub fn new() -> Self {
         Self {
-            prev_q8: [0; NUM_BANDS],
+            energy: [[0.0; NUM_BANDS]; MAX_CHANNELS],
         }
+    }
+
+    /// Zero the carried energies (§4.5.2 decoder reset).
+    pub fn reset(&mut self) {
+        self.energy = [[0.0; NUM_BANDS]; MAX_CHANNELS];
     }
 }
 
@@ -165,105 +185,96 @@ impl Default for CoarseEnergyState {
     }
 }
 
-/// Apply the §4.3.2.1 prediction filter to a vector of prediction
-/// errors, producing per-band coarse log-2 energies in Q8.
+/// Decode one CELT frame's coarse energy envelope
+/// (RFC 6716 §4.3.2.1; Appendix A `quant_bands.c`,
+/// `unquant_coarse_energy`).
 ///
-/// The §4.3.2.1 filter's z-transform is
+/// * `state` carries the previous frame's per-band log-energies and
+///   is updated in place with this frame's coarse-quantised values
+///   for bands `start..end` of each coded channel (other bands and
+///   channels are left untouched).
+/// * `intra` is the §4.3.2.1 intra flag decoded by
+///   [`crate::frame_header::CeltFrameHeader::decode_prefix`]; it
+///   selects `alpha = 0, beta = 4915/32768` and the intra column of
+///   `E_PROB_MODEL`.
+/// * `lm` is `log2(frame_size / 120) ∈ 0..=3` per RFC 6716 §4.3.3.
+/// * `start..end` is the coded band window: `0..21` for pure CELT,
+///   `17..21` for hybrid mode.
+/// * `channels` is 1 (mono) or 2 (stereo). Channels interleave
+///   within each band (band-major, channel-minor), matching the
+///   bitstream order.
 ///
-/// ```text
-///                (1 - alpha*z_l^-1) * (1 - z_b^-1)
-/// A(z_l, z_b) =  --------------------------------
-///                         1 - beta*z_b^-1
-/// ```
+/// The per-slot decode degrades through the budget-keyed fallbacks
+/// described in the module docs; the budget is the frame size in
+/// bits ([`RangeDecoder::storage_bits`]).
 ///
-/// where `l` is the frame index (the time arm) and `b` is the band
-/// index (the frequency arm). Expanding for our scalar form, the
-/// per-band recursion that **produces** the coarse log-energy `E[b]`
-/// from the **prediction error** `e[b]` is:
-///
-/// ```text
-/// E_pred[b] = alpha * prev_q8[b]                  (time arm)
-///           + sum over b' < b of e[b'] * beta^(b - b' - 1)
-///                                                 (freq arm)
-/// E[b] = E_pred[b] + e[b]
-/// ```
-///
-/// In intra mode `alpha = 0` so the time arm vanishes entirely. The
-/// frequency arm reduces to a single-pole IIR with coefficient β:
-///
-/// ```text
-/// running = 0
-/// for b in 0..NUM_BANDS:
-///     E[b] = running + e[b]
-///     running = (running + e[b]) * INTRA_BETA_Q15 / Q15_ONE
-///             = (E[b]) * INTRA_BETA_Q15 / Q15_ONE
-/// ```
-///
-/// The function takes the prediction errors in Q8 (matching the
-/// state's `prev_q8` scale) and writes the reconstructed Q8
-/// log-energies back into the supplied output slice.
-///
-/// This is the post-Laplace-decode arithmetic. It does NOT touch the
-/// range decoder. It is exposed so that future rounds can compose it
-/// with a Laplace decoder once the e_prob_model gap is closed; the
-/// existing tests pin its behaviour against the RFC's stated formula
-/// without needing the gap'd table.
-pub fn apply_intra_prediction(errors_q8: &[i32; NUM_BANDS], out_q8: &mut [i32; NUM_BANDS]) {
-    // Intra mode: alpha = 0, so the time arm contributes nothing. The
-    // frequency arm is a single-pole IIR over the previous band's
-    // reconstructed log-energy, scaled by β.
-    let mut running: i32 = 0;
-    for b in 0..NUM_BANDS {
-        // E[b] = running + e[b]; the running prediction is the
-        // β-filtered cumulative sum of prior bands' reconstructions.
-        let e = errors_q8[b];
-        let recon = running.saturating_add(e);
-        out_q8[b] = recon;
-        // Update running prediction for band b+1. The β multiply is
-        // done in Q15 with a rounding right-shift to stay in Q8.
-        // Numerator: recon * INTRA_BETA_Q15 (in Q8 * Q15 = Q23).
-        // Divisor:   Q15_ONE.
-        running = ((recon as i64 * INTRA_BETA_Q15 as i64) / Q15_ONE as i64) as i32;
-    }
-}
-
-/// Decode coarse energies for one CELT frame (RFC 6716 §4.3.2.1).
-///
-/// **NOT IMPLEMENTED.** Returns [`Error::NotImplemented`] until the
-/// `e_prob_model` table and the `ec_laplace_decode` algorithm are
-/// available as clean-room specifications. See the module docstring
-/// for the full docs-gap statement and the closure requirements.
-///
-/// The signature is locked in so that this round's scaffolding +
-/// future rounds' Laplace + table work compose without breaking
-/// callers. The intended contract is:
-///
-/// * `state` carries the previous frame's final fine-quantised
-///   log-energies (Q8) and is mutated to record this frame's
-///   coarse-quantised log-energies for next-frame inter prediction.
-///   The fine quantisation step in §4.3.2.2 may further refine the
-///   stored values before they propagate.
-/// * `intra` matches the `intra` flag decoded by
-///   [`crate::frame_header::CeltFrameHeader::decode_prefix`].
-/// * `_lm` is `log2(frame_size / 120)` per RFC 6716 §4.3.3, in the
-///   range 0..=3 covering 2.5 / 5 / 10 / 20 ms CELT frames.
-/// * The returned `Vec<i16>` is the per-band coarse log-energy in
-///   6 dB units (the §4.3.2.1 "integer part of base-2 log"), one
-///   entry per band that this frame codes (21 entries for pure CELT,
-///   4 entries for hybrid mode covering only bands 17..=20).
+/// Returns [`Error::InvalidParameter`] for an out-of-range `lm`,
+/// band window, or channel count; the decoder and state are not
+/// touched in that case.
 pub fn decode_coarse_energy(
-    _dec: &mut RangeDecoder<'_>,
-    _state: &mut CoarseEnergyState,
-    _intra: bool,
-    _lm: u32,
-) -> Result<Vec<i16>, Error> {
-    // The Laplace decoder + e_prob_model probability table are
-    // off-limits per the workspace clean-room policy (the RFC names
-    // source files outside the workspace clean-room allow-list as
-    // their normative location). See the
-    // module docstring's DOCS GAP section for the closure
-    // requirements.
-    Err(Error::NotImplemented)
+    dec: &mut RangeDecoder<'_>,
+    state: &mut CoarseEnergyState,
+    intra: bool,
+    lm: u32,
+    start: usize,
+    end: usize,
+    channels: usize,
+) -> Result<(), Error> {
+    if lm as usize >= NUM_LM_FRAME_SIZES
+        || start > end
+        || end > NUM_BANDS
+        || channels == 0
+        || channels > MAX_CHANNELS
+    {
+        return Err(Error::InvalidParameter);
+    }
+    let lm = lm as usize;
+    let pred = if intra { PRED_INTRA } else { PRED_INTER };
+    // Normative float configuration: the Q15 integer coefficients
+    // divide out exactly (the numerators are < 2^15, so the f32
+    // quotients are exact dyadic rationals).
+    let (coef, beta) = if intra {
+        (0.0_f32, INTRA_BETA_Q15 as f32 / Q15_ONE as f32)
+    } else {
+        (
+            PRED_COEF_Q15[lm] as f32 / Q15_ONE as f32,
+            BETA_COEF_Q15[lm] as f32 / Q15_ONE as f32,
+        )
+    };
+    let budget = dec.storage_bits();
+    // The frequency-arm predictor resets at every frame boundary,
+    // independently per channel.
+    let mut prev = [0.0_f32; MAX_CHANNELS];
+    for band in start..end {
+        for (c, prev_c) in prev.iter_mut().enumerate().take(channels) {
+            let tell = dec.tell();
+            let bits_left = budget.saturating_sub(tell);
+            let qi: i32 = if bits_left >= LAPLACE_MIN_BUDGET_BITS {
+                // Full Laplace decode. The table stores Q8 bytes; the
+                // Laplace decoder wants the zero-probability in Q15
+                // (<< 7) and the decay in Q14 (<< 6).
+                let pd = E_PROB_MODEL[lm][pred][band.min(NUM_BANDS - 1)];
+                ec_laplace_decode(dec, (pd.prob as u32) << 7, (pd.decay as u32) << 6)
+            } else if bits_left >= 2 {
+                // 2-bit zig-zag fallback: symbol s ∈ {0, 1, 2} maps to
+                // qi ∈ {0, -1, +1} via (s >> 1) ^ -(s & 1).
+                let s = dec.dec_icdf(&SMALL_ENERGY_ICDF, 2) as i32;
+                (s >> 1) ^ -(s & 1)
+            } else if bits_left >= 1 {
+                // 1-bit fallback: qi ∈ {0, -1}.
+                -(dec.dec_bit_logp(1) as i32)
+            } else {
+                // No bits left at all: the implicit prediction error.
+                -1
+            };
+            let q = qi as f32;
+            // §4.3.2.1 internal clamp on the time-arm input.
+            let old = state.energy[c][band].max(ENERGY_FLOOR);
+            state.energy[c][band] = coef * old + *prev_c + q;
+            *prev_c += q - beta * q;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -276,146 +287,223 @@ mod tests {
     #[test]
     fn num_bands_matches_rfc_table_55() {
         assert_eq!(NUM_BANDS, 21);
+        assert_eq!(MAX_CHANNELS, 2);
     }
 
     /// The intra prediction coefficients are stated in RFC 6716
-    /// §4.3.2.1 (line 6063): `alpha=0, beta=4915/32768`. Verify both
-    /// the integer values and the Q15 interpretation.
+    /// §4.3.2.1: `alpha=0, beta=4915/32768`. The inter coefficient
+    /// rows come from RFC 6716 Appendix A `quant_bands.c` and must
+    /// hold one Q15 value per LM.
     #[test]
-    fn intra_prediction_coefficients_match_rfc() {
+    fn prediction_coefficients_match_spec() {
         assert_eq!(INTRA_ALPHA_Q15, 0);
         assert_eq!(INTRA_BETA_Q15, 4915);
-        // 4915 / 32768 ≈ 0.1500244 — the RFC's chosen β as a fraction
-        // of Q15_ONE.
         assert_eq!(Q15_ONE, 32_768);
-        // Spot-check the fixed-point reconstruction matches the
-        // decimal value to within Q15 precision. 4915 / 32768 ≈
-        // 0.14999389..., so 4915 * 100_000 / 32_768 = 14_999 under
-        // integer-truncating division — within one part in 10^5 of
-        // the spec's stated value 0.15.
-        let beta_per_100k = INTRA_BETA_Q15 * 100_000 / Q15_ONE;
-        assert_eq!(beta_per_100k, 14_999);
+        assert_eq!(PRED_COEF_Q15, [29440, 26112, 21248, 16384]);
+        assert_eq!(BETA_COEF_Q15, [30147, 22282, 12124, 6554]);
+        // Every coefficient is a proper Q15 fraction (< 1.0), so the
+        // recursion is stable in both arms.
+        for lm in 0..NUM_LM_FRAME_SIZES {
+            assert!(PRED_COEF_Q15[lm] > 0 && PRED_COEF_Q15[lm] < Q15_ONE);
+            assert!(BETA_COEF_Q15[lm] > 0 && BETA_COEF_Q15[lm] < Q15_ONE);
+        }
+        // The time-arm coefficient weakens as frames get longer
+        // (more time between predictions), monotonically.
+        for lm in 1..NUM_LM_FRAME_SIZES {
+            assert!(PRED_COEF_Q15[lm] < PRED_COEF_Q15[lm - 1]);
+            assert!(BETA_COEF_Q15[lm] < BETA_COEF_Q15[lm - 1]);
+        }
     }
 
-    /// A freshly-constructed state has all 21 bands at zero log-energy.
-    /// This is the required state both on stream open and after any
-    /// decoder reset (RFC 6716 §4.3.2.1 implicitly assumes the
-    /// previous-frame state vanishes on intra-coded frames; we also
-    /// snap to zero on reset to match the encoder's expected state).
+    /// The 2-bit fallback table is the `{2, 1, 1}/4` PDF in §4.1.3.3
+    /// ICDF form, with the mandatory terminating 0.
     #[test]
-    fn new_state_is_all_zero() {
-        let state = CoarseEnergyState::new();
-        assert_eq!(state.prev_q8, [0i32; NUM_BANDS]);
-        // Default trait matches `new`.
-        assert_eq!(CoarseEnergyState::default().prev_q8, state.prev_q8);
+    fn small_energy_icdf_shape() {
+        assert_eq!(SMALL_ENERGY_ICDF, [2, 1, 0]);
+        // Strictly decreasing with terminating zero per §4.1.3.3.
+        assert!(SMALL_ENERGY_ICDF[0] > SMALL_ENERGY_ICDF[1]);
+        assert!(SMALL_ENERGY_ICDF[1] > SMALL_ENERGY_ICDF[2]);
+        assert_eq!(*SMALL_ENERGY_ICDF.last().unwrap(), 0);
     }
 
-    /// With every prediction error zero, the §4.3.2.1 intra filter
-    /// must reconstruct every band at zero — the trivial silence case.
+    /// A freshly-constructed state has all bands of both channels at
+    /// zero log-energy; `reset()` restores that after mutation.
     #[test]
-    fn intra_prediction_zero_errors_yields_zero_output() {
-        let errors = [0i32; NUM_BANDS];
-        let mut out = [0i32; NUM_BANDS];
-        apply_intra_prediction(&errors, &mut out);
-        assert_eq!(out, [0i32; NUM_BANDS]);
+    fn new_state_is_all_zero_and_resets() {
+        let mut state = CoarseEnergyState::new();
+        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+        assert_eq!(CoarseEnergyState::default().energy, state.energy);
+        state.energy[1][20] = -3.5;
+        state.reset();
+        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
     }
 
-    /// With a single non-zero error in band 0 and zeros elsewhere,
-    /// the §4.3.2.1 filter reduces to:
-    ///   E[0] = e[0]
-    ///   E[b] for b > 0 = E[0] * β^b   (cascade of β multiplies)
-    /// Verify the first three bands by hand.
+    /// Out-of-range parameters are rejected without touching the
+    /// decoder or the carried state.
     #[test]
-    fn intra_prediction_single_impulse_decays_with_beta() {
-        let mut errors = [0i32; NUM_BANDS];
-        errors[0] = 32_768; // arbitrary Q8 magnitude
-        let mut out = [0i32; NUM_BANDS];
-        apply_intra_prediction(&errors, &mut out);
-
-        // E[0] = 32768.
-        assert_eq!(out[0], 32_768);
-        // E[1] = E[0] * β / Q15_ONE = 32768 * 4915 / 32768 = 4915.
-        assert_eq!(out[1], 4915);
-        // E[2] = E[1] * β / Q15_ONE = 4915 * 4915 / 32768.
-        let expected2 = (4915i64 * 4915 / 32768) as i32;
-        assert_eq!(out[2], expected2);
-        // β < 1 (4915 < 32768) so the cascade strictly contracts;
-        // E[2] < E[1] < E[0]. (No equality even on the boundary.)
-        assert!(out[2] < out[1]);
-        assert!(out[1] < out[0]);
-    }
-
-    /// `apply_intra_prediction` is purely additive in the per-band
-    /// errors when β = 0 would degenerate; with the actual β > 0, the
-    /// reconstruction error at band b is bounded by the cumulative
-    /// β^k * e[b-k] tail, which we verify by reconstructing a sample
-    /// pair against a hand-computed expectation.
-    #[test]
-    fn intra_prediction_additive_pair() {
-        // Two non-zero errors: e[0] = 256, e[1] = 128. Compute the
-        // expected reconstruction by hand.
-        //   E[0] = 256
-        //   running after band 0 = 256 * 4915 / 32768 = 38 (integer
-        //     truncation: 1257_984 / 32768 = 38)
-        //   E[1] = 38 + 128 = 166
-        //   running after band 1 = 166 * 4915 / 32768 = 24 (truncation:
-        //     815_890 / 32768 = 24)
-        //   E[2] = 24 + 0 = 24
-        let mut errors = [0i32; NUM_BANDS];
-        errors[0] = 256;
-        errors[1] = 128;
-        let mut out = [0i32; NUM_BANDS];
-        apply_intra_prediction(&errors, &mut out);
-        assert_eq!(out[0], 256);
-        assert_eq!(out[1], 166);
-        assert_eq!(out[2], 24);
-    }
-
-    /// Until the Laplace + e_prob_model docs gap closes,
-    /// `decode_coarse_energy` MUST return `NotImplemented` rather
-    /// than silently producing zeros (which would desync the range
-    /// decoder for the band-allocator that runs after coarse energy).
-    /// The signature is otherwise stable for future rounds.
-    #[test]
-    fn decode_coarse_energy_returns_docs_gap_marker() {
-        let buf = [0u8; 16];
+    fn invalid_parameters_rejected() {
+        let buf = [0u8; 8];
         let mut dec = RangeDecoder::new(&buf);
         let mut state = CoarseEnergyState::new();
-        let r = decode_coarse_energy(&mut dec, &mut state, true, 0);
-        assert_eq!(r, Err(Error::NotImplemented));
-        // The range decoder MUST NOT have been touched on the gap'd
-        // path; `tell()` should match a fresh decoder over the same
-        // buffer.
-        let fresh = RangeDecoder::new(&buf);
-        assert_eq!(dec.tell(), fresh.tell());
-        // State must also be unchanged.
-        assert_eq!(state.prev_q8, [0i32; NUM_BANDS]);
+        let tell_before = dec.tell();
+        // lm out of range.
+        assert_eq!(
+            decode_coarse_energy(&mut dec, &mut state, true, 4, 0, NUM_BANDS, 1),
+            Err(Error::InvalidParameter)
+        );
+        // band window out of range.
+        assert_eq!(
+            decode_coarse_energy(&mut dec, &mut state, true, 0, 0, NUM_BANDS + 1, 1),
+            Err(Error::InvalidParameter)
+        );
+        // inverted band window.
+        assert_eq!(
+            decode_coarse_energy(&mut dec, &mut state, true, 0, 5, 4, 1),
+            Err(Error::InvalidParameter)
+        );
+        // channel counts.
+        assert_eq!(
+            decode_coarse_energy(&mut dec, &mut state, true, 0, 0, NUM_BANDS, 0),
+            Err(Error::InvalidParameter)
+        );
+        assert_eq!(
+            decode_coarse_energy(&mut dec, &mut state, true, 0, 0, NUM_BANDS, 3),
+            Err(Error::InvalidParameter)
+        );
+        assert_eq!(dec.tell(), tell_before);
+        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
     }
 
-    /// Sanity check on the prediction filter's stability: feed a
-    /// constant-magnitude error vector and confirm the reconstructed
-    /// output never explodes outside reasonable bounds. (β < 1
-    /// guarantees this analytically; the test serves as a regression
-    /// sentinel against accidental sign flips or shift errors.)
+    /// An empty band window decodes nothing and leaves both the
+    /// decoder and the state untouched.
     #[test]
-    fn intra_prediction_stable_under_constant_input() {
-        let errors = [1024i32; NUM_BANDS];
-        let mut out = [0i32; NUM_BANDS];
-        apply_intra_prediction(&errors, &mut out);
-        // For a constant input c, the steady state of the IIR is
-        //   E_ss = c / (1 - β) where β = 4915/32768 ≈ 0.15
-        // i.e. E_ss ≈ c * 32768 / (32768 - 4915) = c * 32768 / 27853
-        //          ≈ c * 1.1764 ≈ 1205 for c = 1024.
-        // The reconstruction at band 0 is exactly c (no prior arm);
-        // it monotonically approaches the steady state from below.
-        assert_eq!(out[0], 1024);
-        for b in 1..NUM_BANDS {
-            assert!(out[b] >= out[b - 1], "monotonicity broken at band {b}");
-            assert!(
-                out[b] < 1300,
-                "steady-state bound violated at band {b}: {}",
-                out[b]
+    fn empty_band_window_is_noop() {
+        let buf = [0xA5u8; 8];
+        let mut dec = RangeDecoder::new(&buf);
+        let mut state = CoarseEnergyState::new();
+        let tell_before = dec.tell();
+        decode_coarse_energy(&mut dec, &mut state, false, 2, 7, 7, 2).unwrap();
+        assert_eq!(dec.tell(), tell_before);
+        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+    }
+
+    /// With an empty frame the budget is zero, so every band/channel
+    /// slot takes the no-bits fallback `qi = -1` and the decoder is
+    /// never consulted. The reconstruction must then follow the
+    /// Appendix A recursion exactly; verify against an independent
+    /// evaluation with the intra coefficients.
+    #[test]
+    fn zero_budget_intra_matches_hand_recursion() {
+        let mut dec = RangeDecoder::new(&[]);
+        let mut state = CoarseEnergyState::new();
+        let tell_before = dec.tell();
+        decode_coarse_energy(&mut dec, &mut state, true, 0, 0, NUM_BANDS, 1).unwrap();
+        // No bits were available, so the decoder was never touched.
+        assert_eq!(dec.tell(), tell_before);
+
+        // Independent recursion: intra => coef = 0, beta = 4915/32768,
+        // qi = -1 everywhere.
+        let beta = 4915.0_f32 / 32768.0;
+        let mut prev = 0.0_f32;
+        for band in 0..NUM_BANDS {
+            let q = -1.0_f32;
+            let expected = prev + q; // coef = 0 kills the time arm
+            assert_eq!(
+                state.energy[0][band], expected,
+                "band {band} mismatch vs hand recursion"
             );
+            prev += q - beta * q;
+        }
+        // Channel 1 was not coded (mono) and stays untouched.
+        assert_eq!(state.energy[1], [0.0; NUM_BANDS]);
+    }
+
+    /// Zero-budget inter mode exercises the time arm: pre-seed the
+    /// previous frame's energies (including one below the -9.0 floor)
+    /// and verify the clamp + `coef * old + prev + q` recursion.
+    #[test]
+    fn zero_budget_inter_applies_time_arm_and_floor() {
+        let lm = 2usize;
+        let mut dec = RangeDecoder::new(&[]);
+        let mut state = CoarseEnergyState::new();
+        // Seed history: band 0 sits below the floor, others above.
+        state.energy[0] = std::array::from_fn(|band| band as f32 * 0.25 - 2.0);
+        state.energy[0][0] = -50.0;
+        let seeded = state.energy[0];
+
+        decode_coarse_energy(&mut dec, &mut state, false, lm as u32, 0, NUM_BANDS, 1).unwrap();
+
+        let coef = PRED_COEF_Q15[lm] as f32 / 32768.0;
+        let beta = BETA_COEF_Q15[lm] as f32 / 32768.0;
+        let mut prev = 0.0_f32;
+        for (band, &seed) in seeded.iter().enumerate() {
+            let q = -1.0_f32;
+            let old = seed.max(-9.0);
+            let expected = coef * old + prev + q;
+            assert_eq!(
+                state.energy[0][band], expected,
+                "band {band} mismatch vs hand recursion"
+            );
+            prev += q - beta * q;
+        }
+        // The floor engaged on band 0: the time arm saw -9.0, not -50.
+        assert_eq!(state.energy[0][0], coef * -9.0 - 1.0);
+    }
+
+    /// The hybrid window (bands 17..21) leaves bands 0..17 untouched.
+    #[test]
+    fn hybrid_window_only_touches_coded_bands() {
+        let mut dec = RangeDecoder::new(&[]);
+        let mut state = CoarseEnergyState::new();
+        state.energy[0] = std::array::from_fn(|band| 1.0 + band as f32);
+        let seeded = state.energy[0];
+        decode_coarse_energy(&mut dec, &mut state, true, 3, 17, NUM_BANDS, 1).unwrap();
+        for (band, &seed) in seeded.iter().enumerate() {
+            if band < 17 {
+                assert_eq!(state.energy[0][band], seed, "band {band} clobbered");
+            } else {
+                assert_ne!(state.energy[0][band], seed, "band {band} unchanged");
+            }
+        }
+    }
+
+    /// Stereo interleaves channels within each band and carries an
+    /// independent frequency-arm predictor per channel: with a zero
+    /// budget both channels of a band receive identical treatment, so
+    /// their reconstructions from identical histories must agree.
+    #[test]
+    fn stereo_channels_track_independently_but_identically() {
+        let mut dec = RangeDecoder::new(&[]);
+        let mut state = CoarseEnergyState::new();
+        state.energy[0][3] = 2.5;
+        state.energy[1][3] = 2.5;
+        decode_coarse_energy(&mut dec, &mut state, false, 1, 0, NUM_BANDS, 2).unwrap();
+        assert_eq!(state.energy[0], state.energy[1]);
+    }
+
+    /// With a real (non-empty) buffer the full Laplace path runs for
+    /// every slot and consumes range-coder bits; the decode must stay
+    /// in sync (no sticky error) for arbitrary stream bytes.
+    #[test]
+    fn laplace_path_consumes_bits_and_stays_in_sync() {
+        let buf: Vec<u8> = (0..64u32).map(|i| (i * 89 + 3) as u8).collect();
+        for intra in [false, true] {
+            for lm in 0..NUM_LM_FRAME_SIZES as u32 {
+                let mut dec = RangeDecoder::new(&buf);
+                let mut state = CoarseEnergyState::new();
+                let tell_before = dec.tell();
+                decode_coarse_energy(&mut dec, &mut state, intra, lm, 0, NUM_BANDS, 2).unwrap();
+                assert!(dec.tell() > tell_before, "no bits consumed");
+                assert!(!dec.has_error(), "sticky error lm={lm} intra={intra}");
+                for c in 0..2 {
+                    for band in 0..NUM_BANDS {
+                        assert!(
+                            state.energy[c][band].is_finite(),
+                            "non-finite energy at c={c} band={band}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

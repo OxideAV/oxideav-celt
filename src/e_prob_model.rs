@@ -21,12 +21,10 @@
 //! does the transcription and provides a typed accessor.
 //!
 //! The Laplace decoder ALGORITHM (`ec_laplace_decode`) is a separate
-//! piece — the RFC narrative does not give the per-symbol decode
-//! recurrence, only that it consumes the `{prob, decay}` pair from
-//! this table. That algorithm remains queued for a future round.
-//! Landing the typed table here lets the future round wire it up
-//! without re-shaping data flow, and lets unit tests pin the
-//! table's structure today against the staged CSV.
+//! piece, implemented in [`crate::laplace`] from RFC 6716 Appendix A
+//! `laplace.c` (the reference listing embedded in the RFC's own
+//! text). The [`crate::coarse_energy`] decoder feeds it this table's
+//! `{prob, decay}` pairs (`prob << 7` to Q15, `decay << 6` to Q14).
 //!
 //! ## Table shape
 //!
@@ -48,7 +46,7 @@
 //!
 //! The 336 numeric values transcribed below are taken directly from
 //! `docs/audio/celt/tables/e_prob_model.csv`. The CSV's provenance
-//! (extractor + source SHA-256 + libopus commit) is recorded in
+//! (extractor + source SHA-256 + upstream commit id) is recorded in
 //! `docs/audio/celt/tables/e_prob_model.meta`. The extraction is a
 //! Feist-style numeric-facts extraction; no code from the upstream
 //! source was consulted by this crate, and the RFC's narrative shape

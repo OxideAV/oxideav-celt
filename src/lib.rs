@@ -2,21 +2,25 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-06-09):** round-22. The bit-exact CELT/SILK range
+//! **Status (2026-06-12):** round-25. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
-//! coarse-energy scaffolding (21-band layout from Table 55 + intra
-//! prediction filter with `α=0, β=4915/32768`) is in place. The
-//! §4.3.2.1 `e_prob_model` Laplace-parameter table is now transcribed
-//! verbatim (`E_PROB_MODEL[lm][intra][band] -> ProbDecay { prob,
-//! decay }`, 4 × 2 × 21 = 168 Q8 pairs from
-//! `docs/audio/celt/tables/e_prob_model.csv`) with the
-//! `prob_decay(lm, intra, band)` accessor that folds the `bool intra`
-//! flag onto the staged CSV's `0 = inter / 1 = intra` middle axis;
-//! the `ec_laplace_decode` algorithm itself remains queued for a
-//! future round (the RFC narrative does not state the per-symbol
-//! decode recurrence). The §4.3.2.2
+//! coarse-energy decoder is complete: the `ec_laplace_decode`
+//! per-symbol recurrence (transcribed from RFC 6716 Appendix A
+//! `laplace.c` — the reference listing embedded in the RFC's own
+//! text, extracted per §A.1) drives `decode_coarse_energy`, which
+//! runs the Appendix A `unquant_coarse_energy` walk: per-band,
+//! per-channel Laplace decode against the `E_PROB_MODEL[lm][intra]
+//! [band] -> ProbDecay { prob, decay }` table (4 × 2 × 21 = 168 Q8
+//! pairs from `docs/audio/celt/tables/e_prob_model.csv`), the
+//! budget-keyed low-rate fallbacks (2-bit zig-zag over
+//! `SMALL_ENERGY_ICDF`, 1-bit `{1,1}/2`, implicit `qi = -1`), and the
+//! 2-D prediction reconstruction `E[b] = coef*max(-9, E_prev[b]) +
+//! prev + q` / `prev += (1 - beta)*q` in the normative
+//! floating-point configuration, with the per-LM inter coefficient
+//! rows `PRED_COEF_Q15` / `BETA_COEF_Q15` and the intra pair
+//! `α=0, β=4915/32768`. The §4.3.2.2
 //! fine-energy refinement decoder + finalize step is bit-exact. The
 //! §4.3.3 bit-allocation field decoders (alloc.trim, skip,
 //! intensity-band, dual-stereo) are exposed standalone, gated on
@@ -97,8 +101,8 @@
 //! band denormalization (the per-sample multiplicative pass that
 //! scales each PVQ-decoded unit-norm shape by `sqrt(2^(E_q8 / 256))`
 //! before the inverse MDCT) is wired up as pure arithmetic against
-//! caller-supplied Q8 log-energies, so it composes cleanly once the
-//! `ec_laplace_decode` docs gap on the coarse-energy path closes. The
+//! caller-supplied Q8 log-energies, composing directly with the
+//! coarse-energy decoder's reconstructed envelope. The
 //! §4.3.4 → §4.3.6 single non-split band-decode orchestrator
 //! (`decode_band_shape` → `BandShape`) chains the simplest-case decode
 //! chain in §4.3 bitstream order: PVQ unit-shape decode
@@ -120,11 +124,14 @@
 //!
 //! All routines in this crate are transcribed from RFC 6716 (the IETF
 //! standards-track definition of Opus) and RFC 8251 (the Opus update).
-//! Source files the RFC delegates to for normative numeric tables and
-//! algorithms are off-limits under the workspace clean-room policy
-//! and were not consulted. Black-box invocations of `opusdec` /
-//! `opusenc` are permitted under the workspace clean-room policy as
-//! opaque validators.
+//! RFC 6716's Appendix A reference listing is embedded in the RFC's
+//! own text (extracted per §A.1, SHA-1-verified) and is part of the
+//! staged spec; routines transcribed from it cite "RFC 6716
+//! Appendix A `<file>`". Any source outside the staged RFC text is
+//! off-limits under the workspace clean-room policy and was not
+//! consulted. Black-box invocations of `opusdec` / `opusenc` are
+//! permitted under the workspace clean-room policy as opaque
+//! validators.
 
 #![warn(missing_debug_implementations)]
 
@@ -144,6 +151,7 @@ pub mod e_prob_model;
 pub mod fine_energy;
 pub mod frame_header;
 pub mod hadamard;
+pub mod laplace;
 pub mod mdct;
 pub mod post_filter;
 pub mod pvq;
@@ -176,8 +184,8 @@ pub use bits_to_pulses::{
     SECOND_TO_LAST_BALANCE_DIVISOR,
 };
 pub use coarse_energy::{
-    apply_intra_prediction, decode_coarse_energy, CoarseEnergyState, INTRA_ALPHA_Q15,
-    INTRA_BETA_Q15, NUM_BANDS,
+    decode_coarse_energy, CoarseEnergyState, BETA_COEF_Q15, INTRA_ALPHA_Q15, INTRA_BETA_Q15,
+    MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, SMALL_ENERGY_ICDF,
 };
 pub use deemphasis::{deemphasize_in_place_f32, Deemphasis, ALPHA_P_F32, ALPHA_P_Q15};
 pub use denormalization::{
@@ -198,6 +206,7 @@ pub use hadamard::{
     apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
     HADAMARD_LEVEL_SCALE,
 };
+pub use laplace::{ec_laplace_decode, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN};
 pub use mdct::{
     build_low_overlap_window_f32, build_window_half_f32, celt_window_f32, imdct_naive_f32,
     mdct_naive_f32, MdctSynthesis, BASIC_WINDOW_HALF, BASIC_WINDOW_LEN,
@@ -241,6 +250,11 @@ pub enum Error {
     /// A higher-level CELT entry point that has not been implemented
     /// yet (everything beyond the range decoder, today).
     NotImplemented,
+    /// A caller-supplied parameter was out of its documented range
+    /// (e.g. `lm > 3`, a band window beyond [`NUM_BANDS`], or a
+    /// channel count outside `1..=2`). The decoder state is never
+    /// touched when this is returned.
+    InvalidParameter,
 }
 
 impl core::fmt::Display for Error {
@@ -249,6 +263,10 @@ impl core::fmt::Display for Error {
             Error::NotImplemented => write!(
                 f,
                 "oxideav-celt: requested entry point is not yet implemented"
+            ),
+            Error::InvalidParameter => write!(
+                f,
+                "oxideav-celt: a caller-supplied parameter is out of range"
             ),
         }
     }
