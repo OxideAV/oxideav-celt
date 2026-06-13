@@ -4,6 +4,12 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-celt/compare/v0.1.8...v0.1.9) - 2026-06-13
+
+### Other
+
+- §4.3.2 final per-band log-energy assembly + Q8 bridge
+
 ### Added
 
 * **Round-26 (2026-06-13) — §4.3.2 final per-band log-energy assembly
