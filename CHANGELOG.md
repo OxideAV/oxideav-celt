@@ -4,7 +4,31 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
-## [0.1,8](https://github.com/OxideAV/oxideav-celt/compare/v0.1.7...v0.1.8) - 2026-06-12
+### Added
+
+* **Round-26 (2026-06-13) — §4.3.2 final per-band log-energy assembly
+  (`band_energy`):** the new `band_energy` module combines the three
+  additive §4.3.2 envelope steps — the §4.3.2.1 coarse f32 log-energies
+  in `CoarseEnergyState`, the §4.3.2.2 fine Q14 corrections from
+  `decode_fine_energy`, and the §4.3.2.2 finalize Q14 corrections from
+  `finalize_extra_bits` — into one final per-band base-2 log-energy
+  envelope, and bridges it onto the Q8 axis the §4.3.6 denormalization
+  and `decode_band_shape` consume (the `multiply by 256 and round`
+  step those modules previously documented as the caller's
+  responsibility). `assemble_band_log_energy_f32` returns the f32
+  envelope; `assemble_band_log_energy_q8` returns the rounded Q8
+  integers (coarse `×256` round-to-nearest, fine/finalize Q14 `÷64`
+  round-to-nearest); `log_energy_f32_to_q8` exposes the per-value
+  bridge standalone. Per-channel assembly (stereo channel 1 from
+  `energy[1]`) is supported. Constants `FINE_Q14_DENOM = 16384` and
+  `Q14_TO_Q8_SHIFT = 6` pin the rescale. 10 unit tests cover the
+  no-correction passthrough on both axes, fine/finalize additivity,
+  Q14→Q8 round-to-nearest, out-of-range-channel `None`, and an
+  end-to-end check that the assembled Q8 value drives the §4.3.6
+  amplitude (`sqrt(2)` at `+1.0` log-2 step). Pure spec-grounded
+  arithmetic; no range-decoder interaction, no new table.
+
+## [0.1.8](https://github.com/OxideAV/oxideav-celt/compare/v0.1.7...v0.1.8) - 2026-06-12
 
 ### Other
 

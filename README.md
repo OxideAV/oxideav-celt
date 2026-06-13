@@ -2,7 +2,16 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-12
+## Status — 2026-06-13
+
+**Round-26.** The §4.3.2 final per-band log-energy assembly
+(`band_energy`) combines the three additive envelope steps — the
+§4.3.2.1 coarse f32 log-energies, the §4.3.2.2 fine Q14 corrections,
+and the §4.3.2.2 finalize Q14 corrections — into one final per-band
+log-energy and bridges it onto the Q8 axis the §4.3.6 denormalization
+and `decode_band_shape` consume (closing the `multiply by 256 and
+round` seam those modules previously left to the caller). See the
+dedicated section below.
 
 **Round-25.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
 the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
@@ -669,6 +678,36 @@ The §4.3.6 prose ("each decoded normalized band is multiplied by the
 square root of the decoded energy") is one sentence; the §4.3.2.1 Q8
 log-2 representation and the `sqrt(2^E) = 2^(E/2)` identity supply the
 arithmetic with no normative source-file delegation.
+
+Final per-band log-energy assembly (RFC 6716 §4.3.2):
+
+* CELT reconstructs the per-band log-2 energy in three additive steps:
+  §4.3.2.1 coarse (f32, `1.0` = one integer log-2 step = 6 dB, carried
+  in `CoarseEnergyState`), §4.3.2.2 fine (Q14 corrections from
+  `decode_fine_energy`), and §4.3.2.2 finalize (Q14 corrections from
+  `finalize_extra_bits`). Each correction is *added* to the running
+  log-2 energy per the §4.3.2.2 prose ("the correction applied to the
+  coarse energy"). The three producers carry the same physical quantity
+  at three fixed-point scales (f32 `1.0` / Q14 `16384` / Q8 `256` per
+  integer log-2 step); this module performs the additions and the
+  rescale onto the Q8 axis the §4.3.6 denormalization indexes.
+* `assemble_band_log_energy_f32(coarse, channel, fine_q14,
+  finalize_q14) -> Option<[f32; 21]>` returns the final envelope as
+  f32. `fine_q14` / `finalize_q14` are `Option` so a caller can skip a
+  step (bands stay at the coarse value). Out-of-range `channel` ⇒
+  `None`.
+* `assemble_band_log_energy_q8(...) -> Option<[i32; 21]>` returns the
+  envelope on the Q8 axis: the coarse f32 value is scaled `×256` and
+  rounded; the summed fine + finalize Q14 correction is rescaled by a
+  round-to-nearest `÷64` (`(corr + 32) >> 6`). Rescaling the
+  corrections in integer Q-space keeps the raw-bit-exact fine/finalize
+  values off an extra f32 rounding before they reach the Q8 grid.
+* `log_energy_f32_to_q8(e) -> i32` exposes the per-value `round(e*256)`
+  bridge standalone, for callers that already hold an f32 envelope and
+  want to feed individual bands to `decode_band_shape`.
+* `FINE_Q14_DENOM = 16384`, `Q14_TO_Q8_SHIFT = 6` pin the Q14 scale and
+  the Q14→Q8 rescale shift. The module is pure spec-grounded
+  arithmetic: no range-decoder interaction and no new numeric table.
 
 Single-band shape-decode orchestrator (RFC 6716 §4.3.4 → §4.3.6):
 

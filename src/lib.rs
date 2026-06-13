@@ -2,6 +2,16 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-06-13):** round-26. The §4.3.2 final per-band
+//! log-energy assembly (`band_energy`) combines the §4.3.2.1 coarse f32
+//! log-energies, the §4.3.2.2 fine Q14 corrections, and the §4.3.2.2
+//! finalize Q14 corrections into one final per-band log-energy and
+//! bridges it onto the Q8 axis the §4.3.6 denormalization and
+//! `decode_band_shape` consume (`assemble_band_log_energy_f32` /
+//! `assemble_band_log_energy_q8` / `log_energy_f32_to_q8`), closing the
+//! `multiply by 256 and round` seam those modules previously left to
+//! the caller.
+//!
 //! **Status (2026-06-12):** round-25. The bit-exact CELT/SILK range
 //! decoder (RFC 6716 §4.1) is complete; the CELT frame-header prefix
 //! (silence / post-filter / transient / intra per §4.3, plus the
@@ -140,6 +150,7 @@ use oxideav_core::RuntimeContext;
 pub mod allocation_budget;
 pub mod band_cap;
 pub mod band_decode;
+pub mod band_energy;
 pub mod band_minimums;
 pub mod band_split;
 pub mod bit_allocation;
@@ -166,6 +177,10 @@ pub use allocation_budget::{
 };
 pub use band_cap::{compute_band_caps, decode_band_boosts, BoostResult, CACHE_CAPS50};
 pub use band_decode::{decode_band_shape, BandShape};
+pub use band_energy::{
+    assemble_band_log_energy_f32, assemble_band_log_energy_q8, log_energy_f32_to_q8,
+    FINE_Q14_DENOM, Q14_TO_Q8_SHIFT,
+};
 pub use band_minimums::{
     compute_thresh, compute_trim_offsets, BAND_BINS_LM, EIGHTH_BIT_QUANTUM, NUM_LM,
     SHORT_FRAME_BAND_BINS,
