@@ -556,6 +556,20 @@ Static allocation table (RFC 6716 §4.3.3, Table 57):
   evaluated as `qlo+1` at frac=0 so the interpolated evaluator's
   `frac ∈ 0..INTERP_STEPS` contract stays intact and the top column
   (`qlo == NUM_Q - 1`) is reachable.
+* `window_static_alloc_per_band_1_8th(coding_start, bins_per_band,
+  qlo, frac, channels, lm, out) -> bool` emits the **per-band**
+  breakdown of the static-allocation window at a grid position —
+  `channels * N * interp_alloc(band, qlo, frac) << LM >> 2` per band,
+  the same cell `band_static_alloc_1_8th` computes. Where
+  `find_static_alloc` returns only the scalar window total, this fills
+  `out` with the individual per-band 1/8-bit allocations the §4.3.3
+  reallocation pass (§2.7 outcome) consumes alongside the minimums
+  (`thresh[]`), trim offsets, and caps (`cap[]`). The top-column
+  saturated exit (`qlo == NUM_Q-1`, `frac == 0`) is reachable via
+  direct integer-column evaluation; a non-zero `frac` there is
+  rejected. The emitted vector decomposes the window total exactly
+  (`out.iter().sum()` equals `window_static_alloc_1_8th`). Computed
+  through a scratch buffer so `out` is untouched on any rejection.
 
 Pyramid Vector Quantizer (RFC 6716 §4.3.4.2):
 

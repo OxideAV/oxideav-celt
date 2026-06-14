@@ -260,6 +260,122 @@ pub fn window_static_alloc_1_8th(
     Some(total)
 }
 
+/// Fill `out[i]` with the §4.3.3 per-band static allocation, in 1/8
+/// bits, at the interpolation grid position `(qlo, frac)`.
+///
+/// This is the per-band breakdown of the same window the search
+/// ([`find_static_alloc`]) sums: where [`window_static_alloc_1_8th`]
+/// returns only the scalar window total at `(qlo, frac)`, this routine
+/// emits the individual per-band 1/8-bit allocations that total to it.
+/// The §4.3.3 reallocation pass (RFC 6716 §4.3.3 lines 6431–6460 and
+/// the §2.7 outcome prose) consumes this per-band vector together with
+/// the per-band minimums (`thresh[]`,
+/// [`crate::band_minimums::compute_thresh`]), the trim offsets
+/// (`trim_offsets[]`, [`crate::band_minimums::compute_trim_offsets`]),
+/// and the per-band caps (`cap[]`, [`crate::band_cap::compute_band_caps`])
+/// to derive the final shape / fine-energy split. Exposing the
+/// per-band vector here keeps that arithmetic decoupled from the
+/// interpolation it depends on.
+///
+/// The per-band value is
+///
+/// ```text
+///   channels * N[band] * interp_alloc(band, qlo, frac) << LM >> 2
+/// ```
+///
+/// exactly as [`band_static_alloc_1_8th`] computes it for one band,
+/// where `interp_alloc` is the §2.1 1/64-step linear interpolation
+/// between columns `qlo` and `qlo+1` ([`interp_alloc_1_32nd`]).
+///
+/// The top-column position is reachable here: when `qlo == NUM_Q - 1`
+/// (the search's saturated exit) there is no upper column to
+/// interpolate toward, so `frac` MUST be 0 and the integer column
+/// `NUM_Q - 1` is evaluated directly (mirroring the column path
+/// [`find_static_alloc`] uses at saturation). Any non-zero `frac` at
+/// the top column is rejected, since the grid has no sub-column there.
+///
+/// Inputs match [`window_static_alloc_1_8th`]:
+///
+/// * `coding_start` — first band of the coded-band window (0 for pure
+///   CELT, 17 for Hybrid).
+/// * `bins_per_band` — per-channel MDCT-bin count for each band in the
+///   window; `bins_per_band.len()` is the window length.
+/// * `qlo` / `frac` — the grid position (typically a
+///   [`StaticAllocSearch`] outcome).
+/// * `channels` — 1 (mono) or 2 (stereo).
+/// * `lm` — `log2(frame_size / 120)` ∈ `{0,1,2,3}`.
+/// * `out` — receives the per-band 1/8-bit allocations; its length MUST
+///   equal `bins_per_band.len()`.
+///
+/// Returns `false` (and leaves `out` unchanged) on any input-validation
+/// failure: `out.len() != bins_per_band.len()`, a window overflowing
+/// `NUM_BANDS`, `channels ∉ {1,2}`, `lm > 3`, `qlo >= NUM_Q`, a
+/// non-zero `frac` at the top column, or `frac >= INTERP_STEPS` below
+/// the top column. Returns `true` on success.
+///
+/// On success the emitted vector satisfies
+/// `out.iter().sum() == window_static_alloc_1_8th(...).unwrap()` (or the
+/// column-evaluator total at the top column) — the per-band split is a
+/// faithful decomposition of the window total.
+pub fn window_static_alloc_per_band_1_8th(
+    coding_start: usize,
+    bins_per_band: &[u32],
+    qlo: usize,
+    frac: u32,
+    channels: u32,
+    lm: u32,
+    out: &mut [u32],
+) -> bool {
+    if out.len() != bins_per_band.len() {
+        return false;
+    }
+    if !(1..=2).contains(&channels) || lm > 3 || qlo >= NUM_Q {
+        return false;
+    }
+    if coding_start.saturating_add(bins_per_band.len()) > NUM_BANDS {
+        return false;
+    }
+    // The top column has no upper neighbour to interpolate toward; the
+    // grid degenerates to the integer column there, so `frac` must be 0.
+    let top_column = qlo == NUM_Q - 1;
+    if top_column {
+        if frac != 0 {
+            return false;
+        }
+    } else if frac >= INTERP_STEPS {
+        return false;
+    }
+
+    // First compute every cell into a scratch so a late overflow leaves
+    // `out` untouched (the documented "leaves out unchanged" contract).
+    let mut scratch = [0u32; NUM_BANDS];
+    for (i, &bins) in bins_per_band.iter().enumerate() {
+        let band = coding_start + i;
+        let cell = if top_column {
+            // Direct integer-column evaluation: `channels * N * alloc
+            // << LM >> 2` with `alloc = STATIC_ALLOC[band][NUM_Q-1]`.
+            let alloc = STATIC_ALLOC[band][qlo] as u32;
+            let raw = match channels
+                .checked_mul(bins)
+                .and_then(|v| v.checked_mul(alloc))
+                .and_then(|v| v.checked_shl(lm))
+            {
+                Some(v) => v,
+                None => return false,
+            };
+            raw >> 2
+        } else {
+            match band_static_alloc_1_8th(band, qlo, frac, channels, bins, lm) {
+                Some(v) => v,
+                None => return false,
+            }
+        };
+        scratch[i] = cell;
+    }
+    out.copy_from_slice(&scratch[..bins_per_band.len()]);
+    true
+}
+
 /// Outcome of the §4.3.3 static-allocation search.
 ///
 /// The search picks the highest grid position `(qlo, frac)` whose
@@ -883,5 +999,162 @@ mod tests {
             window_static_alloc_at_column_1_8th(0, &bins, NUM_Q, 1, 0),
             None
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §4.3.3 per-band interpolated allocation
+    // (window_static_alloc_per_band_1_8th) tests.
+    // -----------------------------------------------------------------
+
+    /// The per-band breakdown matches `band_static_alloc_1_8th` cell by
+    /// cell for a non-top-column position.
+    #[test]
+    fn per_band_matches_single_band_evaluator() {
+        let bins = [4u32, 4, 4];
+        let mut out = [0u32; 3];
+        assert!(window_static_alloc_per_band_1_8th(
+            0, &bins, 5, 0, 1, 0, &mut out
+        ));
+        for (i, &n) in bins.iter().enumerate() {
+            let expect = band_static_alloc_1_8th(i, 5, 0, 1, n, 0).unwrap();
+            assert_eq!(out[i], expect, "band {i}");
+        }
+    }
+
+    /// The per-band vector sums to the scalar window total at the same
+    /// grid position (the decomposition invariant).
+    #[test]
+    fn per_band_sums_to_window_total() {
+        let bins = [4u32, 4, 4, 4];
+        // Walk a representative grid of (qlo, frac) positions below the
+        // top column and confirm the per-band split totals the window
+        // sum every time.
+        for qlo in 0..NUM_Q - 1 {
+            for frac in [0u32, 17, 31, 63] {
+                let mut out = [0u32; 4];
+                assert!(
+                    window_static_alloc_per_band_1_8th(0, &bins, qlo, frac, 1, 0, &mut out),
+                    "qlo {qlo} frac {frac}"
+                );
+                let window = window_static_alloc_1_8th(0, &bins, qlo, frac, 1, 0).unwrap();
+                let sum: u32 = out.iter().sum();
+                assert_eq!(sum, window, "qlo {qlo} frac {frac}");
+            }
+        }
+    }
+
+    /// The top column (qlo == NUM_Q-1, frac == 0) is reachable and
+    /// totals the column evaluator's window sum — the search's saturated
+    /// exit position must produce a usable per-band vector.
+    #[test]
+    fn per_band_top_column_reachable() {
+        let bins = [4u32, 4, 4];
+        let mut out = [0u32; 3];
+        assert!(window_static_alloc_per_band_1_8th(
+            0,
+            &bins,
+            NUM_Q - 1,
+            0,
+            1,
+            0,
+            &mut out
+        ));
+        let window = window_static_alloc_at_column_1_8th(0, &bins, NUM_Q - 1, 1, 0).unwrap();
+        let sum: u32 = out.iter().sum();
+        assert_eq!(sum, window);
+        // Band 0 at q=10 (channels=1, bins=4, LM=0) is alloc 200.
+        assert_eq!(out[0], 200);
+    }
+
+    /// A non-zero `frac` at the top column is rejected (no sub-column
+    /// exists there) and leaves `out` unchanged.
+    #[test]
+    fn per_band_top_column_rejects_nonzero_frac() {
+        let bins = [4u32];
+        let mut out = [9999u32];
+        assert!(!window_static_alloc_per_band_1_8th(
+            0,
+            &bins,
+            NUM_Q - 1,
+            1,
+            1,
+            0,
+            &mut out
+        ));
+        assert_eq!(out[0], 9999, "out must be untouched on rejection");
+    }
+
+    /// Feeding a `StaticAllocSearch` outcome straight back into the
+    /// per-band split reproduces the search's committed window total.
+    #[test]
+    fn per_band_consumes_search_outcome() {
+        let bins = [4u32, 4, 4, 4];
+        for budget in (0..=600u32).step_by(13) {
+            let r = find_static_alloc(0, &bins, 1, 0, budget).unwrap();
+            let mut out = [0u32; 4];
+            assert!(
+                window_static_alloc_per_band_1_8th(0, &bins, r.qlo, r.frac, 1, 0, &mut out),
+                "budget {budget}: (qlo={}, frac={})",
+                r.qlo,
+                r.frac
+            );
+            let sum: u32 = out.iter().sum();
+            assert_eq!(sum, r.total_1_8th, "budget {budget}");
+        }
+    }
+
+    /// Input-validation rejections all leave `out` unchanged and return
+    /// false.
+    #[test]
+    fn per_band_rejects_invalid_input() {
+        let bins = [4u32, 4];
+        // Length mismatch.
+        let mut short = [0u32; 1];
+        assert!(!window_static_alloc_per_band_1_8th(
+            0, &bins, 5, 0, 1, 0, &mut short
+        ));
+        // channels = 0.
+        let mut out = [0u32; 2];
+        assert!(!window_static_alloc_per_band_1_8th(
+            0, &bins, 5, 0, 0, 0, &mut out
+        ));
+        // lm = 4.
+        assert!(!window_static_alloc_per_band_1_8th(
+            0, &bins, 5, 0, 1, 4, &mut out
+        ));
+        // qlo = NUM_Q (out of range).
+        assert!(!window_static_alloc_per_band_1_8th(
+            0, &bins, NUM_Q, 0, 1, 0, &mut out
+        ));
+        // frac == INTERP_STEPS below the top column.
+        assert!(!window_static_alloc_per_band_1_8th(
+            0,
+            &bins,
+            5,
+            INTERP_STEPS,
+            1,
+            0,
+            &mut out
+        ));
+        // Window overflow (coding_start 17 + 5 bands > 21).
+        let big = [4u32; 5];
+        let mut wide = [0u32; 5];
+        assert!(!window_static_alloc_per_band_1_8th(
+            17, &big, 5, 0, 1, 0, &mut wide
+        ));
+    }
+
+    /// Hybrid-mode window (coding_start = 17) per-band split totals the
+    /// window evaluator and walks the correct Table 57 rows.
+    #[test]
+    fn per_band_hybrid_window() {
+        let bins = [4u32, 4, 4, 4];
+        let mut out = [0u32; 4];
+        assert!(window_static_alloc_per_band_1_8th(
+            17, &bins, 9, 0, 1, 0, &mut out
+        ));
+        // q=9 cells: band 17 -> 63, 18 -> 56, 19 -> 45, 20 -> 20.
+        assert_eq!(out, [63, 56, 45, 20]);
+        assert_eq!(out.iter().sum::<u32>(), 184);
     }
 }

@@ -6,6 +6,31 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-27 (2026-06-14) — §4.3.3 per-band interpolated allocation
+  vector (`window_static_alloc_per_band_1_8th`):** the existing
+  `find_static_alloc` search returns only the scalar window total at the
+  chosen `(qlo, frac)` interpolation position; the §4.3.3 reallocation
+  pass (RFC 6716 §4.3.3 lines 6431–6460, §2.7 outcome prose) needs the
+  per-band breakdown. The new `window_static_alloc_per_band_1_8th(
+  coding_start, bins_per_band, qlo, frac, channels, lm, out) -> bool`
+  fills `out` with the per-band 1/8-bit static allocations at that grid
+  position — `channels * N * interp_alloc(band, qlo, frac) << LM >> 2`
+  per band, exactly as `band_static_alloc_1_8th` computes one cell. The
+  top-column saturated exit (`qlo == NUM_Q-1`, `frac == 0`) is reachable
+  via direct integer-column evaluation (a non-zero `frac` there is
+  rejected, since the grid has no sub-column past the last column). The
+  emitted vector is a faithful decomposition: `out.iter().sum()` equals
+  the `window_static_alloc_1_8th` total (or the column-evaluator total at
+  saturation), proven across a budget sweep that feeds each
+  `find_static_alloc` outcome back into the per-band split. Computed via
+  a scratch buffer so the documented "leaves `out` unchanged on
+  rejection" contract holds even on a late overflow. Exposed at the
+  crate root. 7 new tests (decomposition invariant, top-column
+  reachability + non-zero-frac rejection, search-outcome round-trip,
+  Hybrid window, input-validation rejections). Wall: RFC 6716 §4.3.3 +
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §2.1/§2.7
+  only.
+
 * **Round-26 (2026-06-13) — §4.3.2 final per-band log-energy assembly
   (`band_energy`):** the new `band_energy` module combines the three
   additive §4.3.2 envelope steps — the §4.3.2.1 coarse f32 log-energies

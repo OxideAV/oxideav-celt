@@ -74,6 +74,13 @@
 //! `StaticAllocSearch { qlo, frac, total_1_8th }`) bisects the 1/64-
 //! step interpolation grid for the highest `(qlo, frac)` whose window
 //! total in 1/8 bits does not exceed the supplied "remaining" budget.
+//! The §4.3.3 static-allocation search additionally exposes the per-band
+//! interpolated allocation vector (`window_static_alloc_per_band_1_8th`):
+//! the per-band 1/8-bit breakdown of the window total at a chosen
+//! `(qlo, frac)` grid position (`channels * N * interp_alloc << LM >> 2`
+//! per band, with the top-column saturated exit reachable), which the
+//! §4.3.3 reallocation pass (§2.7 outcome) consumes alongside the
+//! minimums, trim offsets, and caps.
 //! The §4.3.4.2 PVQ codebook size `V(N, K)` and per-band shape
 //! decoder (`v_count`, `decode_index_to_pulses`, `decode_pulses`,
 //! `normalize_to_unit_l2`, `decode_unit_shape`) reproduce the codebook
@@ -246,7 +253,7 @@ pub use spread_rotation::{
 };
 pub use static_alloc::{
     band_static_alloc_1_8th, find_static_alloc, interp_alloc_1_32nd, window_static_alloc_1_8th,
-    StaticAllocSearch, INTERP_STEPS, NUM_Q, STATIC_ALLOC,
+    window_static_alloc_per_band_1_8th, StaticAllocSearch, INTERP_STEPS, NUM_Q, STATIC_ALLOC,
 };
 pub use tf_change::{
     decode_tf_changes, decode_tf_parameters, decode_tf_select, tf_adjustment, tf_select_matters,
