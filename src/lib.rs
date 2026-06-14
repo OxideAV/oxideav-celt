@@ -2,6 +2,18 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-06-14):** round-28. The §4.3 frame-prefix decode
+//! driver (`decode_frame_prefix` → `FramePrefix`) chains every CELT
+//! control-symbol decoder in RFC 6716 Table 56 bitstream order
+//! (silence / post-filter / transient / intra → coarse energy →
+//! tf_change / tf_select → spread → caps → band boosts → initial
+//! reservations → band allocation), threading the reservation/boost
+//! budget between steps so the trim and stereo gates fire against the
+//! correct intermediate `ec_tell_frac()`. It stops at the Table 56
+//! `fine energy` symbol — the docs-gap boundary where the §4.3.3
+//! reallocation pass (deferred to the reference by §4.3.3 / narrative
+//! §2.7) begins.
+//!
 //! **Status (2026-06-13):** round-26. The §4.3.2 final per-band
 //! log-energy assembly (`band_energy`) combines the §4.3.2.1 coarse f32
 //! log-energies, the §4.3.2.2 fine Q14 corrections, and the §4.3.2.2
@@ -167,6 +179,7 @@ pub mod deemphasis;
 pub mod denormalization;
 pub mod e_prob_model;
 pub mod fine_energy;
+pub mod frame_decode;
 pub mod frame_header;
 pub mod hadamard;
 pub mod laplace;
@@ -223,6 +236,7 @@ pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, finalize_extra_bits, fine_correction_q14,
     fine_correction_qn, FinalizePriority, FinalizeResult, MAX_FINE_BITS,
 };
+pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
 pub use hadamard::{
     apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,

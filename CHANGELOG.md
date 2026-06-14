@@ -6,6 +6,40 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-28 (2026-06-14) — §4.3 frame-prefix decode driver
+  (`decode_frame_prefix` → `FramePrefix`):** the individual CELT
+  control-symbol decoders (header prefix, coarse energy, TF parameters,
+  spread, caps, band boosts, initial reservations, band allocation) were
+  each implemented and unit-tested in isolation, but nothing chained
+  them in bitstream order. The new `frame_decode` module supplies that
+  integration spine: `decode_frame_prefix(dec, coarse_state, lm,
+  frame_bytes, stereo, start, end) -> Result<FramePrefix, Error>` walks
+  RFC 6716 Table 56 (lines 5943–5985) from `silence` through the §4.3.3
+  band-allocation fields, threading the reservation/boost budget between
+  steps so every gate fires against the correct intermediate
+  `ec_tell_frac()`: the initial reservation walk reads the post-spread
+  `tell_frac`, the band-boost loop advances the decoder, and the
+  trim/skip/intensity/dual gates are evaluated against the post-boost
+  `tell_frac` and accumulated `total_boost` exactly as §4.3.3 specifies.
+  `FramePrefix` carries every decoded control parameter plus the running
+  budget state (`reservations`, `boosts`, `caps`) the §4.3.3
+  reallocation pass will consume, and the decoder is left positioned at
+  the Table 56 `fine energy` symbol. The coarse-energy state is mutated
+  in place so inter-frame prediction carries across frames. Everything
+  from `fine energy` onward (the reallocation pass with concurrent skip
+  decoding, the fine/shape split, the residual PVQ loop, §4.3.5
+  anti-collapse processing, finalize) remains a documented docs gap —
+  RFC 6716 §4.3.3 and the clean-room narrative §2.7 defer the
+  reallocation bisection and fine/shape split to the reference
+  implementation — so the driver stops at that boundary. Exposed at the
+  crate root as `decode_frame_prefix` / `FramePrefix`. 6 new tests
+  (pure-CELT mono, stereo with stereo-reservation, Hybrid window,
+  invalid-parameter rejection, tell_frac monotonicity, inter-frame
+  state carry). Wall: RFC 6716 Table 56 + §4.3.3 +
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §§2.1–2.7;
+  every decoded field produced by an existing in-crate module. No
+  external library source consulted.
+
 * **Round-27 (2026-06-14) — §4.3.3 per-band interpolated allocation
   vector (`window_static_alloc_per_band_1_8th`):** the existing
   `find_static_alloc` search returns only the scalar window total at the

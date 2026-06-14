@@ -4,6 +4,18 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status — 2026-06-14
 
+**Round-28.** The §4.3 frame-prefix decode driver
+(`decode_frame_prefix` → `FramePrefix`) chains every CELT
+control-symbol decoder in RFC 6716 Table 56 bitstream order — silence /
+post-filter / transient / intra → coarse energy → tf_change / tf_select
+→ spread → per-band caps → band boosts → initial reservations → band
+allocation — threading the reservation/boost budget between steps so the
+trim and stereo gates fire against the correct intermediate
+`ec_tell_frac()`. It is the integration spine the per-symbol decoders
+have been building toward; it stops at the Table 56 `fine energy` symbol
+(the docs-gap boundary where the reallocation pass begins). See the
+frame-prefix section below.
+
 **Round-27.** The §4.3.3 static-allocation search now exposes the
 per-band interpolated allocation vector
 (`window_static_alloc_per_band_1_8th`): the per-band 1/8-bit breakdown
@@ -759,6 +771,40 @@ Single-band shape-decode orchestrator (RFC 6716 §4.3.4 → §4.3.6):
   §4.3.4.4 geometry round (the precise split-gain precision/PDF is
   deferred to the reference). Callers gate on `band_needs_split(n, k)`
   before invoking this orchestrator.
+
+Frame-prefix decode driver (RFC 6716 §4.3, Table 56):
+
+* `decode_frame_prefix(dec, coarse_state, lm, frame_bytes, stereo,
+  start, end) -> Result<FramePrefix, Error>` walks the CELT bitstream
+  in Table 56 order from `silence` through the §4.3.3 band-allocation
+  fields, chaining the per-symbol decoders (`CeltFrameHeader::
+  decode_prefix` → `decode_coarse_energy` → `decode_tf_parameters` →
+  `decode_spread` → `compute_band_caps` → `decode_band_boosts` →
+  `compute_initial_reservations` → `decode_band_allocation`). The
+  reservation/boost budget is threaded between steps so every gate is
+  evaluated against the correct intermediate `ec_tell_frac()`: the
+  initial reservation walk reads the post-spread `tell_frac`, the
+  band-boost loop advances the decoder, and the trim/skip/intensity/
+  dual gates are evaluated against the post-boost `tell_frac` and the
+  accumulated `total_boost`, exactly as §4.3.3 specifies.
+* `FramePrefix { header, tf, spread, caps, reservations, boosts,
+  allocation, start, end }` carries every decoded control parameter
+  plus the running budget state the §4.3.3 reallocation pass consumes.
+  The coarse-energy `state` is mutated in place so the §4.3.2.1
+  inter-frame prediction carries across frames.
+* The driver leaves the range decoder positioned at the Table 56
+  `fine energy` symbol. Everything from there onward — the §4.3.3
+  reallocation pass (concurrent skip decoding), the fine-energy vs.
+  shape split, the §4.3.4 residual (per-band PVQ) loop, the §4.3.5
+  anti-collapse processing, and the finalize step — depends on the
+  reallocation bisection and the fine/shape split formula, both of
+  which RFC 6716 §4.3.3 and the clean-room narrative §2.7 defer to the
+  reference implementation. They remain documented docs gaps; the
+  driver stops at that boundary.
+* Out-of-range `lm` (`> 3`) or band window (`start > end` /
+  `end > 21`) is rejected with `Error::InvalidParameter` before any
+  decode. Callers check `RangeDecoder::has_error()` after the call for
+  the §4.1.5 corrupt-frame path.
 
 Inverse MDCT and low-overlap window (RFC 6716 §4.3.7):
 
