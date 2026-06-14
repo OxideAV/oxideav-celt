@@ -2,7 +2,16 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-13
+## Status — 2026-06-14
+
+**Round-27.** The §4.3.3 static-allocation search now exposes the
+per-band interpolated allocation vector
+(`window_static_alloc_per_band_1_8th`): the per-band 1/8-bit breakdown
+of the window total at a chosen `(qlo, frac)` grid position
+(`channels * N * interp_alloc << LM >> 2` per band, top-column
+saturated exit reachable), the vector the §4.3.3 reallocation pass
+(§2.7 outcome) consumes alongside the minimums, trim offsets, and caps.
+See the static-allocation section below.
 
 **Round-26.** The §4.3.2 final per-band log-energy assembly
 (`band_energy`) combines the three additive envelope steps — the
