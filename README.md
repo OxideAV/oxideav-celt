@@ -545,10 +545,31 @@ Bits-to-pulses search and balance accumulator (RFC 6716 §4.3.4.1):
   worst-case cost in 1/8-bit units (`ceil(log2(V(N, K))) * 8`).
   `K = 0` is free; saturated codebook sizes return `u32::MAX` so the
   search short-circuits cleanly. This is the closed-form estimator
-  the search composes with by default; the bit-exact per-(N, K) cost
-  cache the §4.3.4.1 reference uses is delegated to a source file
-  outside the workspace clean-room allow-list, so the implementation
-  uses the spec-grounded shape against the worst-case estimator.
+  the search composes with by default and on the cache-sentinel
+  small-band path; the bit-exact cache below supersedes it for every
+  band the §4.3.3 allocator reaches.
+
+The bit-exact §4.3.4.1 pulse-cost cache (`pulse_cache` module),
+embedding the `cache_index50` / `cache_bits50` tables the RFC
+§4.3.4.1 search runs against:
+
+* `CACHE_INDEX50` — 105 `i16` per-(band, LM) offsets in band-major
+  order (`CACHE_INDEX50[band*5 + LM]`); `-1` is the closed-form
+  sentinel (band 0 at every LM, band 1 at LM 0..2).
+* `CACHE_BITS50` — 392 `u8` packed cost runs; each run is a `maxK`
+  byte followed by `qbits[1..=maxK]` in 1/8-bit units, monotone in
+  `K`. The 23 distinct runs tile the 392 bytes exactly.
+* `cache_offset(band, lm)` / `cache_max_k(band, lm)` /
+  `cache_cost_8th(band, lm, k)` — the bit-exact lookups (`None` for a
+  sentinel or an out-of-range `K`).
+* `cached_bits_to_pulses(band, lm, budget_8th) -> CachedPulses` — the
+  §4.3.4.1 inner loop returning the largest cached `K` whose cost
+  fits the budget.
+* `bits_to_pulses_band_loop_cached(lm, band_start, band_n,
+  band_target_8th)` — the band walk driving the bit-exact cache for
+  cached tuples and the estimator only on sentinels.
+  Values from `docs/audio/opus/pulse-cache-format-trace.md` (#118) +
+  `tables/cache-{index,bits}50.csv`.
 * `bits_to_pulses_search(n, target_8th, cost_fn) -> BitsToPulses` —
   for a single band, picks the largest `K ∈ [0, K_SEARCH_CAP]` whose
   reported cost does not exceed `target_8th`. The §4.3.4.1

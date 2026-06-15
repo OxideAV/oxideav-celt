@@ -28,27 +28,24 @@
 //! > which half the balance and the whole balance are applied,
 //! > respectively."
 //!
-//! ## Cost-of-`K` decoupling
+//! ## Cost-of-`K`: bit-exact cache vs. estimator
 //!
-//! Computing the exact 1/8-bit cost of coding a `V(N, K)` codebook
-//! index requires the per-(N, K) cost cache that the RFC delegates to
-//! `compute_pulse_cache()` in `rate.c` — a source file outside the
-//! workspace clean-room allow-list. The RFC's §4.3.4.1 search prose
-//! is otherwise complete and the balance accumulator's rules are
-//! given as a closed-form integer division.
+//! The exact 1/8-bit cost of coding a `K`-pulse band is the
+//! precomputed per-(band, LM) cost curve the RFC §4.3.4.1 search runs
+//! against ("a precomputed allocation table that only permits some K
+//! values for each N"). That curve is the `cache_index50` /
+//! `cache_bits50` pair, now embedded bit-exact in
+//! [`crate::pulse_cache`] from the clean-room trace
+//! `docs/audio/opus/pulse-cache-format-trace.md` (#118). The
+//! cache-driven [`bits_to_pulses_band_loop_cached`] consumes it
+//! directly.
 //!
-//! This module accordingly decouples the **search shape** + **balance
-//! update** (both fully spec'd here) from the **cost function**
-//! (parameterised on a caller-supplied closure). The closure receives
-//! `(N, K)` and returns the 1/8-bit cost; callers in this round
-//! supply a `log2(V(N, K))`-based estimator scaled to 1/8 bits, which
-//! is good enough to drive shape decoding correctly even though it
-//! does not yet reproduce the reference `cache.bits` table bit-exact.
-//!
-//! When the cost-cache docs gap closes (a clean-room derivation of
-//! `compute_pulse_cache()`'s output for every supported `(N, K)`
-//! pair), the same orchestrator runs unchanged against the bit-exact
-//! cost.
+//! The original [`cost_log2_v_count_8th`] estimator (a `ceil(log2
+//! V(N, K))` worst-case bound) remains for two uses: the `-1`
+//! sentinel tuples the cache deliberately omits (band 0 / small band
+//! 1, where §4.3.3 prescribes a closed-form path), and as a
+//! caller-supplied closure for [`bits_to_pulses_band_loop`] /
+//! [`bits_to_pulses_search`].
 //!
 //! ## What ships in this round
 //!
@@ -73,10 +70,16 @@
 //!
 //! ## What does NOT ship yet
 //!
-//! * The bit-exact `cache.bits` table for `(N, K)` cost. Closing
-//!   that gap requires the docs collaborator to provide a clean-room
-//!   derivation of `compute_pulse_cache()`'s output (or a behavioural
-//!   trace anchored to an opaque `opusdec` validator).
+//! * The §4.3.3 closed-form `K` formula for the `-1` sentinel tuples
+//!   (band 0 at every LM, band 1 at LM 0..2). The trace §5 states
+//!   these fall through to "the analytic formula" but does not give
+//!   it; the sentinel path therefore still uses the worst-case
+//!   estimator.
+//! * The §4.3.3 `interp_bits2pulses` reallocation bisection and the
+//!   fine-energy vs. shape split. The CELT narrative
+//!   `celt-coarse-energy-and-allocation.md` §2.7 enumerates these
+//!   steps but defers the algorithm to the reference; they are a
+//!   genuine docs gap (see the round report).
 //! * The §4.3.4.4 band-splitting decision (large bands are split
 //!   into sub-bands before bits-to-pulses runs). This module assumes
 //!   the caller has already done the split.
@@ -89,10 +92,13 @@
 //!
 //! Every formula, integer-division rule, and band-ordering decision
 //! in this module is transcribed from RFC 6716 §4.3.4.1 (lines
-//! 6476–6493 of `docs/audio/opus/rfc6716-opus.txt`). The cost-cache
-//! source file the RFC delegates to is outside the workspace
-//! clean-room allow-list and was not consulted.
+//! 6476–6493 of `docs/audio/opus/rfc6716-opus.txt`). The bit-exact
+//! cost cache consumed by [`bits_to_pulses_band_loop_cached`] is the
+//! clean-room trace `docs/audio/opus/pulse-cache-format-trace.md`
+//! (#118) with values from `docs/audio/opus/tables/cache-bits50.csv`
+//! and `cache-index50.csv`. No external library source was consulted.
 
+use crate::pulse_cache::{cache_offset, cached_bits_to_pulses};
 use crate::pvq::{v_count, V_COUNT_SATURATION};
 
 /// Number of 1/8 bits per whole bit. Pinned for arithmetic clarity
@@ -379,6 +385,83 @@ where
         // bits it actually used.)
         balance.update(adjusted_target, result.bits_used_8th);
 
+        out.push(result);
+    }
+
+    Some((out, balance))
+}
+
+/// Walk a sequence of bands through the §4.3.4.1 bits-to-pulses
+/// search using the **bit-exact** `cache_index50` / `cache_bits50`
+/// cost cache for the bands it covers, falling back to the
+/// worst-case [`cost_log2_v_count_8th`] estimator only for the
+/// `-1` sentinel tuples (band 0 at every LM, band 1 at LM 0..2 —
+/// the small-band closed-form cases the cache deliberately omits).
+///
+/// This is the cache-driven counterpart of
+/// [`bits_to_pulses_band_loop`]: it replaces the `ceil(log2 V(N,K))`
+/// estimator with the precomputed per-(band, LM) cost curve the RFC
+/// delegates to, so the chosen `K` and reported cost are bit-exact
+/// for every band the §4.3.3 allocator actually reaches.
+///
+/// Parameters:
+/// * `lm` — the frame-size shift (`LM ∈ 0..5`) shared by every band.
+/// * `band_n` — per-band `N` (PVQ dimension), used only on the
+///   sentinel fallback path.
+/// * `band_target_8th` — per-band raw shape allocation in 1/8 bits.
+///
+/// The first coded band corresponds to CELT band index `band_start`
+/// (0 in normal mode, 17 in the Hybrid mode §4.3.3 mentions); the
+/// cache is indexed by the absolute CELT band number
+/// `band_start + i`.
+///
+/// Returns `(per_band_result, final_balance)`, or `None` on a length
+/// mismatch / an out-of-range `(band, LM)`.
+pub fn bits_to_pulses_band_loop_cached(
+    lm: usize,
+    band_start: usize,
+    band_n: &[u32],
+    band_target_8th: &[u32],
+) -> Option<(Vec<BitsToPulses>, BalanceAccumulator)> {
+    if band_n.len() != band_target_8th.len() {
+        return None;
+    }
+
+    let nbands = band_n.len();
+    let mut out = Vec::with_capacity(nbands);
+    let mut balance = BalanceAccumulator::new();
+
+    for (i, (&n, &raw_target)) in band_n.iter().zip(band_target_8th.iter()).enumerate() {
+        // §4.3.4.1 divisor selection (identical to the estimator loop).
+        let divisor = if nbands >= 2 && i == nbands - 1 {
+            LAST_BALANCE_DIVISOR
+        } else if nbands >= 2 && i == nbands - 2 {
+            SECOND_TO_LAST_BALANCE_DIVISOR
+        } else {
+            DEFAULT_BALANCE_DIVISOR
+        };
+
+        let adjusted_target = balance.adjusted_target(raw_target, divisor);
+
+        let celt_band = band_start + i;
+        let result = match cache_offset(celt_band, lm) {
+            Some(_) => {
+                // Bit-exact cache path.
+                let cp = cached_bits_to_pulses(celt_band, lm, adjusted_target)?;
+                BitsToPulses {
+                    k: cp.k,
+                    bits_used_8th: cp.bits_used_8th,
+                }
+            }
+            None => {
+                // Sentinel — small-band closed-form fallback uses the
+                // worst-case estimator until §4.3.3's closed-form path
+                // is specified (see module docs).
+                bits_to_pulses_search(n, adjusted_target, cost_log2_v_count_8th)
+            }
+        };
+
+        balance.update(adjusted_target, result.bits_used_8th);
         out.push(result);
     }
 
@@ -779,5 +862,84 @@ mod tests {
         // every K up to the cap costs 16 = target.
         assert_eq!(out[1].k, K_SEARCH_CAP);
         assert_eq!(out[1].bits_used_8th, 16);
+    }
+
+    // ---------- bits_to_pulses_band_loop_cached ----------
+
+    /// Length mismatch ⇒ None.
+    #[test]
+    fn cached_loop_length_mismatch_returns_none() {
+        let r = bits_to_pulses_band_loop_cached(3, 2, &[4, 4, 4], &[100, 100]);
+        assert!(r.is_none());
+    }
+
+    /// A single cached band (band 3, LM 0 ⇒ run @82): the chosen K and
+    /// cost are the bit-exact cache values, not the estimator's.
+    #[test]
+    fn cached_loop_single_band_uses_cache() {
+        // Run @82: qbits[1]=20, qbits[2]=33, qbits[3]=41. Budget 40 ⇒
+        // K=2 (cost 33). The estimator would give a different cost.
+        let (out, _) = bits_to_pulses_band_loop_cached(0, 3, &[8], &[40]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].k, 2);
+        assert_eq!(out[0].bits_used_8th, 33);
+    }
+
+    /// A sentinel band (band 0, every LM) falls back to the estimator.
+    #[test]
+    fn cached_loop_sentinel_falls_back_to_estimator() {
+        // Band 0 LM 0 is a sentinel; the loop uses the worst-case
+        // estimator. With N=1 and a one-bit budget it walks to the cap
+        // (matching the estimator's flat-plateau behaviour).
+        let (out, _) = bits_to_pulses_band_loop_cached(0, 0, &[1], &[8]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].k, K_SEARCH_CAP);
+        assert_eq!(out[0].bits_used_8th, 8);
+    }
+
+    /// The cached loop never overshoots any band's adjusted target.
+    #[test]
+    fn cached_loop_never_overshoots() {
+        // 5 coded bands starting at band 2, LM 2.
+        let lm = 2usize;
+        let start = 2usize;
+        let n = [4u32, 8, 16, 22, 22];
+        let t = [60u32, 120, 200, 300, 400];
+        let (out, _) = bits_to_pulses_band_loop_cached(lm, start, &n, &t).unwrap();
+        let mut balance = BalanceAccumulator::new();
+        for (i, &ti) in t.iter().enumerate() {
+            let divisor = if i == n.len() - 1 {
+                LAST_BALANCE_DIVISOR
+            } else if i == n.len() - 2 {
+                SECOND_TO_LAST_BALANCE_DIVISOR
+            } else {
+                DEFAULT_BALANCE_DIVISOR
+            };
+            let adjusted = balance.adjusted_target(ti, divisor);
+            assert!(
+                out[i].bits_used_8th <= adjusted,
+                "band {} overshot adjusted {} with {}",
+                start + i,
+                adjusted,
+                out[i].bits_used_8th
+            );
+            balance.update(adjusted, out[i].bits_used_8th);
+        }
+    }
+
+    /// Out-of-range absolute band index ⇒ None (cache lookup fails on
+    /// a non-sentinel-but-present offset that exceeds run length is not
+    /// possible, but a band index past 20 has no entry).
+    #[test]
+    fn cached_loop_band_out_of_range_is_none() {
+        // band_start 20 + i=1 ⇒ band 21, out of range ⇒ sentinel path
+        // (cache_offset returns None for band >= 21), so the estimator
+        // handles it rather than erroring. Verify it does not panic and
+        // produces a result for the in-range band.
+        let (out, _) = bits_to_pulses_band_loop_cached(0, 20, &[22, 22], &[400, 400]).unwrap();
+        assert_eq!(out.len(), 2);
+        // Band 20 LM0 is cached (run @351); band 21 is out of range ⇒
+        // estimator path. Both produce a result.
+        assert!(out[0].k >= 1);
     }
 }

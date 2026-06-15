@@ -4,6 +4,31 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-314 (2026-06-15) — bit-exact §4.3.4.1 pulse-cost cache
+  (`pulse_cache`):** the bits-to-pulses search previously drove `K`
+  selection from a worst-case `ceil(log2 V(N, K))` estimator because
+  the per-(band, LM) cost cache the RFC §4.3.4.1 search runs against
+  ("a precomputed allocation table that only permits some K values for
+  each N") was a docs gap. The new `pulse_cache` module embeds both
+  cache tables bit-exact — `CACHE_INDEX50` (105 `i16` per-(band, LM)
+  offsets, band-major `band*5 + LM`, `-1` = closed-form sentinel) and
+  `CACHE_BITS50` (392 `u8` packed cost runs, each `maxK` byte followed
+  by `qbits[1..=maxK]` in 1/8-bit units) — and walks them per the
+  clean-room trace: `cache_offset`, `cache_max_k`, `cache_cost_8th`,
+  and `cached_bits_to_pulses` (the §4.3.4.1 inner loop returning the
+  largest `K` whose cost fits the budget). The 23 distinct runs tile
+  the 392 bytes exactly (verified in-test: every run's leading byte
+  equals its length-minus-one, every curve is monotone, the 8
+  sentinels land on band 0 + band 1 LM0..2). `bits_to_pulses` gains
+  `bits_to_pulses_band_loop_cached`, which consumes the bit-exact
+  cache for cached tuples and falls back to the estimator only for the
+  sentinel small-band cases. This closes the cost-cache gap §4.3.4.1
+  carried and unblocks the §4.3.3 reallocation fine/shape split.
+  Values from `docs/audio/opus/pulse-cache-format-trace.md` (#118) +
+  `tables/cache-index50.csv` + `tables/cache-bits50.csv`.
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-celt/compare/v0.1.8...v0.1.9) - 2026-06-15
 
 ### Other

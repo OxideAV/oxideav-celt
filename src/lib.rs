@@ -197,6 +197,7 @@ pub mod hadamard;
 pub mod laplace;
 pub mod mdct;
 pub mod post_filter;
+pub mod pulse_cache;
 pub mod pvq;
 pub mod range_decoder;
 pub mod spread;
@@ -229,9 +230,9 @@ pub use bit_allocation::{
     DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE,
 };
 pub use bits_to_pulses::{
-    bits_to_pulses_band_loop, bits_to_pulses_search, cost_log2_v_count_8th, BalanceAccumulator,
-    BitsToPulses, DEFAULT_BALANCE_DIVISOR, EIGHTH_BITS_PER_BIT, K_SEARCH_CAP, LAST_BALANCE_DIVISOR,
-    SECOND_TO_LAST_BALANCE_DIVISOR,
+    bits_to_pulses_band_loop, bits_to_pulses_band_loop_cached, bits_to_pulses_search,
+    cost_log2_v_count_8th, BalanceAccumulator, BitsToPulses, DEFAULT_BALANCE_DIVISOR,
+    EIGHTH_BITS_PER_BIT, K_SEARCH_CAP, LAST_BALANCE_DIVISOR, SECOND_TO_LAST_BALANCE_DIVISOR,
 };
 pub use coarse_energy::{
     decode_coarse_energy, CoarseEnergyState, BETA_COEF_Q15, INTRA_ALPHA_Q15, INTRA_BETA_Q15,
@@ -266,6 +267,10 @@ pub use post_filter::{
     apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,
     tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN,
     POST_FILTER_TAPS_F32, POST_FILTER_TAPS_Q15, TAPS_PER_SET,
+};
+pub use pulse_cache::{
+    cache_cost_8th, cache_max_k, cache_offset, cached_bits_to_pulses, CachedPulses, CACHE_BITS50,
+    CACHE_INDEX50,
 };
 pub use pvq::{
     decode_index_to_pulses, decode_pulses, decode_unit_shape, normalize_to_unit_l2, v_count,
