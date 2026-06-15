@@ -2,7 +2,22 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-14
+## Status — 2026-06-15
+
+**Round-29.** The §4.3 MDCT band-layout module (`band_layout`) exposes
+the canonical CELT band-edge layout (`EBAND_EDGES_5MS`, the 22 LM=0
+cumulative MDCT-bin offsets `0..=100` whose consecutive differences are
+the RFC 6716 Table 55 "2.5 ms / Bins" column) plus the band→bin-range
+accessors every band-walking step needs but previously had to
+reconstruct by hand: `band_edge(band, lm)` (per-channel bin offset of a
+band's start, scaled by `1 << lm`), `band_bins(band, lm)` (the Table 55
+per-band bin count), `band_bin_range(band, lm)` (the half-open
+`[start, end)` MDCT-bin range), and `coded_total_bins(start, end, lm)`
+(the total bin span over a coded-band window, e.g. the Hybrid `17..21`
+window's 60 LM=0 bins). The bin counts are bit-identical to
+`BAND_BINS_LM`/`SHORT_FRAME_BAND_BINS`; a test pins the edge-form and
+count-form transcriptions against each other so neither can drift from
+Table 55. See the band-layout section below.
 
 **Round-28.** The §4.3 frame-prefix decode driver
 (`decode_frame_prefix` → `FramePrefix`) chains every CELT
@@ -535,6 +550,37 @@ Per-band minimum + trim-offset helpers (RFC 6716 §4.3.3 §2.6, lines
   window picks up the correct LM=0 reference cell.
 * `EIGHTH_BIT_QUANTUM = 8`, `NUM_LM = 4` constants pin the unit
   and row count.
+
+MDCT band layout (RFC 6716 §4.3, Table 55):
+
+* `EBAND_EDGES_5MS: [u32; 22]` — the canonical CELT band edges at the
+  2.5 ms (LM=0) frame size, in per-channel MDCT bins: the cumulative
+  offsets `[0, 1, 2, …, 78, 100]`. `EBAND_EDGES_5MS[band]` is the start
+  bin of `band`; `EBAND_EDGES_5MS[band+1]` its exclusive end; the final
+  entry `100` is the total LM=0 coded bin count (the 0–20 kHz range; the
+  underlying MDCT has `120 << lm` bins/channel, so the 20-bin gap above
+  20 kHz is not band-coded). The consecutive differences reproduce the
+  Table 55 "2.5 ms / Bins" column
+  (`[1,1,1,1,1,1,1,1,2,2,2,2,4,4,4,6,6,8,12,18,22]`).
+* `band_edge(band, lm) -> Option<u32>` — the per-channel bin offset of
+  `band`'s start at frame-size shift `lm`, `EBAND_EDGES_5MS[band] << lm`.
+  Accepts `band == NUM_BANDS` (returns the terminal edge `100 << lm`).
+* `band_bins(band, lm) -> Option<u32>` — the Table 55 per-band bin count
+  `N[band]` (the edge difference scaled by `1 << lm`); bit-identical to
+  `BAND_BINS_LM[lm][band]`.
+* `band_bin_range(band, lm) -> Option<(u32, u32)>` — the half-open
+  `[start, end)` MDCT-bin range of `band`, with
+  `end - start == band_bins(band, lm)`.
+* `coded_total_bins(start, end, lm) -> Option<u32>` — the total
+  per-channel bin span over the coded-band window `[start, end)`
+  (`band_edge(end, lm) - band_edge(start, lm)`). Pure CELT uses
+  `start = 0`; Hybrid mode uses `start = 17` (a 60-bin LM=0 span over
+  bands `17..21`). Rejects `start > end`, `end > NUM_BANDS`, `lm > 3`.
+* `NUM_BAND_EDGES = 22` (= `NUM_BANDS + 1`). The edge-form layout is the
+  companion of the count-form `BAND_BINS_LM`; the band-decode walkers
+  (§4.3.6 denormalization, §4.3.7 IMDCT input layout, §4.3.4 PVQ band
+  walk, §4.3.5 anti-collapse) index a band to its bin range through
+  these accessors instead of recomputing the prefix sum per call site.
 
 Static allocation table (RFC 6716 §4.3.3, Table 57):
 

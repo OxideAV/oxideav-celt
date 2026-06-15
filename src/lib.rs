@@ -2,6 +2,17 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-06-15):** round-29. The §4.3 MDCT band-layout module
+//! (`band_layout`) exposes the canonical CELT band-edge layout
+//! (`EBAND_EDGES_5MS`, the 22 LM=0 cumulative MDCT-bin offsets `0..=100`
+//! whose consecutive differences are the RFC 6716 §4.3 Table 55
+//! "2.5 ms / Bins" column) plus the band→bin-range accessors the
+//! band-walking steps need — `band_edge` / `band_bins` /
+//! `band_bin_range` / `coded_total_bins` — all scaled by `1 << lm`. The
+//! bin counts are bit-identical to `BAND_BINS_LM`; a test pins the
+//! edge-form and count-form transcriptions of Table 55 against each
+//! other.
+//!
 //! **Status (2026-06-14):** round-28. The §4.3 frame-prefix decode
 //! driver (`decode_frame_prefix` → `FramePrefix`) chains every CELT
 //! control-symbol decoder in RFC 6716 Table 56 bitstream order
@@ -170,6 +181,7 @@ pub mod allocation_budget;
 pub mod band_cap;
 pub mod band_decode;
 pub mod band_energy;
+pub mod band_layout;
 pub mod band_minimums;
 pub mod band_split;
 pub mod bit_allocation;
@@ -200,6 +212,9 @@ pub use band_decode::{decode_band_shape, BandShape};
 pub use band_energy::{
     assemble_band_log_energy_f32, assemble_band_log_energy_q8, log_energy_f32_to_q8,
     FINE_Q14_DENOM, Q14_TO_Q8_SHIFT,
+};
+pub use band_layout::{
+    band_bin_range, band_bins, band_edge, coded_total_bins, EBAND_EDGES_5MS, NUM_BAND_EDGES,
 };
 pub use band_minimums::{
     compute_thresh, compute_trim_offsets, BAND_BINS_LM, EIGHTH_BIT_QUANTUM, NUM_LM,

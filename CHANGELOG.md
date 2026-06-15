@@ -6,6 +6,40 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-29 (2026-06-15) — §4.3 MDCT band-layout module
+  (`band_layout`):** every band-walking step of the CELT decode chain
+  (the §4.3.6 denormalization across 21 bands, the §4.3.7 inverse-MDCT
+  input layout, the §4.3.4 per-band PVQ shape walk, the §4.3.4.4
+  band-split recursion, the §4.3.5 anti-collapse pass) needs to map a
+  band index to the half-open range of MDCT bins `[start, end)` it
+  occupies, but the crate exposed only the per-band *counts*
+  (`BAND_BINS_LM`), forcing each call site to recompute the prefix-sum
+  offset by hand. The new `band_layout` module supplies the edge-form
+  companion: `EBAND_EDGES_5MS` is the canonical LM=0 band-edge layout
+  (the 22 cumulative MDCT-bin offsets `0..=100` whose consecutive
+  differences are the RFC 6716 §4.3 Table 55 "2.5 ms / Bins" column),
+  and `band_edge(band, lm)` / `band_bins(band, lm)` /
+  `band_bin_range(band, lm)` / `coded_total_bins(start, end, lm)` are the
+  derived offset / count / range / window-span accessors (all scaled by
+  `1 << lm` per Table 55's published frame-size doubling). `band_edge`
+  tolerates the terminal edge index `band == NUM_BANDS` (the exclusive
+  end of the last band, `100 << lm`); the range accessors reject it.
+  `coded_total_bins` rejects an inverted or over-run window. The bin
+  counts are bit-identical to `BAND_BINS_LM`/`SHORT_FRAME_BAND_BINS`; a
+  test pins the edge-form and count-form transcriptions of Table 55
+  against each other so neither can drift. Exposed at the crate root:
+  `EBAND_EDGES_5MS`, `band_edge`, `band_bins`, `band_bin_range`,
+  `coded_total_bins`, `NUM_BAND_EDGES`. 16 new unit tests (edge shape /
+  monotonicity / endpoints, LM=0 widths vs Table 55, `band_bins` vs
+  `BAND_BINS_LM` for every LM, `band_edge` as the running prefix sum,
+  range tiling without gaps/overlap, full-band + Hybrid + per-band
+  decomposition of `coded_total_bins`, empty window, terminal-edge
+  handling, out-of-range and inverted-window rejection). Lib test count
+  434 → 450. Wall: RFC 6716 §4.3 Table 55
+  (`docs/audio/opus/rfc6716-opus.txt` lines 5813–5870) only; pure
+  spec-grounded derivation, no range-decoder interaction, no new numeric
+  table beyond the Table 55 edges. No external library source consulted.
+
 * **Round-28 (2026-06-14) — §4.3 frame-prefix decode driver
   (`decode_frame_prefix` → `FramePrefix`):** the individual CELT
   control-symbol decoders (header prefix, coarse energy, TF parameters,
