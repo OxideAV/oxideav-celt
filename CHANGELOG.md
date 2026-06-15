@@ -6,6 +6,33 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-319 (2026-06-16) — §4.3.4 multi-band residual decode loop
+  (`residual`):** the single-band shape chain (`decode_band_shape`)
+  decoded one band; what was missing was the band-loop integration
+  spine that walks the coded-band window in bitstream order and
+  assembles the full MDCT-domain spectrum. The new `residual` module's
+  `decode_residual_bands` → `ResidualSpectrum` is that driver — the
+  residual-section counterpart of `decode_frame_prefix` (the
+  prefix-section spine). For each coded band it computes `N`
+  (RFC 6716 §4.3 Table 55 via `band_bins`), the short-block count
+  (`2^lm` transient / `1` long, per §4.3.1), and the §4.3.4.5 TF
+  adjustment, invokes the single-band chain, and lays the band's
+  samples into its `band_bin_range` slot (offset to the window origin
+  so a Hybrid `start = 17` window indexes from 0). It takes the
+  per-band pulse counts `K[]` as an **input** (the §4.3.4.1
+  bits-to-pulses output), keeping the loop entirely inside
+  fully-specified §4.3.4 territory rather than depending on the
+  RFC-deferred §4.3.3 reallocation pass — the same boundary
+  `bits_to_pulses_band_loop` already draws. A saturated codebook (the
+  §4.3.4.4 split gap), an indivisible block count, or an over-large TF
+  request surfaces as `Error::NotImplemented` rather than a silent
+  mis-decode; length-mismatched per-band slices and out-of-range
+  windows are `Error::InvalidParameter`. 9 unit tests (mono long,
+  transient short-block, Hybrid window, per-band energy scaling,
+  zero-`K` slot, saturation, empty window, length/window rejection).
+  Decode chain order RFC 6716 §4.3.4 (lines 6462–6474); short-block
+  semantics §4.3.1 (lines 6009–6022); band layout §4.3 Table 55.
+
 * **Round-314 (2026-06-15) — bit-exact §4.3.4.1 pulse-cost cache
   (`pulse_cache`):** the bits-to-pulses search previously drove `K`
   selection from a worst-case `ceil(log2 V(N, K))` estimator because

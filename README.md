@@ -711,6 +711,35 @@ Single-band shape-decode orchestrator (RFC 6716 §4.3.4 → §4.3.6):
   split-gain precision/PDF is deferred to the reference). Callers gate
   on `band_needs_split(n, k)` before invoking this orchestrator.
 
+Multi-band residual decode loop (RFC 6716 §4.3.4 → §4.3.6):
+
+* `decode_residual_bands(dec, lm, start, end, is_transient, tf_select,
+  tf_changes, band_k, spread, log_energy_q8) -> Result<ResidualSpectrum,
+  Error>` is the residual-section integration spine — the band-loop
+  counterpart of `decode_frame_prefix`. It walks the coded-band window
+  `[start, end)` in bitstream order, and for each band computes `N`
+  (§4.3 Table 55 via `band_bins`), the short-block count (`2^lm` on a
+  transient frame, `1` on a long MDCT, per §4.3.1), and the §4.3.4.5 TF
+  adjustment (`tf_adjustment`), invokes `decode_band_shape`, and lays
+  the band's samples into its `band_bin_range` slot — offset to the
+  window origin so a Hybrid (`start = 17`) window indexes its spectrum
+  from 0.
+* `ResidualSpectrum { samples, band_k }` carries the contiguous
+  denormalized MDCT-domain spectrum (length `coded_total_bins(start,
+  end, lm)`) and the per-band pulse counts consumed.
+* The per-band pulse counts `band_k[]` are an **input** (the §4.3.4.1
+  bits-to-pulses output), so the loop stays inside the fully-specified
+  §4.3.4 territory and does not depend on the RFC-deferred §4.3.3
+  reallocation pass — the same boundary `bits_to_pulses_band_loop`
+  already draws.
+* A saturated codebook (the §4.3.4.4 split gap), an indivisible block
+  count, or an over-large TF request surfaces as
+  `Error::NotImplemented` rather than a silent mis-decode;
+  length-mismatched per-band slices or an out-of-range window/`lm` are
+  `Error::InvalidParameter`. This is the mono / per-channel, non-split
+  loop; stereo joint coding and the §4.3.5 anti-collapse pass (which
+  follows it) stay out of scope for the same docs-gap reasons.
+
 Frame-prefix decode driver (RFC 6716 §4.3, Table 56):
 
 * `decode_frame_prefix(dec, coarse_state, lm, frame_bytes, stereo,

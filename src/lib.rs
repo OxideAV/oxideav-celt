@@ -148,6 +148,18 @@
 //! chain in §4.3 bitstream order: PVQ unit-shape decode
 //! (§4.3.4.1/§4.3.4.2) → spreading rotation (§4.3.4.3) → time-frequency
 //! resolution change (§4.3.4.5) → denormalization (§4.3.6). The
+//! §4.3.4 multi-band residual loop (`decode_residual_bands` →
+//! `ResidualSpectrum`) is the residual-section integration spine: given
+//! the per-band pulse counts the §4.3.3 allocation produced, it walks
+//! the coded-band window `[start, end)` in bitstream order, computing
+//! each band's `N` (Table 55) and short-block count (`2^lm` transient /
+//! `1` long), evaluating the §4.3.4.5 TF adjustment, invoking the
+//! single-band chain, and assembling the per-band shapes into the
+//! contiguous MDCT-domain spectrum the §4.3.7 inverse MDCT consumes. It
+//! is the residual-section counterpart of `decode_frame_prefix` (the
+//! prefix-section spine) and stays inside fully-specified §4.3.4
+//! territory by taking `K[]` as input rather than computing it via the
+//! gap'd reallocation pass. The
 //! §4.3.7 inverse MDCT machinery (the Vorbis-derived power-of-sine
 //! window in closed form, validated against the staged
 //! `window120.csv` / `window240.csv` data extractions; the low-overlap
@@ -200,6 +212,7 @@ pub mod post_filter;
 pub mod pulse_cache;
 pub mod pvq;
 pub mod range_decoder;
+pub mod residual;
 pub mod spread;
 pub mod spread_rotation;
 pub mod static_alloc;
@@ -277,6 +290,7 @@ pub use pvq::{
     V_COUNT_SATURATION,
 };
 pub use range_decoder::RangeDecoder;
+pub use residual::{decode_residual_bands, ResidualSpectrum};
 pub use spread::{
     decode_spread, pre_rotation_stride, rotation_gain_ratio, rotation_gain_squared_ratio, Spread,
     DEFAULT_SPREAD,
