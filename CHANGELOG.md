@@ -4,6 +4,16 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-celt/compare/v0.1.8...v0.1.9) - 2026-06-15
+
+### Other
+
+- round-29 §4.3 MDCT band-layout module (RFC 6716 Table 55)
+- §4.3 frame-prefix decode driver (Table 56 integration spine)
+- celt r297: bump README status header to round-27
+- celt r297: §4.3.3 per-band interpolated allocation vector (window_static_alloc_per_band_1_8th)
+- §4.3.2 final per-band log-energy assembly + Q8 bridge
+
 ### Added
 
 * **Round-29 (2026-06-15) — §4.3 MDCT band-layout module
