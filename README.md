@@ -2,153 +2,26 @@
 
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
-## Status — 2026-06-15
+## Status
 
-**Round-29.** The §4.3 MDCT band-layout module (`band_layout`) exposes
-the canonical CELT band-edge layout (`EBAND_EDGES_5MS`, the 22 LM=0
-cumulative MDCT-bin offsets `0..=100` whose consecutive differences are
-the RFC 6716 Table 55 "2.5 ms / Bins" column) plus the band→bin-range
-accessors every band-walking step needs but previously had to
-reconstruct by hand: `band_edge(band, lm)` (per-channel bin offset of a
-band's start, scaled by `1 << lm`), `band_bins(band, lm)` (the Table 55
-per-band bin count), `band_bin_range(band, lm)` (the half-open
-`[start, end)` MDCT-bin range), and `coded_total_bins(start, end, lm)`
-(the total bin span over a coded-band window, e.g. the Hybrid `17..21`
-window's 60 LM=0 bins). The bin counts are bit-identical to
-`BAND_BINS_LM`/`SHORT_FRAME_BAND_BINS`; a test pins the edge-form and
-count-form transcriptions against each other so neither can drift from
-Table 55. See the band-layout section below.
+**Decoder building blocks, in progress.** The range decoder and the
+full CELT control-symbol decode path (frame-prefix → coarse energy →
+fine energy → time-frequency parameters → spreading → bit allocation)
+are implemented bit-exactly per RFC 6716, along with the PVQ shape
+decoder, spreading rotation, Hadamard TF transforms, band
+denormalization, post-filter, de-emphasis, and the inverse MDCT /
+overlap-add synthesis. The `decode_frame_prefix` driver chains every
+control symbol in RFC 6716 Table 56 order up to the `fine energy`
+symbol, where the reallocation pass begins.
 
-**Round-28.** The §4.3 frame-prefix decode driver
-(`decode_frame_prefix` → `FramePrefix`) chains every CELT
-control-symbol decoder in RFC 6716 Table 56 bitstream order — silence /
-post-filter / transient / intra → coarse energy → tf_change / tf_select
-→ spread → per-band caps → band boosts → initial reservations → band
-allocation — threading the reservation/boost budget between steps so the
-trim and stereo gates fire against the correct intermediate
-`ec_tell_frac()`. It is the integration spine the per-symbol decoders
-have been building toward; it stops at the Table 56 `fine energy` symbol
-(the docs-gap boundary where the reallocation pass begins). See the
-frame-prefix section below.
+Not yet implemented: the reallocation loop (concurrent skip decoding),
+the §4.3.4.4 split-gain band-split path, and the stereo joint-coding
+path — each blocked on detail that RFC 6716 §4.3.3 / §4.3.4.4 and the
+clean-room narrative §2.7 defer to the reference implementation. The
+higher-level frame decoder, encoder, and codec-registration entry
+points still return `Error::NotImplemented`.
 
-**Round-27.** The §4.3.3 static-allocation search now exposes the
-per-band interpolated allocation vector
-(`window_static_alloc_per_band_1_8th`): the per-band 1/8-bit breakdown
-of the window total at a chosen `(qlo, frac)` grid position
-(`channels * N * interp_alloc << LM >> 2` per band, top-column
-saturated exit reachable), the vector the §4.3.3 reallocation pass
-(§2.7 outcome) consumes alongside the minimums, trim offsets, and caps.
-See the static-allocation section below.
-
-**Round-26.** The §4.3.2 final per-band log-energy assembly
-(`band_energy`) combines the three additive envelope steps — the
-§4.3.2.1 coarse f32 log-energies, the §4.3.2.2 fine Q14 corrections,
-and the §4.3.2.2 finalize Q14 corrections — into one final per-band
-log-energy and bridges it onto the Q8 axis the §4.3.6 denormalization
-and `decode_band_shape` consume (closing the `multiply by 256 and
-round` seam those modules previously left to the caller). See the
-dedicated section below.
-
-**Round-25.** The bit-exact CELT/SILK range decoder (RFC 6716 §4.1),
-the CELT frame-header prefix (RFC 6716 §4.3, the scalar fields that
-precede band-decode), the complete §4.3.2.1 coarse-energy decoder
-(`ec_laplace_decode` + `decode_coarse_energy`, see the dedicated
-section below), the §4.3.2.2 fine-energy
-refinement decoder + finalize step, the §4.3.3 bit-allocation scalar
-fields (alloc.trim, skip, intensity-band, dual-stereo), the §4.3.3
-stereo reservation helpers (`LOG2_FRAC_TABLE` lookup + `intensity_rsv`
-+ `reserve_stereo`), the §4.3.3 per-band `cap[]` machinery (the full
-168-entry `CACHE_CAPS50` table + `compute_band_caps`) and the §4.3.3
-band-boost dynalloc-logp loop (`decode_band_boosts` →
-`BoostResult { boost, total_boost, total_bits_remaining }`), the
-§4.3.3 initial-reservations budget walk
-(`compute_initial_reservations` chains `total_initial` init,
-anti-collapse, skip, intensity, and dual-stereo reservations into
-one call and emits an `InitialReservations` carrier ready to feed
-the band-boost loop and the band-allocation orchestrator), the
-§4.3.4.5 time-frequency change parameters (per-band `tf_change` +
-the gated global `tf_select` + the four tabulated TF-adjustment
-tables 60–63), the §4.3.4.5 Hadamard transform primitives
-(orthonormal radix-2 WHT in natural and sequency order + the
-`apply_tf_resolution_change` orchestrator), the §4.3.4.3 spreading
-parameter (PDF `{7, 2, 21, 2}/32` + Table 59 `f_r` lookup + closed-
-form rotation-gain helpers), the §4.3.7.1 post-filter (three tap
-shapes in f32 + Q15 + gain reconstruction + per-sample / slice
-filter response), and the §4.3.7.2 single-pole de-emphasis filter
-(`α_p = 0.8500061035`, in both f32 and Q15) are now wired up. The
-§4.3.2.1 `e_prob_model` Laplace-parameter table is transcribed
-verbatim (`E_PROB_MODEL[lm][intra][band] -> ProbDecay { prob,
-decay }`, 4 × 2 × 21 = 168 Q8 pairs from
-`docs/audio/celt/tables/e_prob_model.csv`), with the matching
-`prob_decay(lm, intra, band)` accessor that folds the `bool intra`
-flag onto the staged CSV's `0 = inter / 1 = intra` middle axis, and
-now feeds the implemented `ec_laplace_decode` per-symbol recurrence
-(transcribed from RFC 6716 Appendix A `laplace.c`, the reference
-listing embedded in the RFC's own text and extracted per §A.1) and
-the `decode_coarse_energy` envelope walk (Appendix A
-`quant_bands.c`, `unquant_coarse_energy`). The §4.3.3 §2.6 per-band hard-minimum shape
-allocation (`compute_thresh`) and the per-band `trim_offsets[]`
-derivation (`compute_trim_offsets`) are now wired up, alongside the
-full §4.3 Table 55 MDCT-bin layout (`BAND_BINS_LM` for all four LM
-values + `SHORT_FRAME_BAND_BINS` for the LM=0 column the §2.6 prose
-cites), and the §4.3.3 Table 57 static-allocation matrix
-(`STATIC_ALLOC[band][q]`, 21 × 11) with the §4.3.3 per-band evaluator
-`band_static_alloc_1_8th` (the `channels * N * alloc << LM >> 2`
-formula folded with the 1/64-step linear interpolation between
-adjacent quality columns) and the `window_static_alloc_1_8th` window
-sum used by the static-allocation search driver, and the §4.3.3
-inner static-allocation search (`find_static_alloc` →
-`StaticAllocSearch { qlo, frac, total_1_8th }` — bisects the 1/64-
-step interpolation grid for the highest grid position whose window
-total fits the remaining 1/8-bit budget) are now wired up.
-The §4.3.3 inner static-allocation search (`find_static_alloc` →
-`StaticAllocSearch { qlo, frac, total_1_8th }`) bisects the 1/64-
-step interpolation grid for the highest `(qlo, frac)` whose window
-total in 1/8 bits does not exceed the supplied "remaining" budget.
-The §4.3.4.2 Pyramid Vector Quantizer codebook size `V(N, K)` and
-per-band shape decoder (`v_count` + `decode_index_to_pulses` +
-`decode_pulses` + `normalize_to_unit_l2` + `decode_unit_shape`)
-reproduce the §4.3.4.2 recurrence `V(N, K) = V(N-1, K) + V(N, K-1)
-+ V(N-1, K-1)` and the per-position reconstruction loop, then
-normalise the decoded integer pulse vector to unit L2 norm so the
-§4.3.4.3 spreading rotation can consume it directly. The §4.3.4.1
-bits-to-pulses search + balance accumulator
-(`bits_to_pulses_search` + `BalanceAccumulator` +
-`bits_to_pulses_band_loop`) reproduce the §4.3.4.1 K-search rule
-("nearest to target, not exceeding it; ties round down") with a
-caller-supplied cost-of-(N, K) closure, and chain it across a band
-sequence with the §4.3.4.1 share divisors 3 / 2 / 1 for the
-general / second-to-last / last band; the running 1/8-bit balance
-absorbs the residue. The §4.3.4.3 spreading rotation chain
-(`apply_spread`, `apply_nd_rotation`, `apply_nd_rotation_multi_block`,
-`apply_pre_rotation`, `apply_2d_rotation`, `rotation_angle_f64`)
-applies the `theta = pi * g_r^2 / 4` N-D forward + reverse 2-D
-rotation chain to a unit-norm PVQ shape vector, with per-time-block
-independence and the `(pi/2 - theta)` interleaved pre-rotation at
-stride `round(sqrt(N/nb_blocks))` when each time block spans at
-least 8 samples. The §4.3.4.4 PVQ band-split gating + recursion
-geometry (`band_needs_split` + `split_dimensions` +
-`max_split_levels` + `plan_band_split` → `BandSplitNode`) detects
-when `V(N, K)` would exceed the 32-bit codebook budget and
-synthesises the recursive halving tree (capped at `LM + 1` levels
-per §4.3.4.4) the band-decode walker traverses to reach the leaf
-PVQ sub-bands. The quantized split-gain parameter that splits the
-relative L2 norm across the two halves is queued as a docs gap
-(the §4.3.4.4 prose defers the precise precision/PDF to the
-reference). The §4.3.4 → §4.3.6 single non-split band-decode
-orchestrator (`decode_band_shape` → `BandShape`) chains the simplest-
-case decode in §4.3 bitstream order: PVQ unit-shape decode
-(§4.3.4.1/§4.3.4.2) → spreading rotation (§4.3.4.3) → time-frequency
-resolution change (§4.3.4.5) → denormalization (§4.3.6). The §4.3.7
-inverse MDCT machinery — the Vorbis-derived power-of-sine window in
-closed form (validated against the staged `window120.csv` /
-`window240.csv` data extractions), the low-overlap window
-construction with its hop-`N` power-complementarity invariant, the
-direct-form `1/2`-scaled IMDCT plus its `4/N` forward companion, and
-the streaming weighted-overlap-add synthesis state (`MdctSynthesis`)
-— is wired up. The reallocation loop (concurrent skip decoding), the
-fine-energy / shape split, and the §4.3.4.4 split-gain band-split
-path still come later.
+The module-by-module API surface is documented below.
 
 Range decoder (RFC 6716 §4.1):
 
@@ -674,8 +547,8 @@ Bits-to-pulses search and balance accumulator (RFC 6716 §4.3.4.1):
   search short-circuits cleanly. This is the closed-form estimator
   the search composes with by default; the bit-exact per-(N, K) cost
   cache the §4.3.4.1 reference uses is delegated to a source file
-  outside the workspace clean-room allow-list, so this round ships
-  the spec-grounded shape against the worst-case estimator.
+  outside the workspace clean-room allow-list, so the implementation
+  uses the spec-grounded shape against the worst-case estimator.
 * `bits_to_pulses_search(n, target_8th, cost_fn) -> BitsToPulses` —
   for a single band, picks the largest `K ∈ [0, K_SEARCH_CAP]` whose
   reported cost does not exceed `target_8th`. The §4.3.4.1
@@ -699,8 +572,8 @@ Bits-to-pulses search and balance accumulator (RFC 6716 §4.3.4.1):
   balance"). Returns the per-band `(K, bits_used_8th)` plus the
   final balance.
 * `K_SEARCH_CAP = 128` pins a deterministic worst-case on the inner
-  loop. The §4.3.4.4 band-splitting machinery (a future round) keeps
-  the legitimate per-band `K` well inside this bound.
+  loop. The §4.3.4.4 band-splitting machinery keeps the legitimate
+  per-band `K` well inside this bound.
 
 PVQ band-split gating and recursion geometry (RFC 6716 §4.3.4.4,
 page 118):
@@ -813,10 +686,9 @@ Single-band shape-decode orchestrator (RFC 6716 §4.3.4 → §4.3.6):
   divisible by `nb_blocks`, or a TF request exceeding the available
   Hadamard levels).
 * The §4.3.4.4 split-gain band-split path and the stereo joint-coding
-  path remain out of scope for the same docs-gap reason flagged in the
-  §4.3.4.4 geometry round (the precise split-gain precision/PDF is
-  deferred to the reference). Callers gate on `band_needs_split(n, k)`
-  before invoking this orchestrator.
+  path remain out of scope for the same docs-gap reason (the precise
+  split-gain precision/PDF is deferred to the reference). Callers gate
+  on `band_needs_split(n, k)` before invoking this orchestrator.
 
 Frame-prefix decode driver (RFC 6716 §4.3, Table 56):
 
@@ -902,8 +774,8 @@ value §A.1 prints) and is therefore part of the staged spec; the
 `<file>`". Any source outside the staged RFC text — including any
 external distribution of the same reference code — sits outside the
 workspace clean-room allow-list and was not consulted. Black-box
-invocations of `opusdec` / `opusenc` are allowed as opaque validators
-only.
+invocations of a reference command-line encoder/decoder are allowed as
+opaque validators only.
 
 ## License
 
