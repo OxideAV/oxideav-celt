@@ -2,6 +2,17 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-06-17):** round-326. The §4.3.3 per-band
+//! shape-allocation assembly (`alloc_combine`) combines the interpolated
+//! Table-57 static allocation, the decoded band boosts, and the
+//! `alloc.trim`-derived per-band tilt into a per-band candidate clamped
+//! to the per-band `cap[]` and floored at zero
+//! (`combine_band_allocation` → `CombinedAllocation`). This is the
+//! "minimums / cap / boost composition in the next stage" the
+//! `StaticAllocSearch` result hands off to; the §2.7 hard-minimum skip
+//! decision (thresh-floor + concurrent skip decoding) stays deferred
+//! to the reference per the RFC / narrative §2.7.
+//!
 //! **Status (2026-06-15):** round-29. The §4.3 MDCT band-layout module
 //! (`band_layout`) exposes the canonical CELT band-edge layout
 //! (`EBAND_EDGES_5MS`, the 22 LM=0 cumulative MDCT-bin offsets `0..=100`
@@ -189,6 +200,7 @@
 
 use oxideav_core::RuntimeContext;
 
+pub mod alloc_combine;
 pub mod allocation_budget;
 pub mod band_cap;
 pub mod band_decode;
@@ -218,6 +230,7 @@ pub mod spread_rotation;
 pub mod static_alloc;
 pub mod tf_change;
 
+pub use alloc_combine::{combine_band_allocation, CombinedAllocation};
 pub use allocation_budget::{
     compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
 };

@@ -511,6 +511,38 @@ Static allocation table (RFC 6716 §4.3.3, Table 57):
   (`out.iter().sum()` equals `window_static_alloc_1_8th`). Computed
   through a scratch buffer so `out` is untouched on any rejection.
 
+Per-band shape-allocation assembly at a quality column (RFC 6716
+§4.3.3 §§2.1–2.3/2.6):
+
+* `combine_band_allocation(coding_start, bins_per_band, qlo, frac,
+  boost, alloc_trim, channels, stereo, lm) -> Option<CombinedAllocation>`
+  assembles the per-band shape-allocation candidate the §2.7 search
+  evaluates at one quality column. For each coded band it computes
+  `bits[b] = clamp(static[b] + boost[b] + trim_offset[b], 0, cap[b])`
+  in 1/8-bit units: the interpolated Table-57 static allocation (§2.1,
+  via `window_static_alloc_per_band_1_8th`) plus the decoded band boost
+  (§2.3) plus the `alloc.trim`-derived tilt (§2.6, via
+  `compute_trim_offsets`), clamped above by the per-band `cap[]` (§2.2,
+  via `compute_band_caps`) and floored at zero. This is the "minimums /
+  cap / boost composition in the next stage" the `StaticAllocSearch`
+  doc hands off to. The additive chain accumulates in `i64` so it
+  cannot overflow before the clamp re-narrows it.
+* `CombinedAllocation { bits, caps, total }` carries the per-coded-band
+  candidate (`bits`), the `cap[]` used by the clamp (`caps`, kept so the
+  deferred §2.7 bisection reuses it), and the window sum (`total`, in
+  1/8 bits). `bits[b]` is always in `0..=caps[b]`; `total` equals the
+  sum of `bits`.
+* Returns `None` on any input-validation failure (window overflowing
+  `NUM_BANDS`, `channels ∉ {1,2}`, `lm > 3`, `alloc_trim ∉ 0..=10`,
+  `qlo`/`frac` outside the interpolation grid, or a `boost` slice whose
+  length does not match the window).
+* The §2.7 hard-minimum **skip** decision (comparing each candidate
+  against `thresh[]` and zeroing bands that fall short) stays out of
+  scope: it is coupled to the reallocation bisection / concurrent skip
+  decoding that RFC 6716 §4.3.3 and the clean-room narrative §2.7 defer
+  to the reference. `compute_thresh`'s `thresh[]` is carried forward
+  into that deferred step unchanged.
+
 Pyramid Vector Quantizer (RFC 6716 §4.3.4.2):
 
 * `v_count(n, k)` — the §4.3.4.2 codebook size `V(N, K)` computed

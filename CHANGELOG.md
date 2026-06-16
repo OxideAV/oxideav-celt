@@ -6,6 +6,32 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-326 (2026-06-17) — §4.3.3 per-band shape-allocation assembly
+  at a quality column (`alloc_combine`):** the static-allocation search
+  (`find_static_alloc`) returns only a window total, and its
+  `StaticAllocSearch` doc explicitly hands off to "the minimums / cap /
+  boost composition in the next stage." The new `alloc_combine`
+  module's `combine_band_allocation` → `CombinedAllocation` is that next
+  stage, restricted to the part RFC 6716 §4.3.3 spells out term by
+  term. For one quality column `(qlo, frac)` it sums the interpolated
+  per-band static allocation (§2.1
+  `window_static_alloc_per_band_1_8th`), the decoded band boosts (§2.3),
+  and the `alloc.trim`-derived per-band tilt (§2.6 `compute_trim_offsets`
+  — the "tilt"), then clamps each band to its `cap[]` (§2.2
+  `compute_band_caps` — the "band maximums") and floors it at zero, all
+  in 1/8-bit units. The result is the per-band shape-allocation
+  candidate the §2.7 search evaluates at that column; `CombinedAllocation`
+  carries the per-band `bits`, the `caps` used, and the window `total`.
+  The accumulation runs in `i64` so the additive chain cannot overflow
+  before the clamp re-narrows it. The §2.7 hard-minimum **skip**
+  decision (comparing each candidate against `thresh[]` and dropping it
+  to zero) stays out of scope: it is bound up with the reallocation
+  bisection and concurrent skip decoding, which RFC 6716 §4.3.3 and the
+  clean-room narrative §2.7 defer to the reference implementation. 8
+  unit tests (static/trim/cap decomposition, additive boosts, cap and
+  zero clamps binding, window-total identity, stereo cap-row selection,
+  Hybrid `start = 17` window, full input-validation matrix).
+
 * **Round-319 (2026-06-16) — §4.3.4 multi-band residual decode loop
   (`residual`):** the single-band shape chain (`decode_band_shape`)
   decoded one band; what was missing was the band-loop integration
