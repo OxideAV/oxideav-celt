@@ -2,6 +2,22 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-06-18):** round-336. The §4.3.6 → §4.3.7 long-MDCT
+//! synthesis spine (`synthesis`) closes the seam between the residual
+//! band-loop and the inverse MDCT: `place_residual_spectrum` maps a
+//! coded-window residual spectrum (the `decode_residual_bands` output)
+//! into the full `120 << lm`-bin MDCT spectrum at its absolute
+//! band-edge offset (zeroing the uncoded low bins and the `20 << lm`
+//! high-frequency gap above the `100 << lm` coding top), and
+//! `LongMdctSynthesis` runs `MdctSynthesis::frame` with the fixed
+//! 120-sample-overlap §4.3.7 window (`CELT_OVERLAP` / `mdct_size`) to
+//! emit `120 << lm` time-domain samples — the §4.3.7.1 post-filter's
+//! input. This is the residual-spectrum → PCM counterpart of the
+//! `decode_residual_bands` band-loop spine, for the non-transient
+//! (single long MDCT) case; the transient short-block reassembly stays
+//! a documented docs gap (§4.3.1 / §4.3.7 defer the per-short-block
+//! layout + inter-block overlap-add to the reference).
+//!
 //! **Status (2026-06-17):** round-326. The §4.3.3 per-band
 //! shape-allocation assembly (`alloc_combine`) combines the interpolated
 //! Table-57 static allocation, the decoded band boosts, and the
@@ -228,6 +244,7 @@ pub mod residual;
 pub mod spread;
 pub mod spread_rotation;
 pub mod static_alloc;
+pub mod synthesis;
 pub mod tf_change;
 
 pub use alloc_combine::{
@@ -318,6 +335,7 @@ pub use static_alloc::{
     band_static_alloc_1_8th, find_static_alloc, interp_alloc_1_32nd, window_static_alloc_1_8th,
     window_static_alloc_per_band_1_8th, StaticAllocSearch, INTERP_STEPS, NUM_Q, STATIC_ALLOC,
 };
+pub use synthesis::{mdct_size, place_residual_spectrum, LongMdctSynthesis, CELT_OVERLAP};
 pub use tf_change::{
     decode_tf_changes, decode_tf_parameters, decode_tf_select, tf_adjustment, tf_select_matters,
     TfParameters, LM_VALUES, TABLE_60_NON_TRANSIENT_SEL0, TABLE_61_NON_TRANSIENT_SEL1,

@@ -6,6 +6,30 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-336 (2026-06-18) — §4.3.6 → §4.3.7 long-MDCT synthesis spine
+  (`synthesis` module):** closes the seam between the residual band-loop
+  (`decode_residual_bands`) and the inverse MDCT. `mdct_size(lm)` is the
+  full per-channel MDCT span `120 << lm` (vs. the `100 << lm` band-coded
+  top of §4.3 Table 55); `CELT_OVERLAP` is the fixed 120-sample §4.3.7
+  overlap. `place_residual_spectrum(residual, lm, start, end)` maps a
+  coded-window residual spectrum into the full `120 << lm`-bin MDCT
+  spectrum at its absolute band-edge offset
+  `[band_edge(start), band_edge(end))`, leaving the uncoded low bins
+  (below a Hybrid `start`) and the `20 << lm`-bin high-frequency gap at
+  zero — the §4.3.7 inverse-MDCT input. `LongMdctSynthesis` is the
+  streaming synthesis state for a fixed `lm`: `synthesize` places the
+  residual spectrum and runs `MdctSynthesis::frame` with the
+  fixed-overlap §4.3.7 window, emitting `120 << lm` time-domain samples
+  (the §4.3.7.1 post-filter's input), with `reset()` for the §4.5.2
+  decoder reset. This is the residual-spectrum → PCM counterpart of the
+  `decode_residual_bands` band-loop spine, for the non-transient (single
+  long MDCT) case; the transient short-block reassembly (per-short-block
+  frequency-vector layout + inter-block overlap-add) stays a documented
+  docs gap, deferred to the reference by RFC 6716 §4.3.1 / §4.3.7.
+  Fourteen new tests pin the spectrum placement (full-band + Hybrid +
+  high-gap zeroing), the windowed-IMDCT first-frame identity, the
+  two-frame overlap-add, `reset()`, silence, and the validation paths.
+
 * **Round-331 (2026-06-18) — §4.3.3 combined-candidate quality-column
   search (`find_combined_alloc`):** `find_static_alloc` searches the
   1/64-step interpolation grid against the *static-only* window total;

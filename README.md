@@ -12,7 +12,11 @@ decoder, spreading rotation, Hadamard TF transforms, band
 denormalization, post-filter, de-emphasis, and the inverse MDCT /
 overlap-add synthesis. The `decode_frame_prefix` driver chains every
 control symbol in RFC 6716 Table 56 order up to the `fine energy`
-symbol, where the reallocation pass begins.
+symbol, where the reallocation pass begins. On the synthesis side, the
+`LongMdctSynthesis` spine places a decoded residual spectrum into the
+full `120 << lm`-bin MDCT spectrum and runs the §4.3.7 inverse MDCT +
+weighted overlap-add to emit time-domain PCM for the non-transient
+(single long MDCT) case.
 
 Not yet implemented: the reallocation loop (concurrent skip decoding),
 the §4.3.4.4 split-gain band-split path, and the stereo joint-coding
@@ -854,6 +858,34 @@ Inverse MDCT and low-overlap window (RFC 6716 §4.3.7):
   saved tail → emit `N` samples (`frame`), with `reset()` for the
   §4.5.2 decoder reset. Feeds the §4.3.7.1 post-filter ("output of
   the inverse MDCT (after weighted overlap-add)").
+
+Long-MDCT synthesis spine (RFC 6716 §4.3.6 → §4.3.7):
+
+* `mdct_size(lm)` — the full per-channel MDCT size `120 << lm`, the
+  span the §4.3.7 inverse MDCT transforms. The band-coded range tops
+  out at `100 << lm` (§4.3 Table 55), so the upper `20 << lm` bins are
+  the uncoded high-frequency gap.
+* `CELT_OVERLAP` — the fixed 120-sample §4.3.7 overlap (the basic
+  240-sample window's rising/falling half).
+* `place_residual_spectrum(residual, lm, start, end)` — maps the
+  coded-window residual spectrum (the `decode_residual_bands` output,
+  length `coded_total_bins(start, end, lm)`) into the full
+  `120 << lm`-bin MDCT spectrum at its absolute band-edge offset
+  `[band_edge(start), band_edge(end))`, leaving the uncoded low bins
+  (below a Hybrid `start`) and the high-frequency gap at zero. This is
+  the §4.3.7 inverse-MDCT input.
+* `LongMdctSynthesis` — streaming long-MDCT synthesis state for a fixed
+  `lm`: `synthesize(residual, start, end)` places the residual spectrum
+  and runs `MdctSynthesis::frame` with the fixed-overlap §4.3.7 window,
+  emitting `mdct_size(lm)` time-domain samples (the §4.3.7.1
+  post-filter's input), with `reset()` for the §4.5.2 decoder reset.
+  This is the residual-spectrum → time-domain PCM counterpart of the
+  `decode_residual_bands` band-loop spine. It handles the non-transient
+  (single long MDCT) case only — the transient short-block reassembly
+  (the per-short-block frequency-vector layout and inter-block
+  overlap-add) is delegated to the reference by §4.3.1 / §4.3.7 and
+  remains a documented docs gap, the same boundary the residual loop
+  keeps for the short-block geometry.
 
 Higher-level entry points (frame decoder, encoder, codec
 registration with the runtime) still return `Error::NotImplemented`.
