@@ -6,6 +6,35 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-331 (2026-06-18) — §4.3.3 combined-candidate quality-column
+  search (`find_combined_alloc`):** `find_static_alloc` searches the
+  1/64-step interpolation grid against the *static-only* window total;
+  this takes the search one step further into the §4.3.3 prose by
+  searching against the **combined** per-band candidate
+  `clamp(static[b] + boost[b] + trim_offset[b], 0, cap[b])` assembled by
+  `combine_band_allocation` — "the entry nearest but not exceeding the
+  available space, subject to the tilt, boosts, [and] band maximums,"
+  before the linear interpolation. The boosts and trim offsets are
+  column-independent and `clamp(static + const, 0, cap)` is
+  non-decreasing in `static` (itself non-decreasing along the grid), so
+  the combined window total stays monotone and the same two-phase
+  bisection `find_static_alloc` uses is valid. The new
+  `CombinedAllocSearch { qlo, frac, alloc }` carries the chosen grid
+  position and the `CombinedAllocation` assembled there;
+  `alloc.total <= budget` holds whenever the budget admits the `(0,0)`
+  cell, otherwise the floor cell is returned (its total is the minimum
+  achievable). Input validation propagates from
+  `combine_band_allocation`. The §2.7 hard-minimum **skip** decision
+  (the `thresh[]` floor + concurrent skip decoding) and the
+  fine-energy/shape split remain deferred to the reference per RFC 6716
+  §4.3.3 / the clean-room narrative §2.7 — the same docs-gap boundary
+  `combine_band_allocation` draws. 6 unit tests: a brute-force
+  agreement sweep across all four frame sizes / mono+stereo / four trim
+  settings / seven budget points, budget-tightness exit, top-column
+  saturation, zero-budget floor, Hybrid window, and the input-validation
+  matrix. Sourced from `docs/audio/opus/rfc6716-opus.txt` §4.3.3 +
+  `docs/audio/celt/spec/celt-coarse-energy-and-allocation.md` §§2.1–2.7.
+
 * **Round-326 (2026-06-17) — §4.3.3 per-band shape-allocation assembly
   at a quality column (`alloc_combine`):** the static-allocation search
   (`find_static_alloc`) returns only a window total, and its

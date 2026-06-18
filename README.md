@@ -542,6 +542,25 @@ Per-band shape-allocation assembly at a quality column (RFC 6716
   decoding that RFC 6716 §4.3.3 and the clean-room narrative §2.7 defer
   to the reference. `compute_thresh`'s `thresh[]` is carried forward
   into that deferred step unchanged.
+* `find_combined_alloc(coding_start, bins_per_band, boost, alloc_trim,
+  channels, stereo, lm, budget_1_8th) -> Option<CombinedAllocSearch>`
+  takes `find_static_alloc` one step further into the §4.3.3 search:
+  where that one finds the highest grid column whose *static-only*
+  window total fits, this searches the grid against the **combined**
+  (cap-clamped, boost- and trim-inclusive) total — "the entry nearest
+  but not exceeding the available space, subject to the tilt, boosts,
+  [and] band maximums," before the linear interpolation. Boosts and
+  trim offsets are column-independent and `clamp(static + const, 0,
+  cap)` is non-decreasing in `static`, so the combined total stays
+  monotone along the grid and the same two-phase bisection
+  `find_static_alloc` uses applies. `CombinedAllocSearch { qlo, frac,
+  alloc }` returns the chosen position and the `CombinedAllocation`
+  assembled there, with `alloc.total <= budget_1_8th` whenever the
+  budget admits the `(0,0)` cell (otherwise it returns that floor cell,
+  whose total is the minimum achievable). Input validation propagates
+  from `combine_band_allocation`. The §2.7 hard-minimum **skip**
+  decision and the fine-energy/shape split remain deferred (same
+  docs-gap boundary).
 
 Pyramid Vector Quantizer (RFC 6716 §4.3.4.2):
 

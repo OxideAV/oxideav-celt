@@ -50,7 +50,7 @@
 
 use crate::band_cap::compute_band_caps;
 use crate::band_minimums::compute_trim_offsets;
-use crate::static_alloc::window_static_alloc_per_band_1_8th;
+use crate::static_alloc::{window_static_alloc_per_band_1_8th, INTERP_STEPS, NUM_Q};
 
 /// The per-band shape-allocation candidate assembled at a quality
 /// column, in 1/8-bit units.
@@ -182,6 +182,184 @@ pub fn combine_band_allocation(
     }
 
     Some(CombinedAllocation { bits, caps, total })
+}
+
+/// The result of the §4.3.3 quality-column search over the *combined*
+/// (cap-clamped) candidate: the chosen grid position plus the
+/// [`CombinedAllocation`] assembled there.
+///
+/// `qlo` / `frac` is the selected grid position on the same 1/64-step
+/// interpolation grid [`crate::static_alloc::find_static_alloc`] uses;
+/// `alloc` is the per-band candidate `combine_band_allocation` produced
+/// at that position. `alloc.total <= budget` is the search's exit
+/// invariant whenever the budget can afford even the `(0, 0)` cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CombinedAllocSearch {
+    /// Lower quality column at the selected grid position
+    /// (`0..=NUM_Q-1`).
+    pub qlo: usize,
+    /// 1/64-step sub-column position between `qlo` and `qlo+1`
+    /// (`0..=INTERP_STEPS`). `INTERP_STEPS == 64` is the canonical
+    /// "exactly on the upper edge" pin.
+    pub frac: u32,
+    /// The combined per-band candidate assembled at `(qlo, frac)`.
+    pub alloc: CombinedAllocation,
+}
+
+/// Search the §4.3.3 1/64-step interpolation grid for the highest
+/// quality column whose **combined** (cap-clamped, boost- and
+/// trim-inclusive) window total does not exceed `budget_1_8th`.
+///
+/// This is [`crate::static_alloc::find_static_alloc`] taken one step
+/// further into the §4.3.3 prose: that search finds the highest column
+/// whose *static-only* window total fits; this one searches the column
+/// grid against the total of the full per-band candidate
+///
+/// ```text
+/// bits[b] = clamp(static[b] + boost[b] + trim_offset[b], 0, cap[b])
+/// ```
+///
+/// i.e. the entry "nearest but not exceeding the available space,
+/// subject to the tilt, boosts, [and] band maximums" before the linear
+/// interpolation — exactly the words RFC 6716 §4.3.3 uses for the
+/// allocation search. The boosts and trim offsets do not depend on the
+/// column, and `clamp(static + const, 0, cap)` is non-decreasing in
+/// `static`, which is itself non-decreasing in `(qlo, frac)`; the
+/// combined window total is therefore monotonically non-decreasing
+/// along the grid, so the same two-phase bisection
+/// [`find_static_alloc`](crate::static_alloc::find_static_alloc) uses is
+/// valid here.
+///
+/// What this does **not** do: the §2.7 hard-minimum **skip** decision
+/// (comparing each band against `thresh[band]`, the concurrent skip
+/// decoding, and the fine-energy/shape split) stays deferred to the
+/// reference per RFC 6716 §4.3.3 / the clean-room narrative §2.7. The
+/// `thresh[]` floor is *not* folded into the search budget here; a
+/// caller that holds it carries it into that deferred bisection.
+///
+/// Inputs mirror [`combine_band_allocation`] (the column `(qlo, frac)`
+/// is replaced by the `budget_1_8th` the search drives toward):
+///
+/// * `coding_start`, `bins_per_band`, `boost`, `alloc_trim`,
+///   `channels`, `stereo`, `lm` — passed unchanged to
+///   `combine_band_allocation` at each probed column.
+/// * `budget_1_8th` — the §4.3.3 remaining budget in 1/8 bits the
+///   combined window total must not exceed.
+///
+/// Returns `None` on the same input-validation paths as
+/// [`combine_band_allocation`] (mismatched `boost` length, bad
+/// `channels` / `lm` / `alloc_trim`, or an overflowing window).
+///
+/// When even the `(qlo = 0, frac = 0)` cell exceeds the budget the
+/// search returns that cell anyway — its combined total is the minimum
+/// achievable, and the §4.3.3 prose notes minimums and boosts dominate
+/// at "very low rates"; the caller falls through to the deferred
+/// minimums/skip stage.
+#[allow(clippy::too_many_arguments)]
+pub fn find_combined_alloc(
+    coding_start: usize,
+    bins_per_band: &[u32],
+    boost: &[i32],
+    alloc_trim: i32,
+    channels: u32,
+    stereo: bool,
+    lm: u32,
+    budget_1_8th: i64,
+) -> Option<CombinedAllocSearch> {
+    // Evaluate the combined candidate at one grid position. `frac ==
+    // INTERP_STEPS` is the canonical upper-column-edge pin: it is the
+    // `(qlo + 1, 0)` cell, evaluated through `combine_band_allocation`
+    // so the cap clamp and boost/trim addition are identical to every
+    // other probe.
+    let probe = |qlo: usize, frac: u32| -> Option<CombinedAllocation> {
+        if frac == INTERP_STEPS {
+            combine_band_allocation(
+                coding_start,
+                bins_per_band,
+                qlo + 1,
+                0,
+                boost,
+                alloc_trim,
+                channels,
+                stereo,
+                lm,
+            )
+        } else {
+            combine_band_allocation(
+                coding_start,
+                bins_per_band,
+                qlo,
+                frac,
+                boost,
+                alloc_trim,
+                channels,
+                stereo,
+                lm,
+            )
+        }
+    };
+
+    // The `(0, 0)` probe pins every input-validation guard and is the
+    // search's lower bound. If it already exceeds the budget we return
+    // it (its total is the floor; see the "very low rates" note above).
+    let zero = probe(0, 0)?;
+    if zero.total > budget_1_8th {
+        return Some(CombinedAllocSearch {
+            qlo: 0,
+            frac: 0,
+            alloc: zero,
+        });
+    }
+
+    // Phase 1: coarse column scan. Largest `qlo` whose integer-column
+    // combined total fits. Round-up midpoint so `hi == lo + 1` makes
+    // progress.
+    let mut lo: usize = 0;
+    let mut hi: usize = NUM_Q - 1;
+    let mut lo_alloc = zero;
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let cand = probe(mid, 0)?;
+        if cand.total <= budget_1_8th {
+            lo = mid;
+            lo_alloc = cand;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let qlo = lo;
+
+    // At the top column there is no upper neighbour to interpolate
+    // toward; the grid degenerates to the integer column.
+    if qlo == NUM_Q - 1 {
+        return Some(CombinedAllocSearch {
+            qlo,
+            frac: 0,
+            alloc: lo_alloc,
+        });
+    }
+
+    // Phase 2: fine fractional scan. Largest `frac ∈ 0..=INTERP_STEPS`
+    // whose interpolated combined total fits.
+    let mut flo: u32 = 0;
+    let mut fhi: u32 = INTERP_STEPS;
+    let mut flo_alloc = lo_alloc;
+    while flo < fhi {
+        let mid = flo + (fhi - flo).div_ceil(2);
+        let cand = probe(qlo, mid)?;
+        if cand.total <= budget_1_8th {
+            flo = mid;
+            flo_alloc = cand;
+        } else {
+            fhi = mid - 1;
+        }
+    }
+
+    Some(CombinedAllocSearch {
+        qlo,
+        frac: flo,
+        alloc: flo_alloc,
+    })
 }
 
 #[cfg(test)]
@@ -368,5 +546,214 @@ mod tests {
         assert!(combine_band_allocation(5, &bins, 4, 0, &boost, 5, 1, false, lm).is_none());
         // qlo out of range
         assert!(combine_band_allocation(0, &bins, 11, 0, &boost, 5, 1, false, lm).is_none());
+    }
+
+    // ----- find_combined_alloc -----
+
+    /// The brute-force reference: the highest grid position whose
+    /// combined total fits, scanning every `(qlo, frac)` cell in
+    /// monotone order. Returns the same `(qlo, frac)` the bisection
+    /// must land on.
+    #[allow(clippy::too_many_arguments)]
+    fn brute_combined(
+        coding_start: usize,
+        bins: &[u32],
+        boost: &[i32],
+        trim: i32,
+        channels: u32,
+        stereo: bool,
+        lm: u32,
+        budget: i64,
+    ) -> (usize, u32, i64) {
+        let mut best = (0usize, 0u32, i64::MIN);
+        // Enumerate columns in ascending grid order: for each qlo,
+        // frac 0..INTERP_STEPS, then the qlo==NUM_Q-1 integer column.
+        for qlo in 0..NUM_Q {
+            let frac_hi = if qlo == NUM_Q - 1 {
+                0
+            } else {
+                INTERP_STEPS - 1
+            };
+            for frac in 0..=frac_hi {
+                let c = combine_band_allocation(
+                    coding_start,
+                    bins,
+                    qlo,
+                    frac,
+                    boost,
+                    trim,
+                    channels,
+                    stereo,
+                    lm,
+                )
+                .unwrap();
+                if c.total <= budget {
+                    best = (qlo, frac, c.total);
+                }
+            }
+            // The fractional upper-edge pin (qlo+1, 0) is the same cell
+            // as the next column's frac==0; it is reached by stepping
+            // qlo, so the per-qlo loop above already covers it.
+        }
+        best
+    }
+
+    /// The bisection agrees with the brute-force scan across a sweep of
+    /// budgets, for mono and stereo, across all four frame sizes.
+    #[test]
+    fn search_matches_brute_force() {
+        for lm in 0u32..=3 {
+            let bins = mono_window(lm as usize);
+            let n = bins.len();
+            for &(channels, stereo) in &[(1u32, false), (2u32, true)] {
+                let mut boost = vec![0i32; n];
+                boost[3] = 24;
+                boost[12] = 8;
+                for trim in [0, 5, 7, 10] {
+                    // The full-grid total bounds the budget sweep.
+                    let top = combine_band_allocation(
+                        0,
+                        &bins,
+                        NUM_Q - 1,
+                        0,
+                        &boost,
+                        trim,
+                        channels,
+                        stereo,
+                        lm,
+                    )
+                    .unwrap()
+                    .total;
+                    for &budget in &[0i64, 1, top / 4, top / 2, top - 1, top, top + 100] {
+                        let got = find_combined_alloc(
+                            0, &bins, &boost, trim, channels, stereo, lm, budget,
+                        )
+                        .unwrap();
+                        let (eqlo, efrac, etotal) =
+                            brute_combined(0, &bins, &boost, trim, channels, stereo, lm, budget);
+                        // When even (0,0) overflows, both the search and
+                        // the brute force "best" sit at (0,0); compare
+                        // position and the assembled total.
+                        assert_eq!(
+                            got.qlo, eqlo,
+                            "lm={lm} ch={channels} trim={trim} b={budget} qlo"
+                        );
+                        assert_eq!(
+                            got.frac, efrac,
+                            "lm={lm} ch={channels} trim={trim} b={budget} frac"
+                        );
+                        // etotal is i64::MIN only if no cell fit (budget
+                        // below (0,0)); then the search returns (0,0).
+                        if etotal != i64::MIN {
+                            assert_eq!(got.alloc.total, etotal, "lm={lm} b={budget} total");
+                        } else {
+                            assert_eq!((got.qlo, got.frac), (0, 0));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The chosen combined total never exceeds the budget when the
+    /// budget can afford the (0,0) cell, and the next grid position up
+    /// would exceed it (the "nearest but not exceeding" exit).
+    #[test]
+    fn search_total_within_budget_and_tight() {
+        let lm = 2u32;
+        let bins = mono_window(lm as usize);
+        let n = bins.len();
+        let boost = vec![0i32; n];
+        let top = combine_band_allocation(0, &bins, NUM_Q - 1, 0, &boost, 5, 1, false, lm)
+            .unwrap()
+            .total;
+        // A mid budget that admits a non-trivial column.
+        let budget = top / 2;
+        let got = find_combined_alloc(0, &bins, &boost, 5, 1, false, lm, budget).unwrap();
+        assert!(got.alloc.total <= budget, "total over budget");
+
+        // Stepping one frac up (or one column if at the top of the
+        // fraction range) must exceed the budget — otherwise the search
+        // stopped early.
+        let next = if got.frac < INTERP_STEPS {
+            combine_band_allocation(0, &bins, got.qlo, got.frac + 1, &boost, 5, 1, false, lm)
+        } else {
+            combine_band_allocation(0, &bins, got.qlo + 1, 0, &boost, 5, 1, false, lm)
+        };
+        if let Some(next) = next {
+            assert!(next.total > budget, "search stopped before the budget edge");
+        }
+    }
+
+    /// A generous budget lands on the top column; the assembled
+    /// candidate equals `combine_band_allocation` at `(NUM_Q-1, 0)`.
+    #[test]
+    fn search_saturates_top_column() {
+        let lm = 1u32;
+        let bins = mono_window(lm as usize);
+        let n = bins.len();
+        let boost = vec![0i32; n];
+        let got = find_combined_alloc(0, &bins, &boost, 5, 1, false, lm, i64::MAX / 2).unwrap();
+        assert_eq!(got.qlo, NUM_Q - 1);
+        assert_eq!(got.frac, 0);
+        let top = combine_band_allocation(0, &bins, NUM_Q - 1, 0, &boost, 5, 1, false, lm).unwrap();
+        assert_eq!(got.alloc, top);
+    }
+
+    /// A zero budget returns the `(0, 0)` cell (the floor); its total is
+    /// the minimum achievable and may exceed the budget.
+    #[test]
+    fn search_zero_budget_returns_floor() {
+        let lm = 0u32;
+        let bins = mono_window(lm as usize);
+        let n = bins.len();
+        let mut boost = vec![0i32; n];
+        // A boost forces a non-zero (0,0) total, so the floor exceeds a
+        // zero budget.
+        boost[4] = 200;
+        let got = find_combined_alloc(0, &bins, &boost, 5, 1, false, lm, 0).unwrap();
+        assert_eq!((got.qlo, got.frac), (0, 0));
+        let floor = combine_band_allocation(0, &bins, 0, 0, &boost, 5, 1, false, lm).unwrap();
+        assert_eq!(got.alloc, floor);
+        assert!(floor.total > 0);
+    }
+
+    /// Hybrid window (coding_start = 17) searches bands 17..=20 only.
+    #[test]
+    fn search_hybrid_window() {
+        let lm = 3u32;
+        let full = mono_window(lm as usize);
+        let bins = full[17..].to_vec();
+        let n = bins.len();
+        assert_eq!(n, 4);
+        let boost = vec![0i32; n];
+        let top = combine_band_allocation(17, &bins, NUM_Q - 1, 0, &boost, 5, 1, false, lm)
+            .unwrap()
+            .total;
+        let got = find_combined_alloc(17, &bins, &boost, 5, 1, false, lm, top / 2).unwrap();
+        assert_eq!(got.alloc.bits.len(), 4);
+        assert!(got.alloc.total <= top / 2);
+        let (eqlo, efrac, _) = brute_combined(17, &bins, &boost, 5, 1, false, lm, top / 2);
+        assert_eq!((got.qlo, got.frac), (eqlo, efrac));
+    }
+
+    /// Input validation propagates from `combine_band_allocation`.
+    #[test]
+    fn search_invalid_inputs_return_none() {
+        let lm = 0u32;
+        let bins = mono_window(lm as usize);
+        let n = bins.len();
+        let boost = vec![0i32; n];
+        // boost length mismatch
+        let short = vec![0i32; n - 1];
+        assert!(find_combined_alloc(0, &bins, &short, 5, 1, false, lm, 1000).is_none());
+        // bad channels
+        assert!(find_combined_alloc(0, &bins, &boost, 5, 0, false, lm, 1000).is_none());
+        // bad lm
+        assert!(find_combined_alloc(0, &bins, &boost, 5, 1, false, 4, 1000).is_none());
+        // bad trim
+        assert!(find_combined_alloc(0, &bins, &boost, 11, 1, false, lm, 1000).is_none());
+        // overflowing window
+        assert!(find_combined_alloc(5, &bins, &boost, 5, 1, false, lm, 1000).is_none());
     }
 }

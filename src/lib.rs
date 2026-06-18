@@ -230,7 +230,9 @@ pub mod spread_rotation;
 pub mod static_alloc;
 pub mod tf_change;
 
-pub use alloc_combine::{combine_band_allocation, CombinedAllocation};
+pub use alloc_combine::{
+    combine_band_allocation, find_combined_alloc, CombinedAllocSearch, CombinedAllocation,
+};
 pub use allocation_budget::{
     compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
 };
