@@ -323,7 +323,9 @@ pub use fine_energy::{
 };
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
-pub use frame_synthesis::{decode_celt_frame, CeltDecodeState, DecodedFrame};
+pub use frame_synthesis::{
+    decode_celt_frame, CeltDecodeState, DecodedFrame, PostFilterParams, StereoCeltDecodeState,
+};
 pub use hadamard::{
     apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
     HADAMARD_LEVEL_SCALE,
@@ -360,7 +362,10 @@ pub use static_alloc::{
     band_static_alloc_1_8th, find_static_alloc, interp_alloc_1_32nd, window_static_alloc_1_8th,
     window_static_alloc_per_band_1_8th, StaticAllocSearch, INTERP_STEPS, NUM_Q, STATIC_ALLOC,
 };
-pub use synthesis::{mdct_size, place_residual_spectrum, LongMdctSynthesis, CELT_OVERLAP};
+pub use synthesis::{
+    mdct_size, place_residual_spectrum, LongMdctSynthesis, StereoChannel, StereoLongMdctSynthesis,
+    CELT_OVERLAP,
+};
 pub use tf_change::{
     decode_tf_changes, decode_tf_parameters, decode_tf_select, tf_adjustment, tf_select_matters,
     TfParameters, LM_VALUES, TABLE_60_NON_TRANSIENT_SEL0, TABLE_61_NON_TRANSIENT_SEL1,

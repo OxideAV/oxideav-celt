@@ -6,6 +6,37 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-344 (2026-06-20) — stereo long-MDCT synthesis spine
+  (`StereoLongMdctSynthesis` in `synthesis`):** the two-channel
+  counterpart of `LongMdctSynthesis` — two independent per-channel
+  inverse-MDCT + weighted-overlap-add spines, each carrying its own
+  §4.3.7 overlap tail. `synthesize(left_residual, right_residual, start,
+  end)` places both channels' denormalized spectra into the full
+  `120 << lm`-bin MDCT spectrum, transforms each, and interleaves the
+  time-domain outputs into one L/R/L/R buffer of `2 * mdct_size(lm)`
+  samples; both overlap tails advance atomically (a residual-length
+  mismatch on either channel rejects the frame without advancing either
+  tail), `reset()` zeroes both, and `StereoChannel { Left, Right }` names
+  the interleave slots. The §4.3.6 denormalization and §4.3.7 inverse
+  MDCT are per-channel and fully specified; only the §4.3.4.4 `itheta`
+  mid/side coupling that produces the two channel spectra from the
+  bitstream is the documented docs gap, so the spine takes the two
+  channel spectra as input (the same boundary the mono spine draws).
+
+* **Round-344 (2026-06-20) — stereo synthesis driver
+  (`StereoCeltDecodeState` + `synthesize_stereo_frame` in
+  `frame_synthesis`):** the streaming two-channel synthesis state running
+  the full §4.3.6 → §4.3.7 chain per channel — denormalized spectra →
+  per-channel inverse MDCT + WOLA (`StereoLongMdctSynthesis`) → §4.3.7.1
+  post-filter (per-channel history) → §4.3.7.2 de-emphasis (per-channel
+  filter memory) → interleaved L/R/L/R PCM. `PostFilterParams { period,
+  gain, tapset }` carries the §4.3.7.1 parameters applied per channel
+  (`None` = post-filter off). `reset()` zeroes every per-channel
+  inter-frame memory (§4.5.2). This covers everything from the
+  denormalized per-channel spectra onward — the part §4.3.6–§4.3.7 fully
+  specify per channel — drawing the input boundary at the §4.3.4.4
+  `itheta` coupling / §2.7 reallocation docs gap.
+
 * **Round-341 (2026-06-19) — end-to-end frame decode → PCM orchestrator
   (`frame_synthesis` module):** `decode_celt_frame(state, frame_bytes,
   start, end, fine_bits, band_k)` chains the whole documented CELT

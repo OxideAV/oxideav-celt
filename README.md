@@ -900,6 +900,21 @@ Long-MDCT synthesis spine (RFC 6716 §4.3.6 → §4.3.7):
   overlap-add) is delegated to the reference by §4.3.1 / §4.3.7 and
   remains a documented docs gap, the same boundary the residual loop
   keeps for the short-block geometry.
+* `StereoLongMdctSynthesis` — the two-channel counterpart: two
+  independent per-channel `LongMdctSynthesis` spines, each with its own
+  §4.3.7 overlap tail (there is no cross-channel state in the synthesis
+  stage). `synthesize(left_residual, right_residual, start, end)` places
+  both channels' denormalized spectra, runs the per-channel inverse MDCT
+  + weighted overlap-add, and interleaves the time-domain outputs into a
+  single L/R/L/R buffer of `2 * mdct_size(lm)` samples; both overlap
+  tails advance atomically (a length mismatch on either channel rejects
+  the frame without advancing either tail), with `reset()` zeroing both.
+  `StereoChannel { Left, Right }` names the two interleave slots
+  (`offset()` = 0/1). The §4.3.6 denormalization and §4.3.7 inverse MDCT
+  are per-channel and fully specified; only the §4.3.4.4 `itheta` mid/
+  side band coupling that produces the two channel spectra from the
+  bitstream is the documented docs gap, so this spine takes the two
+  channel spectra as input (the same boundary the mono spine draws).
 
 End-to-end frame decode → PCM (RFC 6716 §4.3, Table 56 → §4.3.7):
 

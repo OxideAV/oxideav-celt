@@ -210,6 +210,145 @@ impl LongMdctSynthesis {
     }
 }
 
+/// Channel layout of an interleaved stereo PCM buffer.
+///
+/// The §4.3.7 inverse MDCT runs independently per channel; the time-domain
+/// outputs are interleaved L/R/L/R for the downstream consumer. This enum
+/// just names the two slots so callers reading [`StereoLongMdctSynthesis`]
+/// output do not hard-code `0`/`1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StereoChannel {
+    /// The left (first) channel — even interleave positions.
+    Left,
+    /// The right (second) channel — odd interleave positions.
+    Right,
+}
+
+impl StereoChannel {
+    /// The interleave offset for this channel (`0` left, `1` right).
+    #[inline]
+    pub fn offset(self) -> usize {
+        match self {
+            StereoChannel::Left => 0,
+            StereoChannel::Right => 1,
+        }
+    }
+}
+
+/// Streaming **stereo** long-MDCT synthesis state (RFC 6716 §4.3.6 →
+/// §4.3.7), two independent per-channel [`LongMdctSynthesis`] spines.
+///
+/// The §4.3.7 inverse MDCT and the §4.3.6 denormalization operate on a
+/// **single channel's** spectrum; a stereo frame carries one such
+/// spectrum per channel (left, right). This wrapper runs both per-channel
+/// IMDCT + weighted-overlap-add spines and interleaves their time-domain
+/// outputs into a single L/R/L/R PCM buffer of `2 * mdct_size(lm)`
+/// samples.
+///
+/// Each channel keeps its **own** overlap tail, so the cross-frame
+/// weighted overlap-add (§4.3.7) stays per-channel exactly as it does in
+/// the mono spine — there is no cross-channel state in the synthesis
+/// stage. The only stereo-specific work here is the de-interleave of the
+/// per-channel residual spectra on input and the interleave of the
+/// per-channel PCM on output; the transform itself is identical to
+/// [`LongMdctSynthesis`].
+///
+/// ## Scope
+///
+/// This is the per-channel-spectrum → interleaved-PCM spine. It takes the
+/// two channels' **already-decoded** residual spectra as input, the same
+/// boundary [`LongMdctSynthesis`] draws for the mono case. The stereo
+/// joint band coupling that produces those two spectra from the
+/// bitstream — the §4.3.4.4 `itheta` mid/side angle quantisation — is
+/// deferred to the reference implementation by RFC 6716 §4.3.4 (the
+/// narrative does not pin the angle PDF) and remains a documented docs
+/// gap. The *dual-stereo* mode (each channel coded fully independently)
+/// and the per-channel energy / denormalization / synthesis are fully
+/// specified, and that is exactly what this spine covers: given the two
+/// channel spectra, it produces correct interleaved stereo PCM.
+#[derive(Debug, Clone)]
+pub struct StereoLongMdctSynthesis {
+    left: LongMdctSynthesis,
+    right: LongMdctSynthesis,
+}
+
+impl StereoLongMdctSynthesis {
+    /// Create a stereo long-MDCT synthesis state for frame-size shift
+    /// `lm` (`0..=3`), with both channels' overlap tails zeroed.
+    ///
+    /// Returns `None` if `lm > 3`.
+    pub fn new(lm: u32) -> Option<Self> {
+        Some(Self {
+            left: LongMdctSynthesis::new(lm)?,
+            right: LongMdctSynthesis::new(lm)?,
+        })
+    }
+
+    /// The frame-size shift this state was created for.
+    #[inline]
+    pub fn lm(&self) -> u32 {
+        self.left.lm()
+    }
+
+    /// The per-channel MDCT size (`120 << lm`). The interleaved stereo
+    /// output is twice this length.
+    #[inline]
+    pub fn frame_size(&self) -> usize {
+        self.left.frame_size()
+    }
+
+    /// Zero both channels' overlap tails (decoder reset per §4.5.2).
+    pub fn reset(&mut self) {
+        self.left.reset();
+        self.right.reset();
+    }
+
+    /// Synthesize one stereo long-MDCT frame from the two channels'
+    /// denormalized residual spectra, returning interleaved L/R/L/R PCM.
+    ///
+    /// * `left_residual` / `right_residual` — each channel's denormalized
+    ///   spectrum for the coded-band window `[start, end)`, length
+    ///   [`coded_total_bins(start, end, lm)`](crate::band_layout::coded_total_bins).
+    /// * `start` / `end` — the coded-band window, `start <= end <= 21`.
+    ///
+    /// Both channels are placed into the full `120 << lm`-bin MDCT
+    /// spectrum, transformed (§4.3.7 inverse MDCT + WOLA) against their
+    /// own overlap tails, and interleaved: output index `2*i` is the left
+    /// channel's sample `i`, `2*i + 1` the right's. The returned buffer
+    /// is `2 * mdct_size(lm)` samples.
+    ///
+    /// Returns [`Error::InvalidParameter`] when either residual length or
+    /// the window is inconsistent (via [`place_residual_spectrum`]).
+    /// Neither channel's overlap tail is advanced unless **both** channels
+    /// synthesize successfully, so a rejected frame leaves the state
+    /// unchanged and re-runnable.
+    pub fn synthesize(
+        &mut self,
+        left_residual: &[f32],
+        right_residual: &[f32],
+        start: usize,
+        end: usize,
+    ) -> Result<Vec<f32>, Error> {
+        // Validate both channels' placements BEFORE mutating either
+        // overlap tail, so a length mismatch on the second channel does
+        // not leave the first channel's state advanced.
+        let lm = self.left.lm();
+        let _ = place_residual_spectrum(left_residual, lm, start, end)?;
+        let _ = place_residual_spectrum(right_residual, lm, start, end)?;
+
+        let l = self.left.synthesize(left_residual, start, end)?;
+        let r = self.right.synthesize(right_residual, start, end)?;
+
+        let n = l.len();
+        let mut out = vec![0.0f32; 2 * n];
+        for i in 0..n {
+            out[2 * i] = l[i];
+            out[2 * i + 1] = r[i];
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +555,129 @@ mod tests {
         let mut synth = LongMdctSynthesis::new(0).unwrap();
         let r = synth.synthesize(&[1.0, 2.0, 3.0], 0, 21);
         assert!(matches!(r, Err(Error::InvalidParameter)));
+    }
+
+    #[test]
+    fn stereo_channel_offsets() {
+        assert_eq!(StereoChannel::Left.offset(), 0);
+        assert_eq!(StereoChannel::Right.offset(), 1);
+    }
+
+    #[test]
+    fn stereo_new_rejects_out_of_range_lm() {
+        assert!(StereoLongMdctSynthesis::new(4).is_none());
+        for lm in 0..=3u32 {
+            let s = StereoLongMdctSynthesis::new(lm).unwrap();
+            assert_eq!(s.lm(), lm);
+            assert_eq!(s.frame_size(), 120 << lm);
+        }
+    }
+
+    /// A stereo frame interleaves two independent per-channel mono spines:
+    /// the even/odd de-interleave of the output equals each channel's own
+    /// `LongMdctSynthesis` output.
+    #[test]
+    fn stereo_interleaves_independent_channels() {
+        let lm = 1;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut stereo = StereoLongMdctSynthesis::new(lm).unwrap();
+        let out = stereo.synthesize(&rl, &rr, 0, 21).unwrap();
+        let n = mdct_size(lm).unwrap();
+        assert_eq!(out.len(), 2 * n);
+
+        // Reference: two independent mono spines.
+        let mut ml = LongMdctSynthesis::new(lm).unwrap();
+        let mut mr = LongMdctSynthesis::new(lm).unwrap();
+        let l = ml.synthesize(&rl, 0, 21).unwrap();
+        let r = mr.synthesize(&rr, 0, 21).unwrap();
+        for i in 0..n {
+            assert!((out[2 * i] - l[i]).abs() <= 1e-7, "left[{i}]");
+            assert!((out[2 * i + 1] - r[i]).abs() <= 1e-7, "right[{i}]");
+        }
+    }
+
+    /// Each stereo channel keeps its own overlap tail across frames: the
+    /// second frame's de-interleaved channels match two independent mono
+    /// spines run for two frames.
+    #[test]
+    fn stereo_per_channel_overlap_tail() {
+        let lm = 0;
+        let n = mdct_size(lm).unwrap();
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl1: Vec<f32> = (0..coded).map(|i| ((i % 3) as f32) - 1.0).collect();
+        let rr1: Vec<f32> = (0..coded).map(|i| ((i % 4) as f32) - 1.5).collect();
+        let rl2: Vec<f32> = (0..coded).map(|i| ((i % 5) as f32) - 2.0).collect();
+        let rr2: Vec<f32> = (0..coded).map(|i| ((i % 6) as f32) - 2.5).collect();
+
+        let mut stereo = StereoLongMdctSynthesis::new(lm).unwrap();
+        let _ = stereo.synthesize(&rl1, &rr1, 0, 21).unwrap();
+        let f2 = stereo.synthesize(&rl2, &rr2, 0, 21).unwrap();
+
+        let mut ml = LongMdctSynthesis::new(lm).unwrap();
+        let mut mr = LongMdctSynthesis::new(lm).unwrap();
+        let _ = ml.synthesize(&rl1, 0, 21).unwrap();
+        let _ = mr.synthesize(&rr1, 0, 21).unwrap();
+        let l2 = ml.synthesize(&rl2, 0, 21).unwrap();
+        let r2 = mr.synthesize(&rr2, 0, 21).unwrap();
+        for i in 0..n {
+            assert!((f2[2 * i] - l2[i]).abs() <= 1e-7, "left tail[{i}]");
+            assert!((f2[2 * i + 1] - r2[i]).abs() <= 1e-7, "right tail[{i}]");
+        }
+    }
+
+    /// `reset()` zeroes both channels' overlap tails.
+    #[test]
+    fn stereo_reset_clears_both_tails() {
+        let lm = 1;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 9) as f32) - 4.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 11) as f32) - 5.0).collect();
+
+        let mut stereo = StereoLongMdctSynthesis::new(lm).unwrap();
+        let fresh = stereo.synthesize(&rl, &rr, 0, 21).unwrap();
+        let _ = stereo.synthesize(&rl, &rr, 0, 21).unwrap();
+        stereo.reset();
+        let after = stereo.synthesize(&rl, &rr, 0, 21).unwrap();
+        for (a, b) in fresh.iter().zip(&after) {
+            assert!((a - b).abs() <= 1e-7);
+        }
+    }
+
+    /// A bad residual length on either channel is rejected and leaves the
+    /// state unchanged (re-running with valid input matches a fresh state).
+    #[test]
+    fn stereo_rejects_bad_length_without_advancing_state() {
+        let lm = 0;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = vec![0.5f32; coded];
+        let rr: Vec<f32> = vec![-0.5f32; coded];
+
+        let mut dirty = StereoLongMdctSynthesis::new(lm).unwrap();
+        // Right channel wrong length: rejected, neither tail advanced.
+        let bad = dirty.synthesize(&rl, &rr[..coded - 1], 0, 21);
+        assert!(matches!(bad, Err(Error::InvalidParameter)));
+        let after_bad = dirty.synthesize(&rl, &rr, 0, 21).unwrap();
+
+        // A fresh state's first frame must match (the rejected call left
+        // the overlap tails at zero).
+        let mut fresh = StereoLongMdctSynthesis::new(lm).unwrap();
+        let fresh_first = fresh.synthesize(&rl, &rr, 0, 21).unwrap();
+        for (a, b) in after_bad.iter().zip(&fresh_first) {
+            assert!((a - b).abs() <= 1e-7);
+        }
+    }
+
+    /// Zero residual on both channels synthesizes to interleaved silence.
+    #[test]
+    fn stereo_zero_residual_is_silence() {
+        let lm = 2;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let z = vec![0.0f32; coded];
+        let mut stereo = StereoLongMdctSynthesis::new(lm).unwrap();
+        let out = stereo.synthesize(&z, &z, 0, 21).unwrap();
+        assert!(out.iter().all(|&x| x == 0.0));
     }
 }

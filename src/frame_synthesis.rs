@@ -107,7 +107,7 @@ use crate::frame_decode::{decode_frame_prefix, FramePrefix};
 use crate::post_filter::apply_post_filter_f32;
 use crate::range_decoder::RangeDecoder;
 use crate::residual::decode_residual_bands;
-use crate::synthesis::LongMdctSynthesis;
+use crate::synthesis::{LongMdctSynthesis, StereoLongMdctSynthesis};
 use crate::Error;
 
 /// Streaming CELT decoder state carried across frames (RFC 6716 §4.5.2).
@@ -332,6 +332,165 @@ pub fn decode_celt_frame(
     Ok(DecodedFrame { pcm, prefix })
 }
 
+/// Streaming **stereo** CELT synthesis state carried across frames
+/// (RFC 6716 §4.5.2), two independent per-channel synthesis chains.
+///
+/// The §4.3.6 denormalization, §4.3.7 inverse MDCT + weighted
+/// overlap-add, §4.3.7.1 post-filter, and §4.3.7.2 de-emphasis all run
+/// **per channel** — there is no cross-channel state in the synthesis
+/// stage (the stereo joint coding is entirely upstream, in the §4.3.4
+/// band decode). This state therefore holds two independent copies of
+/// the cross-frame memory the mono [`CeltDecodeState`] keeps:
+///
+/// * the §4.3.7 long-MDCT overlap tail for each channel
+///   (one [`StereoLongMdctSynthesis`] wrapping two spines),
+/// * the §4.3.7.1 post-filter history for each channel,
+/// * the §4.3.7.2 de-emphasis memory for each channel.
+///
+/// [`Self::synthesize_stereo_frame`] takes the two channels' **already
+/// denormalized** residual spectra and runs that per-channel chain,
+/// producing interleaved L/R/L/R PCM. The §4.3.4.4 `itheta` mid/side
+/// band coupling (and the §2.7 reallocation) that produces those two
+/// spectra from the bitstream is the documented docs gap; this spine
+/// covers everything from the denormalized spectra onward, which RFC 6716
+/// §4.3.6–§4.3.7 fully specify per channel.
+#[derive(Debug, Clone)]
+pub struct StereoCeltDecodeState {
+    lm: u32,
+    synth: StereoLongMdctSynthesis,
+    deemph: [Deemphasis; 2],
+    /// Per-channel previous-frame post-filtered (pre-de-emphasis) output.
+    post_filter_history: [Vec<f32>; 2],
+}
+
+/// Per-channel §4.3.7.1 post-filter parameters for a stereo synthesis
+/// frame.
+///
+/// CELT codes a single post-filter in the frame prefix (Table 56), so in
+/// practice both channels share the same parameters; this struct lets a
+/// caller pass them explicitly per channel for generality (and for the
+/// `None` = post-filter-off case).
+#[derive(Debug, Clone, Copy)]
+pub struct PostFilterParams {
+    /// The §4.3.7.1 pitch period (bounded 15..=1022).
+    pub period: u16,
+    /// The 3-bit raw gain index (`G = 3*(gain+1)/32`).
+    pub gain: u8,
+    /// The tapset selector (0..=2).
+    pub tapset: u8,
+}
+
+impl StereoCeltDecodeState {
+    /// Create a fresh stereo synthesis state for frame-size shift `lm`
+    /// (`0..=3`), with all per-channel inter-frame memory zeroed.
+    ///
+    /// Returns `None` if `lm > 3`.
+    pub fn new(lm: u32) -> Option<Self> {
+        let synth = StereoLongMdctSynthesis::new(lm)?;
+        let frame_size = synth.frame_size();
+        Some(Self {
+            lm,
+            synth,
+            deemph: [Deemphasis::new(), Deemphasis::new()],
+            post_filter_history: [vec![0.0; frame_size], vec![0.0; frame_size]],
+        })
+    }
+
+    /// The frame-size shift this state decodes.
+    #[inline]
+    pub fn lm(&self) -> u32 {
+        self.lm
+    }
+
+    /// The per-channel output sample count per frame (`120 << lm`); the
+    /// interleaved stereo output is twice this.
+    #[inline]
+    pub fn frame_size(&self) -> usize {
+        self.synth.frame_size()
+    }
+
+    /// Zero every carried per-channel inter-frame memory (§4.5.2 reset).
+    pub fn reset(&mut self) {
+        self.synth.reset();
+        self.deemph[0].reset();
+        self.deemph[1].reset();
+        for h in &mut self.post_filter_history {
+            h.iter_mut().for_each(|s| *s = 0.0);
+        }
+    }
+
+    /// Synthesize one stereo frame from the two channels' **denormalized**
+    /// residual spectra, running the full §4.3.6 → §4.3.7 chain per
+    /// channel and returning interleaved L/R/L/R PCM.
+    ///
+    /// * `left_residual` / `right_residual` — each channel's denormalized
+    ///   spectrum for the coded-band window `[start, end)`, length
+    ///   [`coded_total_bins(start, end, lm)`](crate::band_layout::coded_total_bins).
+    /// * `start` / `end` — the coded-band window, `start <= end <= 21`.
+    /// * `post_filter` — the §4.3.7.1 parameters to apply per channel
+    ///   (`None` leaves the channel un-post-filtered). Both channels share
+    ///   the same `Option` because CELT codes a single post-filter.
+    ///
+    /// Each channel is placed, transformed (§4.3.7 IMDCT + WOLA against
+    /// its own overlap tail), post-filtered against its own cross-frame
+    /// history, and de-emphasized with its own filter memory, then the two
+    /// channels are interleaved.
+    ///
+    /// Returns [`Error::InvalidParameter`] when either residual length or
+    /// the window is inconsistent. The carried state is advanced only on
+    /// success (the synthesis spine validates both channels before
+    /// mutating either overlap tail).
+    pub fn synthesize_stereo_frame(
+        &mut self,
+        left_residual: &[f32],
+        right_residual: &[f32],
+        start: usize,
+        end: usize,
+        post_filter: Option<PostFilterParams>,
+    ) -> Result<Vec<f32>, Error> {
+        // §4.3.7 per-channel IMDCT + WOLA → interleaved L/R/L/R. The
+        // synthesis spine advances both overlap tails atomically (it
+        // validates both channels' placement before transforming either).
+        let interleaved = self
+            .synth
+            .synthesize(left_residual, right_residual, start, end)?;
+
+        let n = self.synth.frame_size();
+        // De-interleave to per-channel buffers for the per-channel
+        // post-filter + de-emphasis (each filter is a running IIR that
+        // needs contiguous channel samples).
+        let mut chans: [Vec<f32>; 2] = [vec![0.0f32; n], vec![0.0f32; n]];
+        for i in 0..n {
+            chans[0][i] = interleaved[2 * i];
+            chans[1][i] = interleaved[2 * i + 1];
+        }
+
+        for ((chan, history), deemph) in chans
+            .iter_mut()
+            .zip(self.post_filter_history.iter_mut())
+            .zip(self.deemph.iter_mut())
+        {
+            // §4.3.7.1 post-filter against this channel's history.
+            if let Some(pf) = post_filter {
+                apply_post_filter_f32(chan, history, pf.period, pf.gain, pf.tapset);
+            }
+            // Save this frame's post-filtered (pre-de-emphasis) output as
+            // the next frame's post-filter history.
+            history.copy_from_slice(chan);
+            // §4.3.7.2 de-emphasis, carrying this channel's filter memory.
+            deemph.apply_in_place(chan);
+        }
+
+        // Re-interleave the finished per-channel PCM.
+        let mut out = vec![0.0f32; 2 * n];
+        for i in 0..n {
+            out[2 * i] = chans[0][i];
+            out[2 * i + 1] = chans[1][i];
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +644,159 @@ mod tests {
         let out =
             decode_celt_frame(&mut state, &buf, 0, 21, &zero_fine(), &band_k).expect("decode");
         assert!(out.pcm.iter().all(|x| x.is_finite()));
+    }
+
+    // --- Stereo synthesis (per-channel-spectrum → interleaved PCM) ---
+
+    use crate::band_layout::coded_total_bins;
+
+    #[test]
+    fn stereo_state_rejects_bad_lm() {
+        assert!(StereoCeltDecodeState::new(4).is_none());
+        for lm in 0..=3u32 {
+            let s = StereoCeltDecodeState::new(lm).unwrap();
+            assert_eq!(s.lm(), lm);
+            assert_eq!(s.frame_size(), 120 << lm);
+        }
+    }
+
+    /// A stereo synthesis frame produces `2 * frame_size` interleaved
+    /// samples and the de-interleaved channels match a per-channel mono
+    /// synthesis + de-emphasis (no post-filter).
+    #[test]
+    fn stereo_frame_matches_per_channel_chain() {
+        let lm = 1;
+        let n = 120usize << lm;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+        let out = st.synthesize_stereo_frame(&rl, &rr, 0, 21, None).unwrap();
+        assert_eq!(out.len(), 2 * n);
+
+        // Reference: two independent mono synthesis + de-emphasis chains.
+        let mut sl = LongMdctSynthesis::new(lm).unwrap();
+        let mut sr = LongMdctSynthesis::new(lm).unwrap();
+        let mut dl = Deemphasis::new();
+        let mut dr = Deemphasis::new();
+        let mut l = sl.synthesize(&rl, 0, 21).unwrap();
+        let mut r = sr.synthesize(&rr, 0, 21).unwrap();
+        dl.apply_in_place(&mut l);
+        dr.apply_in_place(&mut r);
+        for i in 0..n {
+            assert!((out[2 * i] - l[i]).abs() <= 1e-6, "left[{i}]");
+            assert!((out[2 * i + 1] - r[i]).abs() <= 1e-6, "right[{i}]");
+        }
+    }
+
+    /// Each channel's de-emphasis + overlap memory carries across frames
+    /// (the second frame differs from a fresh first frame of the same
+    /// spectra).
+    #[test]
+    fn stereo_frame_carries_per_channel_memory() {
+        let lm = 0;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 3) as f32) - 1.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 4) as f32) - 1.5).collect();
+
+        let mut shared = StereoCeltDecodeState::new(lm).unwrap();
+        let _f1 = shared
+            .synthesize_stereo_frame(&rl, &rr, 0, 21, None)
+            .unwrap();
+        let f2 = shared
+            .synthesize_stereo_frame(&rl, &rr, 0, 21, None)
+            .unwrap();
+
+        let mut fresh = StereoCeltDecodeState::new(lm).unwrap();
+        let ff = fresh
+            .synthesize_stereo_frame(&rl, &rr, 0, 21, None)
+            .unwrap();
+
+        let any_diff = f2.iter().zip(&ff).any(|(a, b)| (a - b).abs() > 1e-9);
+        assert!(any_diff, "carried per-channel state did not affect frame 2");
+    }
+
+    /// `reset()` restores a fresh-state decode.
+    #[test]
+    fn stereo_reset_restores_fresh() {
+        let lm = 1;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 9) as f32) - 4.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 11) as f32) - 5.0).collect();
+
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+        let fresh = st.synthesize_stereo_frame(&rl, &rr, 0, 21, None).unwrap();
+        let _ = st.synthesize_stereo_frame(&rl, &rr, 0, 21, None).unwrap();
+        st.reset();
+        let after = st.synthesize_stereo_frame(&rl, &rr, 0, 21, None).unwrap();
+        for (a, b) in fresh.iter().zip(&after) {
+            assert!((a - b).abs() <= 1e-6);
+        }
+    }
+
+    /// The post-filter is applied per channel against per-channel history;
+    /// with a non-trivial gain the post-filtered output differs from the
+    /// no-post-filter output.
+    #[test]
+    fn stereo_post_filter_applies_per_channel() {
+        let lm = 1;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 5) as f32) - 2.0).collect();
+        let pf = PostFilterParams {
+            period: 64,
+            gain: 7,
+            tapset: 0,
+        };
+
+        let mut with = StereoCeltDecodeState::new(lm).unwrap();
+        // Prime a non-zero post-filter history with one frame, then a
+        // second frame where the post-filter sees that history.
+        let _ = with
+            .synthesize_stereo_frame(&rl, &rr, 0, 21, Some(pf))
+            .unwrap();
+        let a = with
+            .synthesize_stereo_frame(&rl, &rr, 0, 21, Some(pf))
+            .unwrap();
+
+        let mut without = StereoCeltDecodeState::new(lm).unwrap();
+        let _ = without
+            .synthesize_stereo_frame(&rl, &rr, 0, 21, None)
+            .unwrap();
+        let b = without
+            .synthesize_stereo_frame(&rl, &rr, 0, 21, None)
+            .unwrap();
+
+        let any_diff = a.iter().zip(&b).any(|(x, y)| (x - y).abs() > 1e-6);
+        assert!(any_diff, "post-filter had no effect");
+        assert!(a.iter().all(|x| x.is_finite()));
+    }
+
+    /// Inconsistent residual length is rejected.
+    #[test]
+    fn stereo_frame_rejects_bad_length() {
+        let lm = 0;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl = vec![0.5f32; coded];
+        let rr = vec![-0.5f32; coded - 1];
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+        assert!(matches!(
+            st.synthesize_stereo_frame(&rl, &rr, 0, 21, None),
+            Err(Error::InvalidParameter)
+        ));
+    }
+
+    /// Zero spectra on both channels synthesize to interleaved silence
+    /// (with no post-filter / fresh de-emphasis the WOLA of silence is
+    /// silence).
+    #[test]
+    fn stereo_zero_spectra_is_silence() {
+        let lm = 2;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let z = vec![0.0f32; coded];
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+        let out = st.synthesize_stereo_frame(&z, &z, 0, 21, None).unwrap();
+        assert!(out.iter().all(|&x| x == 0.0));
     }
 }
