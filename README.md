@@ -29,15 +29,33 @@ playback. The per-band pulse counts (`band_k`) and fine-bit counts
 loop already draws — so the driver stays inside fully-specified §4.3
 territory.
 
+**Stereo synthesis (per-channel spectra → interleaved PCM).** The
+§4.3.6 denormalization and the §4.3.7 inverse MDCT + weighted
+overlap-add are per-channel and fully specified by RFC 6716, as is the
+§4.3.2 per-channel energy envelope (`assemble_band_log_energy_q8`
+already accepts channel `0`/`1`). `StereoLongMdctSynthesis` and the
+streaming `StereoCeltDecodeState` / `synthesize_stereo_frame` run that
+per-channel chain for two channels — two independent IMDCT + WOLA spines
+with their own overlap tails, per-channel §4.3.7.1 post-filter history,
+and per-channel §4.3.7.2 de-emphasis memory — and interleave the result
+into one L/R/L/R PCM buffer. They take the two channels' decoded
+denormalized spectra as input, drawing the boundary at the §4.3.4.4
+`itheta` mid/side coupling docs gap (the same input-boundary the mono
+spine draws for `band_k`). `tests/stereo_synthesis.rs` drives the whole
+documented per-channel stereo chain (energy → denormalize → synthesize)
+end-to-end.
+
 Not yet implemented: the §4.3.3 reallocation loop that produces
 `band_k` / `fine_bits` (concurrent skip decoding + fine/shape split),
-the §4.3.4.4 split-gain band-split path, the stereo joint-coding path,
-and the §4.3.5 anti-collapse injection — each blocked on detail that
-RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.5 and the clean-room narrative §2.7
-defer to the reference implementation. `decode_celt_frame` rejects a
-transient or stereo frame with `Error::NotImplemented` rather than
-mis-decode it. The encoder and codec-registration entry points still
-return `Error::NotImplemented`.
+the §4.3.4.4 split-gain band-split path, the §4.3.4.4 stereo `itheta`
+mid/side bitstream coupling, the transient short-block time-domain
+reassembly (§4.3.1 / §4.3.7), and the §4.3.5 anti-collapse injection —
+each blocked on detail that RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.1 /
+§4.3.7 / §4.3.5 and the clean-room narrative §2.7 defer to the
+reference implementation. `decode_celt_frame` rejects a transient or
+stereo frame with `Error::NotImplemented` rather than mis-decode it.
+The encoder and codec-registration entry points still return
+`Error::NotImplemented`.
 
 The module-by-module API surface is documented below.
 
