@@ -44,14 +44,12 @@
 //!
 //! ## Clean-room provenance
 //!
-//! The 336 numeric values transcribed below are taken directly from
-//! `docs/audio/celt/tables/e_prob_model.csv`. The CSV's provenance
-//! (extractor + source SHA-256 + upstream commit id) is recorded in
-//! `docs/audio/celt/tables/e_prob_model.meta`. The extraction is a
-//! Feist-style numeric-facts extraction; no code from the upstream
-//! source was consulted by this crate, and the RFC's narrative shape
-//! (the Laplace model's `{prob, decay}` per-band parameterisation)
-//! is the structural backbone.
+//! The 336 numeric values transcribed below come from the staged
+//! clean-room corpus at `docs/audio/celt/tables/e_prob_model.csv`;
+//! the CSV's provenance metadata is recorded alongside it in
+//! `docs/audio/celt/tables/e_prob_model.meta`. The RFC's narrative
+//! shape (the Laplace model's `{prob, decay}` per-band
+//! parameterisation) is the structural backbone.
 
 use crate::coarse_energy::NUM_BANDS;
 
