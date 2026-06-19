@@ -12,18 +12,32 @@ decoder, spreading rotation, Hadamard TF transforms, band
 denormalization, post-filter, de-emphasis, and the inverse MDCT /
 overlap-add synthesis. The `decode_frame_prefix` driver chains every
 control symbol in RFC 6716 Table 56 order up to the `fine energy`
-symbol, where the reallocation pass begins. On the synthesis side, the
-`LongMdctSynthesis` spine places a decoded residual spectrum into the
-full `120 << lm`-bin MDCT spectrum and runs the §4.3.7 inverse MDCT +
-weighted overlap-add to emit time-domain PCM for the non-transient
-(single long MDCT) case.
+symbol; the `LongMdctSynthesis` spine places a decoded residual
+spectrum into the full `120 << lm`-bin MDCT spectrum and runs the
+§4.3.7 inverse MDCT + weighted overlap-add.
 
-Not yet implemented: the reallocation loop (concurrent skip decoding),
-the §4.3.4.4 split-gain band-split path, and the stereo joint-coding
-path — each blocked on detail that RFC 6716 §4.3.3 / §4.3.4.4 and the
-clean-room narrative §2.7 defer to the reference implementation. The
-higher-level frame decoder, encoder, and codec-registration entry
-points still return `Error::NotImplemented`.
+**End-to-end PCM (mono, long MDCT).** `decode_celt_frame` now chains
+the whole documented decode pipeline into a single call that turns a
+CELT range-coded frame into time-domain PCM: Table 56 prefix → §4.3.2.2
+fine energy → §4.3.2 per-band Q8 envelope assembly → §4.3.4 residual
+(shape) decode → §4.3.6/§4.3.7 long-MDCT synthesis → §4.3.7.1
+post-filter → §4.3.7.2 de-emphasis. A streaming `CeltDecodeState`
+carries the cross-frame overlap tail, post-filter history,
+de-emphasis memory, and §4.3.2.1 coarse-energy prediction for gapless
+playback. The per-band pulse counts (`band_k`) and fine-bit counts
+(`fine_bits`) are inputs — the same RFC-deferred boundary the residual
+loop already draws — so the driver stays inside fully-specified §4.3
+territory.
+
+Not yet implemented: the §4.3.3 reallocation loop that produces
+`band_k` / `fine_bits` (concurrent skip decoding + fine/shape split),
+the §4.3.4.4 split-gain band-split path, the stereo joint-coding path,
+and the §4.3.5 anti-collapse injection — each blocked on detail that
+RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.5 and the clean-room narrative §2.7
+defer to the reference implementation. `decode_celt_frame` rejects a
+transient or stereo frame with `Error::NotImplemented` rather than
+mis-decode it. The encoder and codec-registration entry points still
+return `Error::NotImplemented`.
 
 The module-by-module API surface is documented below.
 
@@ -887,8 +901,51 @@ Long-MDCT synthesis spine (RFC 6716 §4.3.6 → §4.3.7):
   remains a documented docs gap, the same boundary the residual loop
   keeps for the short-block geometry.
 
-Higher-level entry points (frame decoder, encoder, codec
-registration with the runtime) still return `Error::NotImplemented`.
+End-to-end frame decode → PCM (RFC 6716 §4.3, Table 56 → §4.3.7):
+
+* `decode_celt_frame(state, frame_bytes, start, end, fine_bits,
+  band_k) -> Result<DecodedFrame, Error>` is the top-level driver for a
+  **mono, non-transient (single long MDCT)** CELT frame. It walks the
+  documented decode chain end-to-end: `decode_frame_prefix` (Table 56
+  prefix) → `decode_fine_energy` (§4.3.2.2) → `assemble_band_log_energy_q8`
+  (§4.3.2 envelope, sliced to the coded window) → `decode_residual_bands`
+  (§4.3.4 shape) → `LongMdctSynthesis::synthesize` (§4.3.6/§4.3.7) →
+  `apply_post_filter_f32` (§4.3.7.1, when the prefix signalled one) →
+  `Deemphasis::apply_in_place` (§4.3.7.2), returning the `120 << lm`
+  PCM samples plus the decoded `FramePrefix`.
+* `CeltDecodeState::new(lm) -> Option<Self>` builds the streaming state
+  for a fixed frame-size shift; it carries the §4.3.2.1 coarse-energy
+  prediction, the §4.3.7 synthesis overlap tail, the §4.3.7.1
+  post-filter history, and the §4.3.7.2 de-emphasis memory across
+  frames. `reset()` zeroes every carried memory for a §4.5.2 decoder
+  reset; `frame_size()` / `lm()` / `coarse_energy()` expose the
+  geometry and state.
+* `DecodedFrame { pcm, prefix }` carries the final PCM and the decoded
+  control prefix.
+* The per-band pulse counts (`band_k`, the §4.3.4.1 bits-to-pulses
+  output) and the per-band fine-bit counts (`fine_bits`, the §4.3.2.2
+  allocation) are **inputs**: the §4.3.3 reallocation pass that
+  produces them is RFC-deferred (the same boundary `decode_residual_bands`
+  and `bits_to_pulses_band_loop` keep). When that pass lands, the only
+  change here is to compute these two vectors from the `FramePrefix`.
+* A `transient` or stereo frame is rejected with
+  `Error::NotImplemented` (the §4.3.1/§4.3.7 short-block reassembly and
+  the §4.3.4.4 stereo-angle gaps); a saturated codebook surfaces the
+  §4.3.4.4 split gap the same way. A `silence`-flagged frame decodes to
+  all-zero PCM.
+
+The §4.3.5 anti-collapse processing is a documented docs gap: the RFC
+§4.3.5 narrative describes the intent ("a pseudo-random signal is
+inserted with an energy corresponding to the minimum energy over the
+two previous frames; a renormalization step is then required") but
+gives no collapse-detection threshold, pseudo-random generator, or
+injection magnitude — those live in `bands.c::anti_collapse()`, outside
+the staged docs. Since `decode_celt_frame` only handles non-transient
+frames (where §4.3.5 does not even decode the anti-collapse bit), the
+gap does not block the mono long-MDCT path.
+
+The encoder and codec-registration entry points with the runtime still
+return `Error::NotImplemented`.
 
 ## Clean-room provenance
 

@@ -6,6 +6,41 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-341 (2026-06-19) — end-to-end frame decode → PCM orchestrator
+  (`frame_synthesis` module):** `decode_celt_frame(state, frame_bytes,
+  start, end, fine_bits, band_k)` chains the whole documented CELT
+  decode pipeline into a single call for a **mono, non-transient (single
+  long MDCT)** frame: Table 56 prefix (`decode_frame_prefix`) → §4.3.2.2
+  fine energy (`decode_fine_energy`) → §4.3.2 per-band Q8 envelope
+  assembly (`assemble_band_log_energy_q8`, sliced to the coded window) →
+  §4.3.4 residual shape decode (`decode_residual_bands`) → §4.3.6/§4.3.7
+  long-MDCT synthesis (`LongMdctSynthesis::synthesize`) → §4.3.7.1
+  post-filter (`apply_post_filter_f32`, when the prefix signalled one) →
+  §4.3.7.2 de-emphasis (`Deemphasis::apply_in_place`), returning a
+  `DecodedFrame { pcm, prefix }` with the `120 << lm` PCM samples. The
+  streaming `CeltDecodeState` carries the §4.3.2.1 coarse-energy
+  prediction, the §4.3.7 synthesis overlap tail, the §4.3.7.1
+  post-filter history, and the §4.3.7.2 de-emphasis memory across frames
+  (gapless playback); `reset()` zeroes all four for the §4.5.2 decoder
+  reset. The per-band pulse counts (`band_k`, the §4.3.4.1 output) and
+  fine-bit counts (`fine_bits`, the §4.3.2.2 allocation) are inputs —
+  the same RFC-deferred §4.3.3 reallocation boundary `decode_residual_bands`
+  and `bits_to_pulses_band_loop` already keep — so the driver stays
+  inside fully-specified §4.3 territory. A transient or stereo frame is
+  rejected with `NotImplemented` (the §4.3.1/§4.3.7 short-block
+  reassembly and §4.3.4.4 stereo-angle gaps); a saturated codebook
+  surfaces the §4.3.4.4 split gap; a `silence`-flagged frame decodes to
+  all-zero PCM. Eight new tests pin the full-window mono decode, the
+  Hybrid-window decode, the cross-frame overlap-tail carry, the
+  post-reset fresh-decode identity, the transient rejection, the
+  invalid-parameter guards, and finite-PCM on a zero-pulse window.
+  **Docs gap:** §4.3.5 anti-collapse injection — the RFC §4.3.5
+  narrative gives the *intent* ("a pseudo-random signal is inserted with
+  an energy corresponding to the minimum energy over the two previous
+  frames; a renormalization step is then required") but no
+  collapse-detection threshold, pseudo-random generator, or injection
+  magnitude (deferred to `bands.c`). Does not block the non-transient
+  path (the anti-collapse bit is only decoded on transient frames).
 * **Round-336 (2026-06-18) — §4.3.6 → §4.3.7 long-MDCT synthesis spine
   (`synthesis` module):** closes the seam between the residual band-loop
   (`decode_residual_bands`) and the inverse MDCT. `mdct_size(lm)` is the

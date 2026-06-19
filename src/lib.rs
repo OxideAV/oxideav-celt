@@ -2,6 +2,29 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-06-19):** round-341. The end-to-end frame-decode → PCM
+//! orchestrator (`frame_synthesis`) chains the whole documented decode
+//! pipeline into one call: `decode_celt_frame` walks Table 56 prefix
+//! (`decode_frame_prefix`) → §4.3.2.2 fine energy (`decode_fine_energy`)
+//! → §4.3.2 per-band Q8 envelope (`assemble_band_log_energy_q8`, sliced
+//! to the coded window) → §4.3.4 residual shape (`decode_residual_bands`)
+//! → §4.3.6/§4.3.7 long-MDCT synthesis (`LongMdctSynthesis`) → §4.3.7.1
+//! post-filter (`apply_post_filter_f32`) → §4.3.7.2 de-emphasis
+//! (`Deemphasis`), turning a CELT range-coded frame into `120 << lm`
+//! time-domain PCM samples. `CeltDecodeState` carries the cross-frame
+//! overlap tail, post-filter history, de-emphasis memory, and §4.3.2.1
+//! coarse-energy prediction for gapless playback (§4.5.2 reset zeroes
+//! all four). The per-band pulse counts (`band_k`) and fine-bit counts
+//! (`fine_bits`) are inputs — the same RFC-deferred §4.3.3 reallocation
+//! boundary the residual loop keeps — so the driver stays inside
+//! fully-specified §4.3 territory. Handles the mono, non-transient
+//! (single long MDCT) case; a transient/stereo frame is rejected with
+//! `NotImplemented`. The §4.3.5 anti-collapse injection stays a
+//! documented docs gap (the RFC describes the intent but defers the
+//! collapse-detection threshold + pseudo-random generator + injection
+//! magnitude to `bands.c`); it does not block the non-transient path,
+//! where the anti-collapse bit is not decoded.
+//!
 //! **Status (2026-06-18):** round-336. The §4.3.6 → §4.3.7 long-MDCT
 //! synthesis spine (`synthesis`) closes the seam between the residual
 //! band-loop and the inverse MDCT: `place_residual_spectrum` maps a
@@ -233,6 +256,7 @@ pub mod e_prob_model;
 pub mod fine_energy;
 pub mod frame_decode;
 pub mod frame_header;
+pub mod frame_synthesis;
 pub mod hadamard;
 pub mod laplace;
 pub mod mdct;
@@ -299,6 +323,7 @@ pub use fine_energy::{
 };
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
+pub use frame_synthesis::{decode_celt_frame, CeltDecodeState, DecodedFrame};
 pub use hadamard::{
     apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
     HADAMARD_LEVEL_SCALE,
