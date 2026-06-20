@@ -420,6 +420,191 @@ pub fn encode_pulses_to_index(pulses: &[i32], n: u32, k: u32) -> Option<u32> {
     Some(i as u32)
 }
 
+/// Quantize an input vector `x` onto the §4.3.4.2 PVQ codebook of `K`
+/// pulses in `N` dimensions, returning the signed integer pulse vector
+/// `y` with `sum(|y|) == K` that the encoder would transmit.
+///
+/// This is the encoder-side codeword search of RFC 6716 §5.3.8.1. The
+/// codebook is every integer vector `y` with `sum(|y(j)|) == K` (two
+/// pulses at the same position share a sign), and `x` is the unit
+/// vector to be approximated. The documented method:
+///
+/// 1. Form an initial codeword by projecting `x` onto the pyramid of
+///    `K-1` pulses and truncating toward zero:
+///    `y0[j] = trunc((K-1) * x[j] / Σ|x|)`, keeping the sign of `x[j]`.
+/// 2. Add the remaining pulses one at a time with a greedy search that
+///    maximizes the normalized correlation `xᵀy / ||y||` after each
+///    placement, until `sum(|y|) == K`.
+///
+/// RFC 6716 §5.3.8.1 explicitly states implementers MAY use any search
+/// method as long as the output is a valid codebook vector; this
+/// implements the documented projection-plus-greedy method directly,
+/// with no reference-implementation detail. The greedy increment is
+/// evaluated in closed form: adding a unit pulse of sign `s` at
+/// position `j` changes the squared norm `yy → yy + 2*s*y[j] + 1` and
+/// the correlation `xy → xy + s*x[j]`, so the candidate metric
+/// `(xy + s*x[j])² / (yy + 2*s*y[j] + 1)` is compared without
+/// recomputing the full vector. Ties resolve to the lowest position
+/// then to the positive sign, giving a deterministic result.
+///
+/// Returns `None` for `N == 0` with `K > 0` (no codeword exists) and
+/// the all-zero vector for `K == 0`. When `x` is all-zero (or `N == K`
+/// degenerate cases) the pulses are placed deterministically so the
+/// output always satisfies `sum(|y|) == K`. The input slice length
+/// must equal `N`.
+pub fn pvq_search(x: &[f32], n: u32, k: u32) -> Option<Vec<i32>> {
+    let nn = n as usize;
+    if x.len() != nn {
+        return None;
+    }
+    if k == 0 {
+        return Some(vec![0i32; nn]);
+    }
+    if nn == 0 {
+        // N == 0 cannot host K > 0 pulses.
+        return None;
+    }
+    let kk = k as i64;
+    // Work in f64 for the search arithmetic to stay well clear of f32
+    // rounding while comparing candidate metrics.
+    let xf: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+    let mut y = vec![0i64; nn];
+    // Running L1 sum of |x| for the projection step.
+    let sum_abs: f64 = xf.iter().map(|v| v.abs()).sum();
+
+    // Step 1: project onto the (K-1)-pulse pyramid, truncating toward
+    // zero. Skipped when `sum_abs == 0` (no direction to project) — all
+    // pulses are then placed by the greedy step below.
+    let mut pulses_placed: i64 = 0;
+    if sum_abs > 0.0 && kk > 1 {
+        let scale = (kk - 1) as f64 / sum_abs;
+        for j in 0..nn {
+            // trunc toward zero, preserving sign of x[j].
+            let yj = (xf[j] * scale).trunc() as i64;
+            y[j] = yj;
+            pulses_placed += yj.abs();
+        }
+    }
+    // Defensive: the projection can never place more than K-1 pulses,
+    // but clamp the running count so the greedy loop terminates even on
+    // pathological f64 rounding.
+    if pulses_placed > kk {
+        // Shrink the largest-magnitude entries back until within budget.
+        while pulses_placed > kk {
+            // Find the entry with the largest magnitude to decrement.
+            let mut best = 0usize;
+            let mut best_mag = -1i64;
+            for (j, &yj) in y.iter().enumerate() {
+                if yj.abs() > best_mag {
+                    best_mag = yj.abs();
+                    best = j;
+                }
+            }
+            if best_mag <= 0 {
+                break;
+            }
+            y[best] -= y[best].signum();
+            pulses_placed -= 1;
+        }
+    }
+
+    // Maintain the running correlation `xy = Σ x[j]*y[j]` and squared
+    // norm `yy = Σ y[j]²` so each greedy step is O(N) rather than O(N²).
+    let mut xy: f64 = 0.0;
+    let mut yy: f64 = 0.0;
+    for j in 0..nn {
+        xy += xf[j] * y[j] as f64;
+        yy += (y[j] * y[j]) as f64;
+    }
+
+    // Step 2: greedily add the remaining pulses one at a time.
+    while pulses_placed < kk {
+        let mut best_j = 0usize;
+        let mut best_sign: i64 = 1;
+        // Track the best `(metric, tie)` pair. Initialise below every
+        // real candidate.
+        let mut best_metric = f64::NEG_INFINITY;
+        let mut best_tie = f64::NEG_INFINITY;
+        let mut found = false;
+        for j in 0..nn {
+            for &s in &[1i64, -1i64] {
+                // A greedy step must ADD a pulse — increase `sum(|y|)`
+                // by exactly one. Adding `s` at position `j` does that
+                // only when `y[j]` is zero (either sign) or `s` matches
+                // the existing sign; an opposing sign would *cancel* a
+                // pulse, reducing the L1 norm and wasting the placement.
+                if y[j] != 0 && y[j].signum() != s {
+                    continue;
+                }
+                let sf = s as f64;
+                let new_xy = xy + sf * xf[j];
+                let new_yy = yy + 2.0 * sf * (y[j] as f64) + 1.0;
+                if new_yy <= 0.0 {
+                    continue;
+                }
+                // Minimize J = -xᵀy/||y|| ⇔ maximize the signed
+                // normalized correlation `xy' / sqrt(yy')` (§5.3.8.1).
+                // The signed form (not the squared `xy'²/yy'`) is
+                // essential: squaring would make a sign-deepening pulse
+                // tie with a sign-cancelling one and let the search undo
+                // a correctly-placed pulse.
+                let metric = new_xy / new_yy.sqrt();
+                // Tie-break on the un-normalized correlation `xy'`. When
+                // the input is perfectly aligned with an axis, deepening
+                // a pulse and cancelling one normalize to the same
+                // ratio; the larger `xy'` (deepening) is the one that
+                // grows the match, so it must win the tie.
+                let tie = new_xy;
+                let better = if !found || metric > best_metric + 1e-12 {
+                    true
+                } else if metric >= best_metric - 1e-12 {
+                    // Within metric epsilon → decide on the tie key.
+                    tie > best_tie
+                } else {
+                    false
+                };
+                if better {
+                    best_metric = metric;
+                    best_tie = tie;
+                    best_j = j;
+                    best_sign = s;
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            // Unreachable for `N >= 1` (the matching-sign candidate is
+            // always valid), but guard against a non-terminating loop
+            // rather than spin forever if an invariant ever changes.
+            return None;
+        }
+        // Apply the chosen pulse and update the running accumulators.
+        xy += best_sign as f64 * xf[best_j];
+        yy += 2.0 * best_sign as f64 * (y[best_j] as f64) + 1.0;
+        y[best_j] += best_sign;
+        pulses_placed += 1;
+    }
+
+    Some(y.iter().map(|&v| v as i32).collect())
+}
+
+/// Quantize an input vector and return its §4.3.4.2 codeword index in
+/// one call — the encoder-side composition of [`pvq_search`] and
+/// [`encode_pulses_to_index`].
+///
+/// Runs the §5.3.8.1 PVQ search to find the integer pulse vector `y`
+/// approximating `x` with `sum(|y|) == K`, then encodes `y` to its
+/// unique index `i ∈ [0, V(N, K))`. Returns `(i, y)` so the caller can
+/// both transmit the index and keep the quantized pulse vector (e.g.
+/// for the §4.3.4.3 spreading the encoder applies in reverse). Returns
+/// `None` when the search or the index encode rejects the inputs
+/// (`N == 0` with `K > 0`, a length mismatch, or a saturated `V(N, K)`).
+pub fn encode_unit_shape(x: &[f32], n: u32, k: u32) -> Option<(u32, Vec<i32>)> {
+    let y = pvq_search(x, n, k)?;
+    let index = encode_pulses_to_index(&y, n, k)?;
+    Some((index, y))
+}
+
 /// Normalise a signed integer pulse vector to unit `L2` norm per RFC
 /// 6716 §4.3.4.2 (final paragraph). The output `f32` vector has the
 /// same length as `pulses` and satisfies `||out||_2 == 1` (within f32
@@ -804,6 +989,166 @@ mod tests {
         // correctly only if the matrix were built. A length-180 vector
         // with sum 180 still hits the saturation guard before indexing.
         assert_eq!(encode_pulses_to_index(&pulses, 180, 180), None);
+    }
+
+    // ---------- pvq_search (§5.3.8.1 encoder codeword search) ----------
+
+    fn l1(v: &[i32]) -> u32 {
+        v.iter().map(|&x| x.unsigned_abs()).sum()
+    }
+
+    #[test]
+    fn search_output_always_has_k_pulses() {
+        // For a spread of input vectors and (N, K), the search output
+        // must be a valid codeword: sum(|y|) == K, length N.
+        let inputs: &[&[f32]] = &[
+            &[1.0, 0.0, 0.0, 0.0],
+            &[0.5, -0.5, 0.5, -0.5],
+            &[0.9, 0.1, -0.3, 0.2],
+            &[-1.0, -1.0, -1.0, -1.0],
+            &[0.0, 0.0, 0.0, 0.0],
+            &[0.6, 0.6, 0.0, 0.0],
+        ];
+        for x in inputs {
+            let n = x.len() as u32;
+            for k in 1..=8u32 {
+                let y = pvq_search(x, n, k).expect("search must succeed");
+                assert_eq!(y.len(), n as usize);
+                assert_eq!(l1(&y), k, "sum|y| != K for x={:?} K={}", x, k);
+            }
+        }
+    }
+
+    #[test]
+    fn search_k_zero_is_zero_vector() {
+        let y = pvq_search(&[0.3, -0.7, 0.1], 3, 0).unwrap();
+        assert_eq!(y, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn search_n_zero_k_positive_rejected() {
+        assert_eq!(pvq_search(&[], 0, 3), None);
+    }
+
+    #[test]
+    fn search_length_mismatch_rejected() {
+        assert_eq!(pvq_search(&[1.0, 0.0], 3, 2), None);
+    }
+
+    #[test]
+    fn search_concentrates_on_dominant_axis() {
+        // A vector pointing almost entirely along axis 0 should put all
+        // its pulses there (with the correct sign).
+        let y = pvq_search(&[1.0, 0.0, 0.0, 0.0], 4, 5).unwrap();
+        assert_eq!(y, vec![5, 0, 0, 0]);
+        let y = pvq_search(&[-1.0, 0.0, 0.0, 0.0], 4, 3).unwrap();
+        assert_eq!(y, vec![-3, 0, 0, 0]);
+    }
+
+    #[test]
+    fn search_balanced_input_spreads_pulses() {
+        // Four equal-magnitude axes with K=4 → one pulse per axis with
+        // matching signs.
+        let y = pvq_search(&[0.5, -0.5, 0.5, -0.5], 4, 4).unwrap();
+        assert_eq!(l1(&y), 4);
+        assert_eq!(y, vec![1, -1, 1, -1]);
+    }
+
+    #[test]
+    fn search_all_zero_input_still_produces_k_pulses() {
+        // No direction information, but the codeword must still be
+        // valid (sum|y| == K). Determinism: lowest indices, positive.
+        let y = pvq_search(&[0.0, 0.0, 0.0], 3, 2).unwrap();
+        assert_eq!(l1(&y), 2);
+    }
+
+    #[test]
+    fn search_maximizes_correlation_against_brute_force() {
+        // For small (N, K) confirm the greedy search finds a codeword
+        // whose normalized correlation xᵀy/||y|| is within f64 epsilon
+        // of the brute-force optimum over the full codebook. The greedy
+        // method is documented as a "good trade-off", so it is not
+        // guaranteed globally optimal in general — but for these small
+        // well-separated inputs it coincides with the optimum.
+        let cases: &[(&[f32], u32, u32)] = &[
+            (&[0.9, 0.3, 0.2, 0.1], 4, 3),
+            (&[0.6, -0.6, 0.4, -0.2], 4, 4),
+            (&[0.8, 0.5, 0.3, 0.1, 0.05], 5, 2),
+        ];
+        for &(x, n, k) in cases {
+            let y = pvq_search(x, n, k).unwrap();
+            let corr = normalized_corr(x, &y);
+            // Brute-force the optimum over every codeword.
+            let v = v_count(n, k);
+            let mut best = f64::NEG_INFINITY;
+            for i in 0..v {
+                let cand = decode_index_to_pulses(i, n, k).unwrap();
+                let c = normalized_corr(x, &cand);
+                if c > best {
+                    best = c;
+                }
+            }
+            assert!(
+                corr >= best - 1e-9,
+                "greedy corr {} below brute-force optimum {} for x={:?} K={}",
+                corr,
+                best,
+                x,
+                k
+            );
+        }
+    }
+
+    fn normalized_corr(x: &[f32], y: &[i32]) -> f64 {
+        let mut xy = 0.0f64;
+        let mut yy = 0.0f64;
+        for (j, &yj) in y.iter().enumerate() {
+            xy += x[j] as f64 * yj as f64;
+            yy += (yj * yj) as f64;
+        }
+        if yy == 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        xy / yy.sqrt()
+    }
+
+    // ---------- encode_unit_shape (search → index composition) ----------
+
+    #[test]
+    fn encode_unit_shape_roundtrips_through_decoder() {
+        // For a spread of inputs, encode_unit_shape's (index, pulses)
+        // must satisfy decode_index_to_pulses(index) == pulses, and the
+        // pulses must be a valid K-pulse codeword.
+        let inputs: &[&[f32]] = &[
+            &[1.0, 0.0, 0.0, 0.0],
+            &[0.5, -0.5, 0.5, -0.5],
+            &[0.9, 0.1, -0.3, 0.2, -0.1, 0.05],
+        ];
+        for x in inputs {
+            let n = x.len() as u32;
+            for k in 1..=6u32 {
+                let (index, pulses) = encode_unit_shape(x, n, k).unwrap();
+                assert_eq!(l1(&pulses), k);
+                let decoded = decode_index_to_pulses(index, n, k).unwrap();
+                assert_eq!(
+                    decoded, pulses,
+                    "decode(encode_unit_shape) mismatch for x={:?} K={}",
+                    x, k
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_unit_shape_n_zero_k_positive_none() {
+        assert_eq!(encode_unit_shape(&[], 0, 2), None);
+    }
+
+    #[test]
+    fn encode_unit_shape_k_zero_index_zero() {
+        let (index, pulses) = encode_unit_shape(&[0.3, -0.7, 0.1], 3, 0).unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(pulses, vec![0, 0, 0]);
     }
 
     // ---------- v_column ----------

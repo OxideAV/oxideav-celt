@@ -54,8 +54,15 @@ each blocked on detail that RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.1 /
 §4.3.7 / §4.3.5 and the clean-room narrative §2.7 defer to the
 reference implementation. `decode_celt_frame` rejects a transient or
 stereo frame with `Error::NotImplemented` rather than mis-decode it.
-The encoder and codec-registration entry points still return
-`Error::NotImplemented`.
+
+**Encode building blocks, in progress.** The first encode-direction
+primitives are in place: the §4.3.4.2 PVQ codeword index encode
+(`encode_pulses_to_index`, the exact inverse of the decode loop) and the
+§5.3.8.1 PVQ codeword search (`pvq_search` → `encode_unit_shape`), giving
+the full input-vector → integer-codeword → bitstream-index PVQ encode
+chain (the range *encoder* that would serialise the index, the
+energy-quantization encode, and the codec-registration entry point still
+return `Error::NotImplemented`).
 
 **Documented allocation→pulses seam.** `tests/allocation_to_pulses.rs`
 composes the fully-specified §4.3.3 modules on *both sides* of the one
@@ -612,7 +619,7 @@ Per-band shape-allocation assembly at a quality column (RFC 6716
   decision and the fine-energy/shape split remain deferred (same
   docs-gap boundary).
 
-Pyramid Vector Quantizer (RFC 6716 §4.3.4.2):
+Pyramid Vector Quantizer (RFC 6716 §4.3.4.2 decode + §5.3.8.1 encode):
 
 * `v_count(n, k)` — the §4.3.4.2 codebook size `V(N, K)` computed
   from the recurrence `V(N, K) = V(N-1, K) + V(N, K-1) +
@@ -636,6 +643,34 @@ Pyramid Vector Quantizer (RFC 6716 §4.3.4.2):
 * `decode_unit_shape(dec, n, k)` — convenience composition of the
   two above, returning the unit-norm `Vec<f32>` ready to feed the
   §4.3.4.3 spreading rotation.
+* `encode_pulses_to_index(pulses, n, k)` — the exact arithmetic
+  inverse of `decode_index_to_pulses`: maps a signed integer pulse
+  vector `X` with `sum(|X|) = K` back to its unique codeword index
+  `i ∈ [0, V(N, K))`, by replaying the decoder's per-position
+  half-selection + magnitude walk forward and re-accumulating the
+  residual the decoder subtracted from `i`. The §4.3.4.2 codeword↔index
+  map is a bijection, so `encode_pulses_to_index ∘ decode_index_to_pulses
+  == id` over the whole codeword space. Returns `None` on a length
+  mismatch, a magnitude sum other than `K`, an entry exceeding the
+  remaining budget, or a saturated `V(N, K)`.
+* `pvq_search(x, n, k)` — the encoder-side §5.3.8.1 codeword search:
+  quantizes an input vector onto the §4.3.4.2 codebook (every integer
+  vector with `sum(|y|) = K`) by projecting `x` onto the `K-1`-pulse
+  pyramid with truncate-toward-zero
+  (`y0[j] = trunc((K-1)·x[j]/Σ|x|)`), then greedily adding the
+  remaining pulses one at a time to maximize the signed normalized
+  correlation `xᵀy/||y||` (minimizing §5.3.8.1's `J = -xᵀy/||y||`).
+  Each greedy step is constrained to add a pulse (matching-sign /
+  zero-entry candidates), never cancel one, so `sum(|y|)` reaches `K`
+  exactly. `K = 0` returns the zero vector; `N = 0` with `K > 0` is
+  `None`. The RFC names this method and permits any search yielding a
+  valid codebook vector, so the implementation is clean-room by
+  construction.
+* `encode_unit_shape(x, n, k)` — composes `pvq_search` with
+  `encode_pulses_to_index`, returning `(index, pulses)` so the caller
+  both transmits the codeword index and keeps the quantized integer
+  pulse vector. The full encode chain: input vector → integer codeword
+  → bitstream index. `decode_index_to_pulses(index) == pulses` always.
 * `V_COUNT_SATURATION = u32::MAX` — sentinel for the over-budget
   codebook case (callers that hit it must split per §4.3.4.4
   before retrying).

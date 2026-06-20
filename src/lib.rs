@@ -346,7 +346,7 @@ pub use pulse_cache::{
 };
 pub use pvq::{
     decode_index_to_pulses, decode_pulses, decode_unit_shape, encode_pulses_to_index,
-    normalize_to_unit_l2, v_count, V_COUNT_SATURATION,
+    encode_unit_shape, normalize_to_unit_l2, pvq_search, v_count, V_COUNT_SATURATION,
 };
 pub use range_decoder::RangeDecoder;
 pub use residual::{decode_residual_bands, ResidualSpectrum};

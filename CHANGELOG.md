@@ -6,6 +6,29 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-354 (2026-06-21) — PVQ encoder codeword search
+  (`pvq_search` + `encode_unit_shape` in `pvq`):** the encoder-side
+  §5.3.8.1 codeword search. `pvq_search(x, N, K)` quantizes an input
+  vector onto the §4.3.4.2 PVQ codebook (every integer vector with
+  `sum(|y|) == K`) by the documented method: project `x` onto the
+  `K-1`-pulse pyramid with truncate-toward-zero
+  (`y0[j] = trunc((K-1)·x[j]/Σ|x|)`), then add the remaining pulses one
+  at a time, each maximizing the signed normalized correlation
+  `xᵀy/||y||` (minimizing §5.3.8.1's `J = -xᵀy/||y||`). Each greedy
+  step is constrained to *add* a pulse (the matching-sign or zero-entry
+  candidates), never cancel one, so `sum(|y|)` reaches `K` exactly; the
+  metric is evaluated in closed form from running `xy`/`yy`
+  accumulators. `encode_unit_shape` composes the search with
+  `encode_pulses_to_index` to return `(index, pulses)` in one call.
+  Together with the index encode below, this is the full PVQ encode
+  chain — input vector → integer codeword → bitstream index — all
+  within fully-specified §4.3.4.2/§5.3.8.1 territory (the RFC names the
+  projection+greedy method and states implementers MAY use any search
+  yielding a valid codebook vector). Validated by codeword-validity
+  (`sum|y|==K`), dominant-axis/balanced-input shape checks, a
+  greedy-vs-brute-force-optimum correlation check on small bands, and a
+  `decode(encode_unit_shape) == pulses` round-trip. +8 tests.
+
 * **Round-354 (2026-06-21) — PVQ codeword index encode
   (`encode_pulses_to_index` in `pvq`):** the exact arithmetic inverse
   of the §4.3.4.2 decode loop. Given a signed integer pulse vector `X`
