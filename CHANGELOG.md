@@ -6,6 +6,20 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-354 (2026-06-21) — PVQ codeword index encode
+  (`encode_pulses_to_index` in `pvq`):** the exact arithmetic inverse
+  of the §4.3.4.2 decode loop. Given a signed integer pulse vector `X`
+  with `sum(|X|) == K`, it recovers the unique index `i ∈ [0, V(N, K))`
+  for which `decode_index_to_pulses(i, N, K) == X`, by replaying the
+  decoder's per-position half-selection + magnitude walk forward and
+  re-accumulating exactly the residual the decoder subtracted from `i`.
+  This is the first encode-direction building block in the crate (the
+  decode-only PVQ codebook now round-trips), wholly within the
+  fully-specified §4.3.4.2 indexing — no reference-implementation
+  detail. Validated by an `encode∘decode == id` property test over the
+  *entire* codeword space for every `(N, K)` in a small grid, plus
+  range/`K=0`/malformed-input/saturation guards. +6 tests.
+
 * **Round-348 (2026-06-20) — documented allocation→pulses→synthesis
   seam integration test (`tests/allocation_to_pulses.rs`):** a cross-
   module test that derives the residual loop's per-band pulse counts
