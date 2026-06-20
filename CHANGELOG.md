@@ -6,6 +6,18 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-354 (2026-06-21) — PVQ encode→decode round-trip integration
+  test (`tests/pvq_encode_roundtrip.rs`):** a cross-module test driving
+  the full encode chain through the public API: `pvq_search` (§5.3.8.1)
+  → `encode_pulses_to_index` (§4.3.4.2) → `decode_index_to_pulses`
+  (§4.3.4.2) → `normalize_to_unit_l2`. Over a deterministic random sweep
+  of input vectors and `(N, K)` it confirms the decoded codeword equals
+  the searched codeword exactly (the codeword↔index bijection),
+  `encode_unit_shape` matches the manual composition, the reconstructed
+  unit vector is L2-normalized with signs matching the integer codeword
+  (the shape the §4.3.4.3 spreading stage consumes), and the search
+  never settles on a net-negative correlation. +4 tests.
+
 * **Round-354 (2026-06-21) — PVQ encoder codeword search
   (`pvq_search` + `encode_unit_shape` in `pvq`):** the encoder-side
   §5.3.8.1 codeword search. `pvq_search(x, N, K)` quantizes an input
