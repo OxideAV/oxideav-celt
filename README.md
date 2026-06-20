@@ -57,6 +57,20 @@ stereo frame with `Error::NotImplemented` rather than mis-decode it.
 The encoder and codec-registration entry points still return
 `Error::NotImplemented`.
 
+**Documented allocation→pulses seam.** `tests/allocation_to_pulses.rs`
+composes the fully-specified §4.3.3 modules on *both sides* of the one
+remaining allocation docs gap (`interp_bits2pulses`: the reallocation +
+concurrent skip + fine/shape split): `decode_frame_prefix` →
+`find_combined_alloc` (the §4.3.3 column search "nearest but not
+exceeding … subject to tilt, boosts, [and] band maximums") →
+`bits_to_pulses_band_loop_cached` (§4.3.4.1 bit-exact `cache_bits50`
+pulse counts). For pure-CELT mono the derived `band_k` drives the full
+`decode_celt_frame` pipeline to finite PCM, deterministically, with the
+total pulse count monotone in the frame budget — demonstrating the
+`band_k` the residual loop takes as input *can* be produced from the
+documented modules wherever §4.3.3 is not deferred. Only the fine/shape
+split + concurrent-skip reallocation remains a genuine docs gap.
+
 The module-by-module API surface is documented below.
 
 Range decoder (RFC 6716 §4.1):

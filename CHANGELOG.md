@@ -6,6 +6,26 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-348 (2026-06-20) — documented allocation→pulses→synthesis
+  seam integration test (`tests/allocation_to_pulses.rs`):** a cross-
+  module test that derives the residual loop's per-band pulse counts
+  (`band_k`) from the documented §4.3.3 modules instead of taking them
+  as a raw caller input — `decode_frame_prefix` (§4.3.2.1 coarse-energy
+  Laplace envelope + boost/trim/reservation budget) → `find_combined_alloc`
+  (the §4.3.3 column search "nearest but not exceeding ... subject to
+  tilt, boosts, [and] band maximums") → `bits_to_pulses_band_loop_cached`
+  (§4.3.4.1 bit-exact `cache_bits50` pulse counts), each `K` clamped to
+  the non-overflow `V(N,K)` range. For pure-CELT mono (LM 2 and 3) the
+  derived `band_k` drives the full `decode_celt_frame` synthesis pipeline
+  to finite PCM, deterministically, with total pulses monotone in the
+  frame budget; the hybrid window (bands 17..=20) is validated through
+  the `band_k` derivation. This pins the documented composition on both
+  sides of the one remaining §4.3.3 docs gap (`interp_bits2pulses`: the
+  reallocation + concurrent skip + fine/shape split), demonstrating that
+  the `band_k` the residual loop currently takes as an input *can* be
+  produced from the documented modules for the part of §4.3.3 that is not
+  deferred. +4 tests (534 → 538).
+
 * **Round-344 (2026-06-20) — stereo long-MDCT synthesis spine
   (`StereoLongMdctSynthesis` in `synthesis`):** the two-channel
   counterpart of `LongMdctSynthesis` — two independent per-channel
