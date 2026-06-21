@@ -65,30 +65,42 @@
 //! reallocation pass lands, the only change here is to compute these two
 //! vectors from the [`FramePrefix`] rather than accept them.
 //!
-//! ## Scope: mono, non-transient
+//! ## Scope: mono and stereo, non-transient
 //!
-//! This driver handles the unambiguous **mono single-long-MDCT** case.
+//! [`decode_celt_frame`] handles the unambiguous **mono
+//! single-long-MDCT** case. [`StereoCeltDecodeState::decode_stereo_frame`]
+//! extends the same driver shape to the **stereo** dimension: it decodes
+//! the stereo control prefix and **both channels' §4.3.2.1 coarse
+//! energy** from the bitstream (the stereo coarse channel interleave
+//! *is* specified, `channels = 2`), composes each channel's §4.3.2
+//! envelope, and runs the per-channel §4.3.6 → §4.3.7 synthesis — taking
+//! the two channels' denormalized residual spectra and fine corrections
+//! as inputs (the same docs-gap boundary the mono path draws for
+//! `band_k`).
+//!
 //! Three CELT features are deferred to the reference by the RFC and
-//! therefore out of scope:
+//! therefore remain out of scope (inputs, or rejected):
 //!
 //! * **Transient short blocks** (§4.3.1 / §4.3.7): the per-short-block
-//!   frequency layout and inter-block overlap-add are delegated to
-//!   `celt.c` / `mdct.c`; [`crate::synthesis::LongMdctSynthesis`] keeps
-//!   that boundary.
-//! * **Stereo joint coding** (§4.3.4.4 `itheta` mid/side): the angle
-//!   quantisation PDF is deferred to the reference.
-//! * **Anti-collapse injection** (§4.3.5): the §4.3.5 narrative
-//!   describes the *intent* — "a pseudo-random signal is inserted with
-//!   an energy corresponding to the minimum energy over the two
-//!   previous frames" — but gives **no** collapse-detection threshold,
-//!   pseudo-random generator, or injection magnitude formula; those live
-//!   in `bands.c::anti_collapse()`, outside the staged docs. This is a
-//!   documented docs gap; since this driver only handles non-transient
-//!   frames (where §4.3.5 says the anti-collapse bit is not even
-//!   decoded), the gap does not block the mono long-MDCT path.
-//!
-//! A `transient` or `stereo` request is rejected with
-//! [`Error::NotImplemented`] rather than silently mis-decoded.
+//!   frequency layout and inter-block overlap-add are delegated to the
+//!   reference and not in the staged docs;
+//!   [`crate::synthesis::LongMdctSynthesis`] keeps that boundary, and a
+//!   transient prefix is rejected with [`Error::NotImplemented`] in both
+//!   the mono and stereo drivers.
+//! * **Stereo joint coding** (§4.3.4.4 `itheta` mid/side) and the
+//!   **main §4.3.2.2 fine-energy channel interleave**: the angle PDF and
+//!   the fine-energy per-channel bit order are deferred to the reference.
+//!   The stereo driver takes the per-channel residual spectra and fine
+//!   corrections as inputs for exactly this reason; the **coarse** energy
+//!   it decodes itself.
+//! * **Anti-collapse injection** (§4.3.5): the narrative describes the
+//!   *intent* — "a pseudo-random signal is inserted with an energy
+//!   corresponding to the minimum energy over the two previous frames" —
+//!   but gives **no** collapse-detection threshold, pseudo-random
+//!   generator, or injection magnitude formula; this is a documented docs
+//!   gap. Since both drivers only handle non-transient frames (where
+//!   §4.3.5 says the anti-collapse bit is not even decoded), the gap does
+//!   not block the long-MDCT path.
 //!
 //! ## Clean-room provenance
 //!
@@ -197,6 +209,23 @@ pub struct DecodedFrame {
     /// parameters, spread, band allocation), for callers that want to
     /// inspect the decoded control state.
     pub prefix: FramePrefix,
+}
+
+/// The result of decoding one **stereo**, non-transient CELT frame to
+/// interleaved PCM.
+#[derive(Debug, Clone)]
+pub struct StereoDecodedFrame {
+    /// The interleaved L/R/L/R time-domain PCM samples, `2 * frame_size()`
+    /// of them, after per-channel synthesis → post-filter → de-emphasis.
+    pub pcm: Vec<f32>,
+    /// The fully-decoded Table 56 control prefix (shared by both channels;
+    /// CELT codes one control prefix per frame).
+    pub prefix: FramePrefix,
+    /// The two channels' assembled §4.3.2 final per-band Q8 log-energy
+    /// envelopes (`[0]` = left, `[1]` = right), indexed by absolute band.
+    /// These are the coarse (bitstream-decoded, both channels) + fine
+    /// (caller-supplied) composition the §4.3.6 denormalization consumed.
+    pub envelope_q8: [[i32; NUM_BANDS]; 2],
 }
 
 /// Decode one mono, non-transient CELT frame to time-domain PCM
@@ -357,6 +386,12 @@ pub fn decode_celt_frame(
 #[derive(Debug, Clone)]
 pub struct StereoCeltDecodeState {
     lm: u32,
+    /// The §4.3.2.1 coarse-energy inter-frame prediction state. Both
+    /// channels live in the one [`CoarseEnergyState`] (it carries
+    /// `energy[channel][band]` for `channel ∈ {0, 1}`), so stereo
+    /// coarse-energy decode and its cross-frame prediction stay in one
+    /// place exactly as §4.3.2.1 prescribes.
+    coarse: CoarseEnergyState,
     synth: StereoLongMdctSynthesis,
     deemph: [Deemphasis; 2],
     /// Per-channel previous-frame post-filtered (pre-de-emphasis) output.
@@ -390,10 +425,18 @@ impl StereoCeltDecodeState {
         let frame_size = synth.frame_size();
         Some(Self {
             lm,
+            coarse: CoarseEnergyState::new(),
             synth,
             deemph: [Deemphasis::new(), Deemphasis::new()],
             post_filter_history: [vec![0.0; frame_size], vec![0.0; frame_size]],
         })
+    }
+
+    /// Read-only view of the §4.3.2.1 stereo coarse-energy prediction
+    /// state (both channels).
+    #[inline]
+    pub fn coarse_energy(&self) -> &CoarseEnergyState {
+        &self.coarse
     }
 
     /// The frame-size shift this state decodes.
@@ -409,14 +452,143 @@ impl StereoCeltDecodeState {
         self.synth.frame_size()
     }
 
-    /// Zero every carried per-channel inter-frame memory (§4.5.2 reset).
+    /// Zero every carried per-channel inter-frame memory (§4.5.2 reset):
+    /// the §4.3.2.1 coarse-energy prediction (both channels), the
+    /// per-channel synthesis overlap tails, post-filter history, and
+    /// de-emphasis memory.
     pub fn reset(&mut self) {
+        self.coarse.reset();
         self.synth.reset();
         self.deemph[0].reset();
         self.deemph[1].reset();
         for h in &mut self.post_filter_history {
             h.iter_mut().for_each(|s| *s = 0.0);
         }
+    }
+
+    /// Decode one **stereo**, non-transient CELT frame to interleaved
+    /// PCM (RFC 6716 §4.3, Table 56 → §4.3.7 chain), decoding the
+    /// stereo control prefix and **both channels' coarse energy** from
+    /// the range-coded bitstream.
+    ///
+    /// This is the stereo counterpart of [`decode_celt_frame`]. It
+    /// decodes the Table 56 prefix with the stereo channel count, which
+    /// runs the §4.3.2.1 coarse-energy walk for **both** channels
+    /// (`channels = 2`) against the shared [`CoarseEnergyState`] this
+    /// state carries — so the inter-frame coarse-energy prediction stays
+    /// correct per channel across frames. It then composes each channel's
+    /// §4.3.2 final Q8 log-energy envelope (bitstream coarse + the
+    /// caller-supplied fine corrections) and runs the per-channel
+    /// §4.3.6 → §4.3.7 synthesis on the two **caller-supplied
+    /// denormalized residual spectra**, returning interleaved PCM.
+    ///
+    /// ## Why the residual spectra and fine corrections are inputs
+    ///
+    /// Two stereo-specific decode stages are deferred to the reference by
+    /// RFC 6716 and therefore remain documented docs gaps, exactly as the
+    /// mono [`decode_celt_frame`] defers `band_k`:
+    ///
+    /// * the §4.3.4.4 `itheta` mid/side angle coupling that produces the
+    ///   two channels' residual spectra from the joint-coded bitstream
+    ///   (the angle PDF is deferred to the reference), and
+    /// * the per-channel bitstream interleave order of the **main**
+    ///   §4.3.2.2 fine-energy pass (`quant_fine_energy`; the RFC prose
+    ///   names the function but does not pin the channel interleave).
+    ///
+    /// By taking the per-channel `fine_q14` corrections and per-channel
+    /// denormalized `*_residual` spectra as inputs, this driver stays
+    /// inside fully-specified territory: the §4.3.2.1 stereo coarse-energy
+    /// decode, the §4.3.2 envelope composition, and the per-channel
+    /// §4.3.6 → §4.3.7 synthesis. The **coarse** energy, by contrast, is
+    /// decoded here from the bitstream — its stereo channel interleave
+    /// *is* specified (`decode_coarse_energy` with `channels = 2`).
+    ///
+    /// ## Parameters
+    ///
+    /// * `frame_bytes` — the stereo CELT range-coded payload for this
+    ///   frame; the prefix decode reads the control symbols + coarse
+    ///   energy from it.
+    /// * `start` / `end` — the coded-band window, `start <= end <= 21`.
+    /// * `fine_q14` — the two channels' §4.3.2.2 fine corrections in Q14,
+    ///   indexed by absolute band (`[0]` left, `[1]` right). Pass all-zero
+    ///   arrays when fine energy is not modelled.
+    /// * `left_residual` / `right_residual` — each channel's denormalized
+    ///   spectrum for `[start, end)`, length
+    ///   [`coded_total_bins(start, end, lm)`](crate::band_layout::coded_total_bins).
+    /// * `post_filter` — the §4.3.7.1 parameters applied per channel
+    ///   (`None` = off). CELT codes one post-filter, so both channels
+    ///   share it; this argument lets the caller override with the
+    ///   prefix-decoded value or disable it.
+    ///
+    /// ## Returns
+    ///
+    /// A [`StereoDecodedFrame`] (interleaved PCM + prefix + both
+    /// envelopes) on success, or:
+    ///
+    /// * [`Error::InvalidParameter`] when the band window / `lm` is out of
+    ///   range or either residual length is inconsistent.
+    /// * [`Error::NotImplemented`] when the decoded prefix signals a
+    ///   transient frame (the §4.3.1 / §4.3.7 short-block reassembly gap).
+    ///
+    /// On any error the carried state (coarse prediction, overlap tails,
+    /// de-emphasis, post-filter history) is left **unchanged** for the
+    /// synthesis stage; the prefix decode may have advanced the coarse
+    /// prediction before a later validation failed, so callers that need
+    /// strict atomicity should validate the residual lengths first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_stereo_frame(
+        &mut self,
+        frame_bytes: &[u8],
+        start: usize,
+        end: usize,
+        fine_q14: &[[i32; NUM_BANDS]; 2],
+        left_residual: &[f32],
+        right_residual: &[f32],
+        post_filter: Option<PostFilterParams>,
+    ) -> Result<StereoDecodedFrame, Error> {
+        if start > end || end > NUM_BANDS {
+            return Err(Error::InvalidParameter);
+        }
+        let lm = self.lm;
+
+        let mut dec = RangeDecoder::new(frame_bytes);
+
+        // Table 56 prefix with the stereo channel count: this decodes the
+        // §4.3.2.1 coarse energy for BOTH channels into `self.coarse`.
+        let prefix = decode_frame_prefix(
+            &mut dec,
+            &mut self.coarse,
+            lm,
+            frame_bytes.len() as u32,
+            true,
+            start,
+            end,
+        )?;
+
+        // The per-channel short-block reassembly is a documented gap; a
+        // transient stereo frame is rejected rather than mis-decoded.
+        if prefix.header.transient {
+            return Err(Error::NotImplemented);
+        }
+
+        // §4.3.2 final per-channel Q8 log-energy envelopes (bitstream
+        // coarse + caller-supplied fine), one assembly per channel.
+        let env_l = assemble_band_log_energy_q8(&self.coarse, 0, Some(&fine_q14[0]), None)
+            .ok_or(Error::InvalidParameter)?;
+        let env_r = assemble_band_log_energy_q8(&self.coarse, 1, Some(&fine_q14[1]), None)
+            .ok_or(Error::InvalidParameter)?;
+
+        // Per-channel §4.3.6 → §4.3.7 synthesis from the supplied
+        // denormalized spectra (validates both residual lengths before
+        // advancing either overlap tail).
+        let pcm =
+            self.synthesize_stereo_frame(left_residual, right_residual, start, end, post_filter)?;
+
+        Ok(StereoDecodedFrame {
+            pcm,
+            prefix,
+            envelope_q8: [env_l, env_r],
+        })
     }
 
     /// Synthesize one stereo frame from the two channels' **denormalized**
@@ -798,5 +970,230 @@ mod tests {
         let mut st = StereoCeltDecodeState::new(lm).unwrap();
         let out = st.synthesize_stereo_frame(&z, &z, 0, 21, None).unwrap();
         assert!(out.iter().all(|&x| x == 0.0));
+    }
+
+    // --- Stereo bitstream decode driver (prefix + coarse energy →
+    //     interleaved PCM, residual + fine corrections as input) ---
+
+    fn zero_fine2() -> [[i32; NUM_BANDS]; 2] {
+        [[0i32; NUM_BANDS]; 2]
+    }
+
+    /// A full stereo frame decodes the prefix + both channels' coarse
+    /// energy from the bitstream and emits `2 * frame_size` interleaved
+    /// PCM, threading every stage.
+    #[test]
+    fn decodes_full_stereo_frame() {
+        let lm = 1;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let buf: Vec<u8> = (0..96u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+        let out = st
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &rl, &rr, None)
+            .expect("stereo decode");
+        assert_eq!(out.pcm.len(), 2 * mdct_size(lm).unwrap());
+        assert_eq!(out.prefix.start, 0);
+        assert_eq!(out.prefix.end, 21);
+        assert!(out.pcm.iter().all(|x| x.is_finite()));
+    }
+
+    /// The decoded stereo prefix mutates BOTH channels' coarse-energy
+    /// prediction (a stereo frame decodes `channels = 2`), so a generic
+    /// non-intra frame leaves at least one of the two channel envelopes
+    /// non-zero after decode.
+    #[test]
+    fn stereo_decode_populates_both_channel_envelopes() {
+        let lm = 0;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let buf: Vec<u8> = (0..80u8)
+            .map(|i| i.wrapping_mul(53).wrapping_add(7))
+            .collect();
+        let r: Vec<f32> = (0..coded).map(|i| ((i % 3) as f32) - 1.0).collect();
+
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+        let out = st
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+        // The returned envelopes equal an independent assembly from the
+        // post-decode coarse state for each channel.
+        let env_l = assemble_band_log_energy_q8(st.coarse_energy(), 0, Some(&[0; NUM_BANDS]), None)
+            .unwrap();
+        let env_r = assemble_band_log_energy_q8(st.coarse_energy(), 1, Some(&[0; NUM_BANDS]), None)
+            .unwrap();
+        assert_eq!(out.envelope_q8[0], env_l);
+        assert_eq!(out.envelope_q8[1], env_r);
+    }
+
+    /// The stereo coarse-energy prediction carries across frames: two
+    /// consecutive stereo frames sharing one state differ from a fresh
+    /// first decode (the carried coarse prediction + overlap + de-emphasis
+    /// memory all fold prior state into the second frame).
+    #[test]
+    fn stereo_decode_carries_coarse_prediction() {
+        let lm = 1;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let buf: Vec<u8> = (0..96u8)
+            .map(|i| i.wrapping_mul(41).wrapping_add(13))
+            .collect();
+        let r: Vec<f32> = (0..coded).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut shared = StereoCeltDecodeState::new(lm).unwrap();
+        let _f1 = shared
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+        let f2 = shared
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+
+        let mut fresh = StereoCeltDecodeState::new(lm).unwrap();
+        let ff = fresh
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+
+        let any_diff = f2
+            .pcm
+            .iter()
+            .zip(&ff.pcm)
+            .any(|(a, b)| (a - b).abs() > 1e-9);
+        assert!(any_diff, "carried stereo state did not affect frame 2");
+    }
+
+    /// `reset()` zeroes the carried coarse prediction too, so a post-reset
+    /// stereo decode equals a fresh-state first decode of the same bytes.
+    #[test]
+    fn stereo_decode_reset_restores_fresh() {
+        let lm = 0;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let buf: Vec<u8> = (0..80u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let r: Vec<f32> = (0..coded).map(|i| ((i % 4) as f32) - 1.5).collect();
+
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+        let fresh = st
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+        let _ = st
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+        st.reset();
+        let after = st
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+        for (a, b) in fresh.pcm.iter().zip(&after.pcm) {
+            assert!((a - b).abs() <= 1e-6, "post-reset stereo PCM differs");
+        }
+        // The coarse prediction state also matches the fresh decode.
+        assert_eq!(fresh.envelope_q8, after.envelope_q8);
+    }
+
+    /// A transient stereo frame is rejected with `NotImplemented` (the
+    /// §4.3.1 / §4.3.7 short-block reassembly gap), never silently
+    /// mis-decoded. A transient stereo prefix is reachable for some
+    /// stream; this test searches a deterministic seed space for one and
+    /// asserts every transient-decoding seed is rejected (and that at
+    /// least one such seed exists, so the rejection path is exercised).
+    #[test]
+    fn stereo_transient_frame_is_not_implemented() {
+        use crate::coarse_energy::CoarseEnergyState;
+        use crate::frame_decode::decode_frame_prefix;
+
+        let lm = 1;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let r: Vec<f32> = (0..coded).map(|i| ((i % 3) as f32) - 1.0).collect();
+        let mut saw_transient = false;
+        for seed in 0u16..256 {
+            let s = seed as u8;
+            let buf: Vec<u8> = (0..96u8)
+                .map(|i| {
+                    i.wrapping_mul(41)
+                        .wrapping_mul(s.wrapping_add(1))
+                        .wrapping_add(s)
+                })
+                .collect();
+            // Probe the prefix transient flag with a throwaway coarse state.
+            let mut probe = CoarseEnergyState::new();
+            let mut dec = RangeDecoder::new(&buf);
+            let prefix =
+                decode_frame_prefix(&mut dec, &mut probe, lm, buf.len() as u32, true, 0, 21)
+                    .unwrap();
+            if !prefix.header.transient {
+                continue;
+            }
+            saw_transient = true;
+            let mut st = StereoCeltDecodeState::new(lm).unwrap();
+            let got = st.decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None);
+            assert!(
+                matches!(got, Err(Error::NotImplemented)),
+                "transient stereo frame (seed {s}) not rejected: {got:?}"
+            );
+        }
+        assert!(
+            saw_transient,
+            "no transient stereo prefix found in the seed space"
+        );
+    }
+
+    /// Out-of-range window / inconsistent residual length is rejected.
+    #[test]
+    fn stereo_decode_rejects_invalid_parameters() {
+        let lm = 0;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let buf = [0x5au8; 64];
+        let r = vec![0.5f32; coded];
+        let mut st = StereoCeltDecodeState::new(lm).unwrap();
+
+        // end > NUM_BANDS.
+        assert!(matches!(
+            st.decode_stereo_frame(&buf, 0, 22, &zero_fine2(), &r, &r, None),
+            Err(Error::InvalidParameter)
+        ));
+        // start > end.
+        assert!(matches!(
+            st.decode_stereo_frame(&buf, 10, 5, &zero_fine2(), &[], &[], None),
+            Err(Error::InvalidParameter)
+        ));
+        // Wrong residual length (right channel one short).
+        assert!(matches!(
+            st.decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r[..coded - 1], None),
+            Err(Error::InvalidParameter)
+        ));
+    }
+
+    /// A non-zero fine correction shifts the assembled envelope (and hence
+    /// the denormalized PCM is unaffected here since residuals are passed
+    /// in, but the returned envelope must reflect the correction).
+    #[test]
+    fn stereo_decode_applies_fine_corrections() {
+        let lm = 0;
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let buf: Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(29).wrapping_add(3))
+            .collect();
+        let r = vec![0.25f32; coded];
+
+        let mut zero_st = StereoCeltDecodeState::new(lm).unwrap();
+        let zero_out = zero_st
+            .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+            .unwrap();
+
+        // A +1 Q14 fine bump on every band of the left channel only.
+        let mut fine = zero_fine2();
+        for b in fine[0].iter_mut() {
+            *b = 4096; // 0.25 in base-2 log (Q14).
+        }
+        let mut bumped_st = StereoCeltDecodeState::new(lm).unwrap();
+        let bumped_out = bumped_st
+            .decode_stereo_frame(&buf, 0, 21, &fine, &r, &r, None)
+            .unwrap();
+
+        // Left envelope shifts up; right is unchanged.
+        assert_ne!(zero_out.envelope_q8[0], bumped_out.envelope_q8[0]);
+        assert_eq!(zero_out.envelope_q8[1], bumped_out.envelope_q8[1]);
     }
 }

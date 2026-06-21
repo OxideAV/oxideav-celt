@@ -2,6 +2,27 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-06-21):** round-356. The frame-decode → PCM
+//! orchestrator now covers the **stereo** dimension:
+//! [`StereoCeltDecodeState::decode_stereo_frame`] decodes the stereo
+//! Table 56 control prefix and **both channels' §4.3.2.1 coarse energy**
+//! from the range-coded bitstream (the stereo coarse channel interleave
+//! is specified, `channels = 2`), composes each channel's §4.3.2 Q8
+//! envelope (bitstream coarse + caller-supplied fine), and runs the
+//! per-channel §4.3.6 → §4.3.7 synthesis on the two denormalized residual
+//! spectra to emit interleaved L/R/L/R PCM — the same docs-gap boundary
+//! the mono [`decode_celt_frame`] draws for `band_k`. The shared
+//! [`CoarseEnergyState`] carries both channels' inter-frame coarse-energy
+//! prediction across frames; `reset()` zeroes it with the per-channel
+//! overlap / de-emphasis / post-filter memory. The §4.3.2.1 Laplace
+//! recurrence + constants are now sourced from the clean-room narrative
+//! `docs/audio/celt/spec/celt-laplace-decode.md` and the data extraction
+//! `docs/audio/celt/tables/laplace_constants.csv` (provenance re-anchored
+//! off the RFC's Appendix A reference source, which the clean-room policy
+//! bars). Transient short-block reassembly + the §4.3.4.4 `itheta` joint
+//! coupling + the main §4.3.2.2 fine-energy channel interleave stay
+//! documented docs gaps.
+//!
 //! **Status (2026-06-19):** round-341. The end-to-end frame-decode → PCM
 //! orchestrator (`frame_synthesis`) chains the whole documented decode
 //! pipeline into one call: `decode_celt_frame` walks Table 56 prefix
@@ -331,6 +352,7 @@ pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
 pub use frame_synthesis::{
     decode_celt_frame, CeltDecodeState, DecodedFrame, PostFilterParams, StereoCeltDecodeState,
+    StereoDecodedFrame,
 };
 pub use hadamard::{
     apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,

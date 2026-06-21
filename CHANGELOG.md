@@ -25,6 +25,25 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-356 (2026-06-21) — stereo frame-decode driver
+  (`StereoCeltDecodeState::decode_stereo_frame` + `StereoDecodedFrame`):**
+  the stereo counterpart of `decode_celt_frame`. It decodes the stereo
+  Table 56 control prefix and **both channels' §4.3.2.1 coarse energy**
+  from the range-coded bitstream (the stereo coarse channel interleave is
+  specified — `decode_coarse_energy` with `channels = 2`), composes each
+  channel's §4.3.2 Q8 log-energy envelope (bitstream coarse +
+  caller-supplied fine corrections), and runs the per-channel §4.3.6 →
+  §4.3.7 synthesis on the two denormalized residual spectra, emitting
+  interleaved L/R/L/R PCM plus both assembled envelopes. The
+  `StereoCeltDecodeState` now carries a shared `CoarseEnergyState` (both
+  channels' inter-frame coarse-energy prediction); `reset()` zeroes it
+  alongside the per-channel overlap / de-emphasis / post-filter memory. A
+  transient prefix is rejected with `Error::NotImplemented`. The
+  per-channel residual spectra and the main fine-energy corrections are
+  inputs (the §4.3.4.4 `itheta` coupling + the main §4.3.2.2 fine-energy
+  channel interleave are the docs-gap boundaries, mirroring the mono
+  path's `band_k`). +7 tests (548 lib tests total).
+
 * **Round-356 (2026-06-21) — `laplace_constants.csv` binding test
   (`laplace::tests::constants_match_staged_csv`):** pins
   `LAPLACE_LOG_MINP` / `LAPLACE_MINP` / `LAPLACE_NMIN` / the 32768 total

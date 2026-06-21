@@ -45,15 +45,32 @@ spine draws for `band_k`). `tests/stereo_synthesis.rs` drives the whole
 documented per-channel stereo chain (energy → denormalize → synthesize)
 end-to-end.
 
+**Stereo frame decode (bitstream prefix + coarse energy → interleaved
+PCM).** `StereoCeltDecodeState::decode_stereo_frame` is the stereo
+counterpart of `decode_celt_frame`: it decodes the stereo Table 56
+control prefix and **both channels' §4.3.2.1 coarse energy** from the
+range-coded bitstream (the stereo coarse channel interleave *is*
+specified — `decode_coarse_energy` with `channels = 2`), composes each
+channel's §4.3.2 Q8 envelope (bitstream coarse + caller-supplied fine
+corrections), and runs the per-channel §4.3.6 → §4.3.7 synthesis on the
+two denormalized residual spectra to emit interleaved PCM. The shared
+`CoarseEnergyState` carries both channels' inter-frame coarse-energy
+prediction; `reset()` zeroes it alongside the per-channel overlap /
+de-emphasis / post-filter memory. The per-channel residual spectra and
+the main fine-energy corrections are inputs — the §4.3.4.4 `itheta`
+coupling and the main §4.3.2.2 fine-energy channel interleave are the
+docs-gap boundaries, the same shape the mono path keeps for `band_k`.
+
 Not yet implemented: the §4.3.3 reallocation loop that produces
 `band_k` / `fine_bits` (concurrent skip decoding + fine/shape split),
 the §4.3.4.4 split-gain band-split path, the §4.3.4.4 stereo `itheta`
-mid/side bitstream coupling, the transient short-block time-domain
-reassembly (§4.3.1 / §4.3.7), and the §4.3.5 anti-collapse injection —
-each blocked on detail that RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.1 /
-§4.3.7 / §4.3.5 and the clean-room narrative §2.7 defer to the
-reference implementation. `decode_celt_frame` rejects a transient or
-stereo frame with `Error::NotImplemented` rather than mis-decode it.
+mid/side bitstream coupling, the main §4.3.2.2 fine-energy per-channel
+interleave, the transient short-block time-domain reassembly
+(§4.3.1 / §4.3.7), and the §4.3.5 anti-collapse injection — each blocked
+on detail that RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.1 / §4.3.7 / §4.3.5 and
+the clean-room narrative §2.7 defer to the reference implementation.
+Both `decode_celt_frame` and `decode_stereo_frame` reject a transient
+frame with `Error::NotImplemented` rather than mis-decode it.
 
 **Encode building blocks, in progress.** The first encode-direction
 primitives are in place: the §4.3.4.2 PVQ codeword index encode
