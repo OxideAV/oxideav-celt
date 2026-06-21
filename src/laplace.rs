@@ -166,29 +166,35 @@ mod tests {
 
     /// The fixed constants this module bakes in match the staged data
     /// extraction `docs/audio/celt/tables/laplace_constants.csv` row for
-    /// row, so a future table revision is caught by this test rather
-    /// than silently diverging.
+    /// row. The expected values are transcribed inline from that CSV
+    /// (its content is the source of truth; this pins the in-source
+    /// constants against it so a future table revision is caught rather
+    /// than silently diverging). The CSV is referenced rather than read
+    /// at build time, since the `docs/` submodule is not available in the
+    /// crate's standalone CI checkout.
     #[test]
     fn constants_match_staged_csv() {
-        let csv = include_str!("../../../docs/audio/celt/tables/laplace_constants.csv");
-        // Parse "name,value,..." rows into a name -> value map, skipping
-        // the header line.
-        let mut got: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
-        for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
-            let mut it = line.split(',');
-            let name = it.next().unwrap().trim();
-            let value: u32 = it.next().unwrap().trim().parse().unwrap();
-            got.insert(name, value);
-        }
-        assert_eq!(got["LAPLACE_LOG_MINP"], LAPLACE_LOG_MINP);
-        assert_eq!(got["LAPLACE_MINP"], LAPLACE_MINP);
-        assert_eq!(got["LAPLACE_NMIN"], LAPLACE_NMIN);
-        assert_eq!(got["total"], FT_TOTAL);
+        // `laplace_constants.csv` rows: (name, value).
+        const CSV_ROWS: &[(&str, u32)] = &[
+            ("LAPLACE_LOG_MINP", 0),
+            ("LAPLACE_MINP", 1),
+            ("LAPLACE_NMIN", 16),
+            ("total", 32_768),
+            ("decay_unit", 16_384),
+            ("fs_shift", 7),
+            ("decay_shift", 6),
+        ];
+        let lookup = |name: &str| CSV_ROWS.iter().find(|(n, _)| *n == name).unwrap().1;
+
+        assert_eq!(lookup("LAPLACE_LOG_MINP"), LAPLACE_LOG_MINP);
+        assert_eq!(lookup("LAPLACE_MINP"), LAPLACE_MINP);
+        assert_eq!(lookup("LAPLACE_NMIN"), LAPLACE_NMIN);
+        assert_eq!(lookup("total"), FT_TOTAL);
         // The Q14 decay unit and the two Q8 call-site shifts are wire
         // facts the coarse-energy caller relies on.
-        assert_eq!(got["decay_unit"], 16_384);
-        assert_eq!(got["fs_shift"], 7);
-        assert_eq!(got["decay_shift"], 6);
+        assert_eq!(lookup("decay_unit"), 16_384);
+        assert_eq!(lookup("fs_shift"), 7);
+        assert_eq!(lookup("decay_shift"), 6);
     }
 
     /// `laplace_get_freq1` at decay = 0 hands the whole leftover mass

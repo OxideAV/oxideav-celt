@@ -58,8 +58,9 @@ All notable changes to `oxideav-celt` are recorded here.
   (`laplace::tests::constants_match_staged_csv`):** pins
   `LAPLACE_LOG_MINP` / `LAPLACE_MINP` / `LAPLACE_NMIN` / the 32768 total
   / the Q14 decay unit / the two Q8→Q15/Q14 call-site shifts against the
-  staged data extraction row for row, so a future table revision is
-  caught rather than silently diverging. +1 test.
+  staged data extraction row for row (transcribed inline; the `docs/`
+  submodule is not in the crate's standalone CI checkout), so a future
+  table revision is caught rather than silently diverging. +1 test.
 
 * **Round-354 (2026-06-21) — PVQ encode→decode round-trip integration
   test (`tests/pvq_encode_roundtrip.rs`):** a cross-module test driving
