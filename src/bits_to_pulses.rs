@@ -272,7 +272,7 @@ impl BalanceAccumulator {
     /// case, `2` for the second-to-last band, `1` for the last band.
     /// The adjustment is `target + balance / divisor` with
     /// round-toward-zero integer division (the natural Rust `/`
-    /// semantics for `i32`, matching the C reference convention the
+    /// semantics for `i32`, matching the rounding convention the
     /// RFC §4 sec 2 paragraph 2 implies for "1/8 bits"-scale integer
     /// arithmetic).
     ///

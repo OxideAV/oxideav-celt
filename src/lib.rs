@@ -43,7 +43,7 @@
 //! `NotImplemented`. The §4.3.5 anti-collapse injection stays a
 //! documented docs gap (the RFC describes the intent but defers the
 //! collapse-detection threshold + pseudo-random generator + injection
-//! magnitude to `bands.c`); it does not block the non-transient path,
+//! magnitude to its own reference code); it does not block the non-transient path,
 //! where the anti-collapse bit is not decoded.
 //!
 //! **Status (2026-06-18):** round-336. The §4.3.6 → §4.3.7 long-MDCT
