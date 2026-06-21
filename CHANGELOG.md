@@ -4,7 +4,33 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+* **Round-356 (2026-06-21) — Laplace / coarse-energy provenance
+  re-anchored to clean-room narrative:** the §4.3.2.1 `ec_laplace_decode`
+  interval-narrowing recurrence and its fixed constants are now sourced
+  from the staged clean-room narrative
+  `docs/audio/celt/spec/celt-laplace-decode.md` (which recovers the
+  range-coder interval narrowing as wire-format facts) and the data
+  extraction `docs/audio/celt/tables/laplace_constants.csv`, rather than
+  the RFC's Appendix A reference implementation (the C source extractable
+  per §A.1, which the workspace clean-room policy bars). The same
+  re-anchoring is applied to the `coarse_energy`, `e_prob_model`,
+  `range_decoder`, and crate-level provenance notes: numeric prediction
+  coefficients (`pred_coef` / `beta_coef` / `small_energy_icdf`) are
+  cited as Q15 data, and the `ec_laplace_decode` / `unquant_coarse_energy`
+  names are cited as the RFC §4.3.2.1 prose names (not as Appendix A
+  source listings). No code behaviour changes; this corrects citations
+  that read as reference-source derivation.
+
 ### Added
+
+* **Round-356 (2026-06-21) — `laplace_constants.csv` binding test
+  (`laplace::tests::constants_match_staged_csv`):** pins
+  `LAPLACE_LOG_MINP` / `LAPLACE_MINP` / `LAPLACE_NMIN` / the 32768 total
+  / the Q14 decay unit / the two Q8→Q15/Q14 call-site shifts against the
+  staged data extraction row for row, so a future table revision is
+  caught rather than silently diverging. +1 test.
 
 * **Round-354 (2026-06-21) — PVQ encode→decode round-trip integration
   test (`tests/pvq_encode_roundtrip.rs`):** a cross-module test driving

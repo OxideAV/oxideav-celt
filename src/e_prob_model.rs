@@ -21,9 +21,9 @@
 //! does the transcription and provides a typed accessor.
 //!
 //! The Laplace decoder ALGORITHM (`ec_laplace_decode`) is a separate
-//! piece, implemented in [`crate::laplace`] from RFC 6716 Appendix A
-//! `laplace.c` (the reference listing embedded in the RFC's own
-//! text). The [`crate::coarse_energy`] decoder feeds it this table's
+//! piece, implemented in [`crate::laplace`] from the clean-room
+//! narrative `docs/audio/celt/spec/celt-laplace-decode.md`. The
+//! [`crate::coarse_energy`] decoder feeds it this table's
 //! `{prob, decay}` pairs (`prob << 7` to Q15, `decay << 6` to Q14).
 //!
 //! ## Table shape

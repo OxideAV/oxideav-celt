@@ -90,10 +90,11 @@
 //! (silence / post-filter / transient / intra per §4.3, plus the
 //! deferred anti-collapse bit per §4.3.5) is wired up. The §4.3.2.1
 //! coarse-energy decoder is complete: the `ec_laplace_decode`
-//! per-symbol recurrence (transcribed from RFC 6716 Appendix A
-//! `laplace.c` — the reference listing embedded in the RFC's own
-//! text, extracted per §A.1) drives `decode_coarse_energy`, which
-//! runs the Appendix A `unquant_coarse_energy` walk: per-band,
+//! per-symbol recurrence (from the clean-room narrative
+//! `docs/audio/celt/spec/celt-laplace-decode.md`, which recovers the
+//! range-coder interval narrowing as wire-format facts) drives
+//! `decode_coarse_energy`, which runs the §4.3.2.1
+//! `unquant_coarse_energy` walk: per-band,
 //! per-channel Laplace decode against the `E_PROB_MODEL[lm][intra]
 //! [band] -> ProbDecay { prob, decay }` table (4 × 2 × 21 = 168 Q8
 //! pairs from `docs/audio/celt/tables/e_prob_model.csv`), the
@@ -224,16 +225,21 @@
 //!
 //! ## Clean-room provenance
 //!
-//! All routines in this crate are transcribed from RFC 6716 (the IETF
-//! standards-track definition of Opus) and RFC 8251 (the Opus update).
-//! RFC 6716's Appendix A reference listing is embedded in the RFC's
-//! own text (extracted per §A.1, SHA-1-verified) and is part of the
-//! staged spec; routines transcribed from it cite "RFC 6716
-//! Appendix A `<file>`". Any source outside the staged RFC text is
-//! off-limits under the workspace clean-room policy and was not
-//! consulted. Black-box invocations of `opusdec` / `opusenc` are
-//! permitted under the workspace clean-room policy as opaque
-//! validators.
+//! All routines in this crate are derived from the **normative prose**
+//! of RFC 6716 §1–§8 (the IETF standards-track definition of Opus) and
+//! RFC 8251 (the Opus update), together with the project's own
+//! clean-room behavioural-narrative and numeric-table material under
+//! `docs/audio/celt/` (`spec/celt-*.md` narratives; `tables/*.csv`
+//! data extractions with `.meta` provenance). Where the RFC prose
+//! names a function but defers the procedure to its implementation
+//! (e.g. `ec_laplace_decode`, the §4.3.3 reallocation pass, the
+//! transient short-block layout), the procedure is taken from the
+//! clean-room narrative that recovers it as wire-format facts, not from
+//! the reference source. RFC 6716's **Appendix A reference
+//! implementation** (the C source extractable per §A.1) is off-limits
+//! under the workspace clean-room policy and was **not** consulted.
+//! Black-box invocations of `opusdec` / `opusenc` are permitted as
+//! opaque validators.
 
 #![warn(missing_debug_implementations)]
 

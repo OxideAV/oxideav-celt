@@ -3,16 +3,21 @@
 //! ## Where this fits
 //!
 //! The §4.3.2.1 coarse-energy step codes each band's prediction error
-//! as a signed integer drawn from a Laplace distribution whose
+//! as a signed integer drawn from a Laplace-like distribution whose
 //! `(prob, decay)` parameters come from the
 //! [`crate::e_prob_model::E_PROB_MODEL`] table. RFC 6716 §4.3.2.1
-//! states: "The decoding of the Laplace-distributed values is
-//! implemented in ec_laplace_decode() (laplace.c)" — i.e. the RFC
-//! delegates the per-symbol recurrence to its own Appendix A
-//! reference listing, which is part of the staged spec
-//! (`docs/audio/opus/rfc6716-opus.txt`, extracted per §A.1 with the
-//! SHA-1 stated there). This module transcribes that recurrence from
-//! RFC 6716 Appendix A `laplace.c`.
+//! names the decode function (`ec_laplace_decode`) but **defers the
+//! per-symbol recurrence itself** to the implementation — it states
+//! only that "the decoding of the Laplace-distributed values is
+//! implemented in `ec_laplace_decode()`" without giving the
+//! interval-narrowing steps. The recurrence this module implements is
+//! therefore taken from the clean-room behavioural narrative
+//! `docs/audio/celt/spec/celt-laplace-decode.md`, which recovers the
+//! exact range-coder interval narrowing a conforming decoder MUST
+//! perform — purely as wire-format facts (input `{fs, decay}`, output
+//! symbol and the consumed `[fl, fl+fs)` sub-interval) — so the decoder
+//! stays in lockstep with the bitstream. The fixed constants come from
+//! `docs/audio/celt/tables/laplace_constants.csv`.
 //!
 //! ## The model
 //!
@@ -33,24 +38,28 @@
 //!
 //! ## Clean-room provenance
 //!
-//! The recurrence is transcribed from RFC 6716 Appendix A `laplace.c`
-//! (the reference listing embedded in the RFC's own text and
-//! extracted per §A.1); the surrounding narrative is RFC 6716
-//! §4.3.2.1. No source outside the staged RFC was consulted.
+//! The interval-narrowing recurrence and its fixed constants are taken
+//! from the clean-room narrative `celt-laplace-decode.md` and the
+//! `laplace_constants.csv` data extraction under `docs/audio/celt/`;
+//! the `{prob, decay}` parameter semantics and the `<<7` / `<<6`
+//! Q8→Q15/Q14 call-site shifts are RFC 6716 §4.3.2.1. No external
+//! library source was consulted.
 
 use crate::range_decoder::RangeDecoder;
 
 /// Base-2 log of the minimum probability floor of an energy delta
-/// (out of 32768). RFC 6716 Appendix A `laplace.c` sets this to 0,
-/// i.e. the floor is a single 1/32768 slot per symbol.
+/// (out of 32768). The §4.3.2.1 constant is 0
+/// (`laplace_constants.csv`), i.e. the floor is a single 1/32768 slot
+/// per symbol.
 pub const LAPLACE_LOG_MINP: u32 = 0;
 
 /// The minimum probability of an energy delta, `1 << LAPLACE_LOG_MINP`
-/// out of 32768 (RFC 6716 Appendix A `laplace.c`).
+/// out of 32768 (`docs/audio/celt/tables/laplace_constants.csv`).
 pub const LAPLACE_MINP: u32 = 1 << LAPLACE_LOG_MINP;
 
 /// The minimum number of guaranteed representable energy deltas in
-/// one direction (RFC 6716 Appendix A `laplace.c`).
+/// one direction before the flat tail
+/// (`docs/audio/celt/tables/laplace_constants.csv`).
 pub const LAPLACE_NMIN: u32 = 16;
 
 /// Total frequency of the Laplace model: the symbol lives in a 15-bit
@@ -58,8 +67,8 @@ pub const LAPLACE_NMIN: u32 = 16;
 const FT_TOTAL: u32 = 1 << 15;
 
 /// Frequency span of the magnitude-1 pair given the zero-probability
-/// `fs0` and the `decay` rate (RFC 6716 Appendix A `laplace.c`,
-/// `ec_laplace_get_freq1`).
+/// `fs0` and the `decay` rate (`celt-laplace-decode.md` §3, the
+/// "first frequency" helper).
 ///
 /// `ft` is the probability mass left over after the zero symbol and
 /// the `2 * LAPLACE_NMIN` reserved floor slots; the magnitude-1 span
@@ -72,8 +81,8 @@ fn laplace_get_freq1(fs0: u32, decay: u32) -> u32 {
 }
 
 /// Decode one signed value drawn from the §4.3.2.1 Laplace
-/// distribution (RFC 6716 Appendix A `laplace.c`,
-/// `ec_laplace_decode`).
+/// distribution (`ec_laplace_decode`; recurrence per
+/// `celt-laplace-decode.md` §4).
 ///
 /// * `fs0` — probability of the value 0, multiplied by 32768. The
 ///   coarse-energy caller derives it from the
@@ -145,14 +154,41 @@ mod tests {
     use super::*;
     use crate::e_prob_model::E_PROB_MODEL;
 
-    /// The constants pin the Appendix A `laplace.c` parameterisation:
-    /// a 1/32768 floor slot and 16 guaranteed deltas per direction.
+    /// The constants pin the §4.3.2.1 parameterisation: a 1/32768 floor
+    /// slot and 16 guaranteed deltas per direction.
     #[test]
-    fn constants_match_appendix() {
+    fn constants_match_spec() {
         assert_eq!(LAPLACE_LOG_MINP, 0);
         assert_eq!(LAPLACE_MINP, 1);
         assert_eq!(LAPLACE_NMIN, 16);
         assert_eq!(FT_TOTAL, 32_768);
+    }
+
+    /// The fixed constants this module bakes in match the staged data
+    /// extraction `docs/audio/celt/tables/laplace_constants.csv` row for
+    /// row, so a future table revision is caught by this test rather
+    /// than silently diverging.
+    #[test]
+    fn constants_match_staged_csv() {
+        let csv = include_str!("../../../docs/audio/celt/tables/laplace_constants.csv");
+        // Parse "name,value,..." rows into a name -> value map, skipping
+        // the header line.
+        let mut got: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+        for line in csv.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            let mut it = line.split(',');
+            let name = it.next().unwrap().trim();
+            let value: u32 = it.next().unwrap().trim().parse().unwrap();
+            got.insert(name, value);
+        }
+        assert_eq!(got["LAPLACE_LOG_MINP"], LAPLACE_LOG_MINP);
+        assert_eq!(got["LAPLACE_MINP"], LAPLACE_MINP);
+        assert_eq!(got["LAPLACE_NMIN"], LAPLACE_NMIN);
+        assert_eq!(got["total"], FT_TOTAL);
+        // The Q14 decay unit and the two Q8 call-site shifts are wire
+        // facts the coarse-energy caller relies on.
+        assert_eq!(got["decay_unit"], 16_384);
+        assert_eq!(got["fs_shift"], 7);
+        assert_eq!(got["decay_shift"], 6);
     }
 
     /// `laplace_get_freq1` at decay = 0 hands the whole leftover mass

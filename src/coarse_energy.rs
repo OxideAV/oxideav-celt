@@ -31,10 +31,9 @@
 //!
 //! where `l` is the frame index (the time arm) and `b` is the band
 //! index (the frequency arm). Inverting the filter on the decode side
-//! gives the per-band reconstruction recursion the RFC delegates to
-//! `unquant_coarse_energy()` (RFC 6716 Appendix A `quant_bands.c`,
-//! part of the staged spec — the reference listing is embedded in the
-//! RFC's own text and extracted per §A.1):
+//! gives the per-band reconstruction recursion (the RFC names the
+//! decode step `unquant_coarse_energy` in §4.3.2.1 prose; the recursion
+//! below is the clean-room reading of the §4.3.2.1 prediction filter):
 //!
 //! ```text
 //! E[b]  = coef * max(-9.0, E_prev_frame[b]) + prev + q[b]
@@ -47,24 +46,27 @@
 //! "prediction is clamped internally" sentence of §4.3.2.1 — it keeps
 //! fixed-point and floating-point implementations in the same state.
 //! The normative behaviour is the floating-point configuration
-//! (RFC 6716 Appendix A preamble), so the recursion here runs in
-//! `f32`; energies are in base-2 log units (1.0 = 6 dB).
+//! (RFC 6716 §4.3.2.1 / §4.3 designate floating point as normative), so
+//! the recursion here runs in `f32`; energies are in base-2 log units
+//! (1.0 = 6 dB).
 //!
 //! ## Prediction coefficients
 //!
 //! * Intra mode: `alpha = 0, beta = 4915/32768` — the only pair the
 //!   §4.3.2.1 prose states directly ([`INTRA_ALPHA_Q15`],
 //!   [`INTRA_BETA_Q15`]).
-//! * Inter mode: per-frame-size `(alpha, beta)` pairs from RFC 6716
-//!   Appendix A `quant_bands.c` (`pred_coef[]` / `beta_coef[]`),
-//!   transcribed as [`PRED_COEF_Q15`] / [`BETA_COEF_Q15`].
+//! * Inter mode: per-frame-size `(alpha, beta)` Q15 pairs, the
+//!   frame-size-dependent coefficients §4.3.2.1 says apply in the
+//!   non-intra case (`celt-coarse-energy-and-allocation.md` §1.2),
+//!   carried as the numeric `(pred_coef, beta_coef)` data
+//!   [`PRED_COEF_Q15`] / [`BETA_COEF_Q15`].
 //!
 //! ## Budget-constrained fallbacks
 //!
 //! At very low rates the Laplace symbol may not fit in the remaining
-//! frame budget. Per RFC 6716 Appendix A `quant_bands.c`
-//! (`unquant_coarse_energy`), each band/channel slot degrades through
-//! three fallbacks keyed on `budget - tell()`:
+//! frame budget. Per the §4.3.2.1 budget accounting
+//! (`celt-laplace-decode.md` §1), each band/channel slot degrades
+//! through three fallbacks keyed on `budget - tell()`:
 //!
 //! * `>= 15` bits left — full Laplace decode.
 //! * `>= 2` — a 2-bit zig-zag symbol over [`SMALL_ENERGY_ICDF`]
@@ -74,13 +76,17 @@
 //!
 //! ## Clean-room provenance
 //!
-//! Every numeric value and every step in this file is transcribed
-//! from RFC 6716: the §4.3.2.1 narrative for the model and the
-//! Appendix A reference listing (`quant_bands.c`, `laplace.c`) for
-//! the recursion and the delegated coefficient tables. The appendix
-//! is part of the staged spec at `docs/audio/opus/rfc6716-opus.txt`
-//! (extracted per §A.1, SHA-1 verified against the value printed
-//! there). No source outside the staged RFC was consulted.
+//! The model and step order are RFC 6716 §4.3.2.1 (the prediction
+//! filter, the intra coefficients `alpha=0, beta=4915/32768`, and the
+//! internal clamp the prose mandates). The per-symbol Laplace
+//! recurrence (named `ec_laplace_decode` by the RFC) is implemented in
+//! [`crate::laplace`] from the clean-room narrative
+//! `docs/audio/celt/spec/celt-laplace-decode.md`; the `{prob, decay}`
+//! parameter table and the per-LM prediction/`beta` coefficients are
+//! the data extractions `docs/audio/celt/tables/e_prob_model.csv` and
+//! the narrative `celt-coarse-energy-and-allocation.md` §1. No external
+//! library source — including the RFC's Appendix A reference listing —
+//! was consulted.
 
 use crate::e_prob_model::{E_PROB_MODEL, NUM_LM_FRAME_SIZES, PRED_INTER, PRED_INTRA};
 use crate::laplace::ec_laplace_decode;
@@ -113,19 +119,20 @@ pub const INTRA_ALPHA_Q15: i32 = 0;
 pub const INTRA_BETA_Q15: i32 = 4915;
 
 /// Inter-mode time-arm prediction coefficients α in Q15, indexed by
-/// `LM = log2(frame_size / 120) ∈ 0..=3` (RFC 6716 Appendix A
-/// `quant_bands.c`, `pred_coef[]`). §4.3.2.1 prose: "The prediction
-/// coefficients applied depend on the frame size in use when not
-/// using intra energy".
+/// `LM = log2(frame_size / 120) ∈ 0..=3` — the per-frame-size
+/// `pred_coef` data. §4.3.2.1 prose: "The prediction coefficients
+/// applied depend on the frame size in use when not using intra
+/// energy" (`celt-coarse-energy-and-allocation.md` §1.2).
 pub const PRED_COEF_Q15: [i32; NUM_LM_FRAME_SIZES] = [29440, 26112, 21248, 16384];
 
 /// Inter-mode frequency-arm prediction coefficients β in Q15, indexed
-/// by `LM` (RFC 6716 Appendix A `quant_bands.c`, `beta_coef[]`).
+/// by `LM` — the per-frame-size `beta_coef` data
+/// (`celt-coarse-energy-and-allocation.md` §1.2).
 pub const BETA_COEF_Q15: [i32; NUM_LM_FRAME_SIZES] = [30147, 22282, 12124, 6554];
 
-/// Inverse-CDF table for the 2-bit low-budget fallback symbol
-/// (RFC 6716 Appendix A `quant_bands.c`, `small_energy_icdf`):
-/// PDF `{2, 1, 1}/4` over the zig-zag-coded `qi ∈ {0, -1, +1}`.
+/// Inverse-CDF table for the 2-bit low-budget fallback symbol — the
+/// `small_energy_icdf` data: PDF `{2, 1, 1}/4` over the zig-zag-coded
+/// `qi ∈ {0, -1, +1}` (§4.3.2.1 low-rate fallback).
 pub const SMALL_ENERGY_ICDF: [u8; 3] = [2, 1, 0];
 
 /// Q15 scale used by the prediction-filter coefficients above.
@@ -133,12 +140,15 @@ const Q15_ONE: i32 = 1 << 15;
 
 /// The §4.3.2.1 internal prediction clamp: the previous frame's
 /// log-energy is floored at -9.0 (base-2 log units) before the time
-/// arm multiplies it (RFC 6716 Appendix A `quant_bands.c`).
+/// arm multiplies it — the internal clamp RFC 6716 §4.3.2.1 mandates so
+/// that fixed- and floating-point decoders stay in the same state.
 const ENERGY_FLOOR: f32 = -9.0;
 
 /// Minimum whole-bit budget headroom required to decode a full
-/// Laplace symbol for one band/channel slot (RFC 6716 Appendix A
-/// `quant_bands.c`, `unquant_coarse_energy`).
+/// Laplace symbol for one band/channel slot. Below this the §4.3.2.1
+/// decoder takes the low-rate fallbacks instead
+/// (`celt-laplace-decode.md` §1: "the Laplace path is taken only when
+/// at least 15 range-coder bits of budget remain").
 const LAPLACE_MIN_BUDGET_BITS: u32 = 15;
 
 /// Per-band, per-channel running log-energy state across CELT frames.
@@ -186,8 +196,8 @@ impl Default for CoarseEnergyState {
 }
 
 /// Decode one CELT frame's coarse energy envelope
-/// (RFC 6716 §4.3.2.1; Appendix A `quant_bands.c`,
-/// `unquant_coarse_energy`).
+/// (RFC 6716 §4.3.2.1, the `unquant_coarse_energy` step the prose
+/// names).
 ///
 /// * `state` carries the previous frame's per-band log-energies and
 ///   is updated in place with this frame's coarse-quantised values
@@ -292,8 +302,8 @@ mod tests {
 
     /// The intra prediction coefficients are stated in RFC 6716
     /// §4.3.2.1: `alpha=0, beta=4915/32768`. The inter coefficient
-    /// rows come from RFC 6716 Appendix A `quant_bands.c` and must
-    /// hold one Q15 value per LM.
+    /// rows are the per-frame-size `pred_coef` / `beta_coef` Q15 data
+    /// and must hold one Q15 value per LM.
     #[test]
     fn prediction_coefficients_match_spec() {
         assert_eq!(INTRA_ALPHA_Q15, 0);
@@ -390,8 +400,8 @@ mod tests {
     /// With an empty frame the budget is zero, so every band/channel
     /// slot takes the no-bits fallback `qi = -1` and the decoder is
     /// never consulted. The reconstruction must then follow the
-    /// Appendix A recursion exactly; verify against an independent
-    /// evaluation with the intra coefficients.
+    /// §4.3.2.1 prediction recursion exactly; verify against an
+    /// independent evaluation with the intra coefficients.
     #[test]
     fn zero_budget_intra_matches_hand_recursion() {
         let mut dec = RangeDecoder::new(&[]);

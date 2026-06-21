@@ -108,8 +108,8 @@ impl<'a> RangeDecoder<'a> {
     ///
     /// RFC 6716 §4.3.2.1's budget-constrained coarse-energy decode
     /// compares the running `ec_tell()` against the total number of
-    /// bits in the frame (`storage * 8` in the Appendix A phrasing);
-    /// this accessor exposes that total.
+    /// bits in the frame (`8 *` the byte length the decoder was
+    /// initialized over); this accessor exposes that total.
     pub fn storage_bits(&self) -> u32 {
         (self.buf.len() as u32).saturating_mul(8)
     }
