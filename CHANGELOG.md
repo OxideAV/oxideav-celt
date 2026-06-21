@@ -25,6 +25,16 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-356 (2026-06-21) — stereo frame-decode integration test
+  (`tests/stereo_decode.rs`):** drives `decode_stereo_frame` from raw
+  bitstream bytes + per-channel denormalized residual spectra through the
+  public API and confirms it is a faithful composition: (1) the
+  bitstream-decoded coarse energy for both channels equals a standalone
+  stereo `decode_frame_prefix` of the same bytes, (2) the interleaved PCM
+  equals the manual `prefix → per-channel synthesis → de-emphasis`
+  composition, (3) the shared coarse-energy prediction carries across
+  frames, and a Hybrid-mode (17..=21) stereo window decodes. +4 tests.
+
 * **Round-356 (2026-06-21) — stereo frame-decode driver
   (`StereoCeltDecodeState::decode_stereo_frame` + `StereoDecodedFrame`):**
   the stereo counterpart of `decode_celt_frame`. It decodes the stereo
