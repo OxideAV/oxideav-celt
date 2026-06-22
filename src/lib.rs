@@ -279,6 +279,7 @@ pub mod bits_to_pulses;
 pub mod coarse_energy;
 pub mod deemphasis;
 pub mod denormalization;
+pub mod derive_pulses;
 pub mod e_prob_model;
 pub mod fine_energy;
 pub mod frame_decode;
@@ -340,6 +341,7 @@ pub use denormalization::{
     denormalize_bands_in_place_f32, log_energy_q8_to_amplitude_f32, scale_band_f32,
     scale_band_in_place_f32, Q8_DENOM, SQRT_Q8_DENOM,
 };
+pub use derive_pulses::{decode_celt_frame_auto, derive_band_pulses};
 pub use e_prob_model::{
     prob_decay, ProbDecay, E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER,
     PRED_INTRA,

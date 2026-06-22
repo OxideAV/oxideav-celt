@@ -4,6 +4,36 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-360 (2026-06-22) — caller-input-free mono decode
+  (`derive_band_pulses` + `decode_celt_frame_auto`):** the documented
+  §4.3.3 → §4.3.4.1 allocation→pulses seam is now a public API (module
+  `derive_pulses`), promoted from the `tests/allocation_to_pulses.rs`
+  composition. `derive_band_pulses(prefix, lm, channels, stereo)` runs
+  the §4.3.3 combined column search (`find_combined_alloc`) over a
+  decoded `FramePrefix`'s post-boost budget, then the §4.3.4.1
+  bits-to-pulses loop (`bits_to_pulses_band_loop_cached`, threading the
+  balance accumulator across the coded-band window in spec order), and
+  returns one per-band pulse count `K` — each clamped to the largest
+  value whose PVQ codebook `V(N, K)` is representable in the documented
+  single-block decode (a larger `K` is the deferred §4.3.4.4 split
+  regime). `decode_celt_frame_auto(state, frame_bytes, start, end)`
+  chains it end-to-end: decode the Table 56 prefix, derive the pulse
+  counts, and run `decode_celt_frame` with no fine refinement — a mono,
+  non-transient CELT frame → PCM with **no caller-supplied `band_k` /
+  `fine_bits`**. It treats the whole combined allocation as shape (the
+  maximal documented approximation given the RFC-deferred fine/shape
+  split); a transient frame, an out-of-range window, or a band hitting
+  the §4.3.4.4 split gap is surfaced as `Error::NotImplemented` /
+  `InvalidParameter`, never mis-decoded. The derivation is deterministic
+  and matches the manual `decode_frame_prefix` → `derive_band_pulses` →
+  `decode_celt_frame` compose exactly. +8 tests (556 lib tests total).
+  Provenance: RFC 6716 §4.3.3 (allocation search, lines 6111–6229) →
+  §4.3.4.1 (bits-to-pulses + balance, lines 6476–6492); every step
+  delegates to an existing RFC-grounded module. No external library
+  source consulted.
+
 ### Changed
 
 * **Round-356 (2026-06-21) — Laplace / coarse-energy provenance

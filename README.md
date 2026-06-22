@@ -95,6 +95,28 @@ total pulse count monotone in the frame budget — demonstrating the
 documented modules wherever §4.3.3 is not deferred. Only the fine/shape
 split + concurrent-skip reallocation remains a genuine docs gap.
 
+**Caller-input-free mono decode (`decode_celt_frame_auto`).** The
+documented allocation→pulses seam is now a public API, not just a test
+composition. `derive_band_pulses(prefix, lm, channels, stereo)` runs the
+§4.3.3 column search over a decoded `FramePrefix`'s post-boost budget,
+then the §4.3.4.1 bits-to-pulses loop (threading the balance accumulator
+across the coded-band window in spec order), and returns the per-band
+pulse counts — clamping each `K` to the largest value whose PVQ codebook
+`V(N, K)` stays representable in the single-block decode (a larger `K` is
+the deferred §4.3.4.4 split regime). `decode_celt_frame_auto(state,
+frame_bytes, start, end)` chains the whole thing: decode the prefix,
+derive the pulse counts, and run `decode_celt_frame` with no fine
+refinement — a mono, non-transient CELT frame → PCM with **no
+caller-supplied `band_k` / `fine_bits`**. It is the deepest
+caller-input-free decode the wall permits: every step is RFC-specified
+except the deferred fine/shape split, approximated by treating the whole
+combined allocation as shape. A transient frame, an out-of-range window,
+or a band that hits the §4.3.4.4 split gap is surfaced as
+`Error::NotImplemented` / `InvalidParameter`, never mis-decoded. The
+derivation is deterministic (identical bytes → identical pulse counts →
+identical PCM) and matches the manual `decode_frame_prefix` →
+`derive_band_pulses` → `decode_celt_frame` compose exactly.
+
 The module-by-module API surface is documented below.
 
 Range decoder (RFC 6716 §4.1):
