@@ -122,7 +122,7 @@ use crate::deemphasis::Deemphasis;
 use crate::fine_energy::decode_fine_energy;
 use crate::frame_decode::{decode_frame_prefix, FramePrefix};
 use crate::post_filter::{
-    apply_post_filter_f32, apply_post_filter_transition_f32, PostFilterParams as PfTransitionParams,
+    apply_post_filter_transition_f32, PostFilterParams as PfTransitionParams,
 };
 use crate::range_decoder::RangeDecoder;
 use crate::residual::decode_residual_bands;
@@ -424,6 +424,12 @@ pub struct StereoCeltDecodeState {
     deemph: [Deemphasis; 2],
     /// Per-channel previous-frame post-filtered (pre-de-emphasis) output.
     post_filter_history: [Vec<f32>; 2],
+    /// Per-channel previous-frame §4.3.7.1 post-filter parameters, the
+    /// transition-crossfade predecessor (the same role as the mono
+    /// [`CeltDecodeState::prev_post_filter`]).
+    /// [`crate::post_filter::PostFilterParams::OFF`] on a fresh / reset
+    /// state.
+    prev_post_filter: [PfTransitionParams; 2],
 }
 
 /// Per-channel §4.3.7.1 post-filter parameters for a stereo synthesis
@@ -457,6 +463,7 @@ impl StereoCeltDecodeState {
             synth,
             deemph: [Deemphasis::new(), Deemphasis::new()],
             post_filter_history: [vec![0.0; frame_size], vec![0.0; frame_size]],
+            prev_post_filter: [PfTransitionParams::OFF; 2],
         })
     }
 
@@ -492,6 +499,7 @@ impl StereoCeltDecodeState {
         for h in &mut self.post_filter_history {
             h.iter_mut().for_each(|s| *s = 0.0);
         }
+        self.prev_post_filter = [PfTransitionParams::OFF; 2];
     }
 
     /// Decode one **stereo**, non-transient CELT frame to interleaved
@@ -632,9 +640,13 @@ impl StereoCeltDecodeState {
     ///   the same `Option` because CELT codes a single post-filter.
     ///
     /// Each channel is placed, transformed (§4.3.7 IMDCT + WOLA against
-    /// its own overlap tail), post-filtered against its own cross-frame
-    /// history, and de-emphasized with its own filter memory, then the two
-    /// channels are interleaved.
+    /// its own overlap tail), post-filtered with the §4.3.7.1
+    /// squared-window gain-transition crossfade against its own
+    /// previous-frame parameters (carried in the state), and de-emphasized
+    /// with its own filter memory, then the two channels are interleaved.
+    /// The crossfade reduces to the steady-state filter when the
+    /// parameters did not change (and to passthrough when both this and
+    /// the previous frame had the post-filter off).
     ///
     /// Returns [`Error::InvalidParameter`] when either residual length or
     /// the window is inconsistent. The carried state is advanced only on
@@ -665,18 +677,34 @@ impl StereoCeltDecodeState {
             chans[1][i] = interleaved[2 * i + 1];
         }
 
-        for ((chan, history), deemph) in chans
+        // This frame's post-filter parameters in the transition-crossfade
+        // form (`None` ⇒ OFF), shared by both channels because CELT codes
+        // a single post-filter.
+        let cur_pf = match post_filter {
+            Some(pf) => PfTransitionParams {
+                enabled: true,
+                period: pf.period,
+                gain_index: pf.gain,
+                tapset: pf.tapset,
+            },
+            None => PfTransitionParams::OFF,
+        };
+
+        for (((chan, history), deemph), prev) in chans
             .iter_mut()
             .zip(self.post_filter_history.iter_mut())
             .zip(self.deemph.iter_mut())
+            .zip(self.prev_post_filter.iter_mut())
         {
-            // §4.3.7.1 post-filter against this channel's history.
-            if let Some(pf) = post_filter {
-                apply_post_filter_f32(chan, history, pf.period, pf.gain, pf.tapset);
-            }
-            // Save this frame's post-filtered (pre-de-emphasis) output as
-            // the next frame's post-filter history.
+            // §4.3.7.1 post-filter with the squared-window gain-transition
+            // crossfade against this channel's previous-frame parameters
+            // (reduces to the steady-state filter when unchanged, and to
+            // passthrough when both frames had the post-filter off).
+            apply_post_filter_transition_f32(chan, history, *prev, cur_pf, CELT_OVERLAP);
+            // Save this frame's post-filtered (pre-de-emphasis) output and
+            // parameters as the next frame's transition predecessor.
             history.copy_from_slice(chan);
+            *prev = cur_pf;
             // §4.3.7.2 de-emphasis, carrying this channel's filter memory.
             deemph.apply_in_place(chan);
         }

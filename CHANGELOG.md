@@ -28,14 +28,18 @@ All notable changes to `oxideav-celt` are recorded here.
   output history. This advances the long-MDCT decode toward
   sample-correct output whenever the post-filter gain/period/tapset
   changes between frames — previously each frame applied a single
-  parameter set with a hard switch at the frame boundary. +7 tests (570
+  parameter set with a hard switch at the frame boundary. +7 tests (563
   lib tests total). Provenance: RFC 6716 §4.3.7.1 (post-filter +
   transition prose, lines 6756–6793) and §4.3.7 (window construction,
   lines 6738–6754). Window-orientation / region-length is a documented
   decoder decision (the only assignment under which `prev == cur`
   reduces to steady-state); whether the reference additionally
   interpolates the *period* `T` within the region is noted as a residual
-  §4.3.7.1 docs question. No external library source consulted.
+  §4.3.7.1 docs question. The **stereo** synthesis path
+  (`StereoCeltDecodeState::synthesize_stereo_frame` /
+  `decode_stereo_frame`) carries per-channel previous-frame
+  `PostFilterParams` and applies the same transition crossfade per
+  channel. No external library source consulted.
 
 * **Round-360 (2026-06-22) — caller-input-free mono decode
   (`derive_band_pulses` + `decode_celt_frame_auto`):** the documented

@@ -36,8 +36,9 @@ overlap-add are per-channel and fully specified by RFC 6716, as is the
 already accepts channel `0`/`1`). `StereoLongMdctSynthesis` and the
 streaming `StereoCeltDecodeState` / `synthesize_stereo_frame` run that
 per-channel chain for two channels — two independent IMDCT + WOLA spines
-with their own overlap tails, per-channel §4.3.7.1 post-filter history,
-and per-channel §4.3.7.2 de-emphasis memory — and interleave the result
+with their own overlap tails, per-channel §4.3.7.1 post-filter history
+plus previous-frame parameters (for the §4.3.7.1 gain-transition
+crossfade), and per-channel §4.3.7.2 de-emphasis memory — and interleave the result
 into one L/R/L/R PCM buffer. They take the two channels' decoded
 denormalized spectra as input, drawing the boundary at the §4.3.4.4
 `itheta` mid/side coupling docs gap (the same input-boundary the mono
