@@ -475,6 +475,30 @@ Post-filter (RFC 6716 §4.3.7.1):
 * `apply_post_filter_f32(out, prev_output, period, gain_index, tapset)`
   — in-place slice variant. `prev_output` carries the most-recent
   filtered samples across frame boundaries.
+* `PostFilterParams { enabled, period, gain_index, tapset }` +
+  `PostFilterParams::OFF` package one frame's §4.3.7.1 parameters (gain
+  index `0` is *not* "off" — the `G = 3*(gain+1)/32` formula has no
+  zero — so the disabled state is carried explicitly).
+* `apply_post_filter_transition_f32(out, prev_output, prev, cur, overlap)`
+  — the §4.3.7.1 cross-frame **gain-transition crossfade**. RFC 6716
+  §4.3.7.1: "During a transition between different gains, a smooth
+  transition is calculated using the square of the MDCT window. It is
+  important that values of y(n) be interpolated one at a time such that
+  the past value of y(n) used is interpolated." The old (`prev`) and new
+  (`cur`) filter lobes are blended `(1 - w²)` / `w²` over the first
+  `overlap` samples using the squared §4.3.7 synthesis window
+  (`mdct::celt_window_f32`); both lobes read the single already-blended
+  past output `y`, so the recursion is interpolated one sample at a
+  time. `prev == cur` reduces algebraically to a steady-state
+  `apply_post_filter_f32` pass and `OFF→OFF` to passthrough, so
+  `decode_celt_frame` routes every mono frame through it
+  unconditionally. The transition region length (`= CELT_OVERLAP`) and
+  the rising-half window orientation are a documented decoder decision —
+  the only assignment under which the unchanged-parameter case stays
+  steady-state. Whether the reference additionally interpolates the
+  *period* `T` within the region (rather than switching it at the region
+  start) is a residual §4.3.7.1 docs question; this implementation
+  switches `T` at sample 0 and crossfades only the lobe magnitude.
 * `POST_FILTER_PERIOD_MIN = 15`, `POST_FILTER_PERIOD_MAX = 1022`
   pin the §4.3.7.1 "bounded between 15 and 1022, inclusively"
   prose.
@@ -1031,9 +1055,12 @@ End-to-end frame decode → PCM (RFC 6716 §4.3, Table 56 → §4.3.7):
   prefix) → `decode_fine_energy` (§4.3.2.2) → `assemble_band_log_energy_q8`
   (§4.3.2 envelope, sliced to the coded window) → `decode_residual_bands`
   (§4.3.4 shape) → `LongMdctSynthesis::synthesize` (§4.3.6/§4.3.7) →
-  `apply_post_filter_f32` (§4.3.7.1, when the prefix signalled one) →
+  `apply_post_filter_transition_f32` (§4.3.7.1, with the squared-window
+  gain-transition crossfade against the previous frame's parameters) →
   `Deemphasis::apply_in_place` (§4.3.7.2), returning the `120 << lm`
-  PCM samples plus the decoded `FramePrefix`.
+  PCM samples plus the decoded `FramePrefix`. The streaming
+  `CeltDecodeState` carries the previous frame's `PostFilterParams` (for
+  the §4.3.7.1 transition) alongside the post-filter output history.
 * `CeltDecodeState::new(lm) -> Option<Self>` builds the streaming state
   for a fixed frame-size shift; it carries the §4.3.2.1 coarse-energy
   prediction, the §4.3.7 synthesis overlap tail, the §4.3.7.1

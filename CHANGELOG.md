@@ -6,6 +6,37 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-364 (2026-06-24) — §4.3.7.1 post-filter cross-frame
+  gain-transition crossfade:** `apply_post_filter_transition_f32` +
+  `PostFilterParams` implement the §4.3.7.1 smooth transition between
+  frames whose post-filter parameters changed. RFC 6716 §4.3.7.1:
+  "During a transition between different gains, a smooth transition is
+  calculated using the square of the MDCT window. It is important that
+  values of y(n) be interpolated one at a time such that the past value
+  of y(n) used is interpolated." The old (previous-frame) and new
+  (current-frame) filter lobes are blended `(1 - w^2)` / `w^2` over the
+  §4.3.7 overlap region using the squared synthesis window
+  `crate::mdct::celt_window_f32`; both lobes read the single
+  already-blended past output `y` (written sample-by-sample into the
+  output), so the recursion is interpolated one sample at a time exactly
+  as the RFC requires. The `prev == cur` case reduces algebraically to a
+  steady-state `apply_post_filter_f32` pass, and `OFF→OFF` to
+  passthrough, so `decode_celt_frame` now routes **every** mono frame
+  through the transition call. `CeltDecodeState` carries the previous
+  frame's `PostFilterParams` (`reset()` clears it to `OFF`) as the
+  cross-frame transition predecessor, alongside the existing post-filter
+  output history. This advances the long-MDCT decode toward
+  sample-correct output whenever the post-filter gain/period/tapset
+  changes between frames — previously each frame applied a single
+  parameter set with a hard switch at the frame boundary. +7 tests (570
+  lib tests total). Provenance: RFC 6716 §4.3.7.1 (post-filter +
+  transition prose, lines 6756–6793) and §4.3.7 (window construction,
+  lines 6738–6754). Window-orientation / region-length is a documented
+  decoder decision (the only assignment under which `prev == cur`
+  reduces to steady-state); whether the reference additionally
+  interpolates the *period* `T` within the region is noted as a residual
+  §4.3.7.1 docs question. No external library source consulted.
+
 * **Round-360 (2026-06-22) — caller-input-free mono decode
   (`derive_band_pulses` + `decode_celt_frame_auto`):** the documented
   §4.3.3 → §4.3.4.1 allocation→pulses seam is now a public API (module

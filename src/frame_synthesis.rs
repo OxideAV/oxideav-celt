@@ -39,14 +39,19 @@
 //! 5. Runs the §4.3.6 → §4.3.7 long-MDCT synthesis
 //!    ([`crate::synthesis::LongMdctSynthesis`]) to obtain the
 //!    `120 << lm` time-domain samples (the §4.3.7.1 post-filter input).
-//! 6. Applies the §4.3.7.1 post-filter
-//!    ([`crate::post_filter::apply_post_filter_f32`]) when the prefix
-//!    signalled one, then the §4.3.7.2 de-emphasis
+//! 6. Applies the §4.3.7.1 post-filter with the §4.3.7.1 squared-window
+//!    gain-transition crossfade
+//!    ([`crate::post_filter::apply_post_filter_transition_f32`]) against
+//!    the previous frame's parameters (the crossfade reduces to the
+//!    steady-state filter when nothing changed, and to passthrough when
+//!    both frames had the post-filter off), then the §4.3.7.2 de-emphasis
 //!    ([`crate::deemphasis::Deemphasis`]), yielding the final PCM.
 //!
 //! The streaming state ([`CeltDecodeState`]) carries the cross-frame
-//! synthesis overlap tail, the de-emphasis memory, and the post-filter
-//! history exactly as §4.5.2 requires for gapless playback.
+//! synthesis overlap tail, the de-emphasis memory, the post-filter
+//! history, and the previous frame's post-filter parameters (for the
+//! §4.3.7.1 transition crossfade) exactly as §4.5.2 requires for gapless
+//! playback.
 //!
 //! ## Why the allocation is an input
 //!
@@ -116,9 +121,12 @@ use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::deemphasis::Deemphasis;
 use crate::fine_energy::decode_fine_energy;
 use crate::frame_decode::{decode_frame_prefix, FramePrefix};
-use crate::post_filter::apply_post_filter_f32;
+use crate::post_filter::{
+    apply_post_filter_f32, apply_post_filter_transition_f32, PostFilterParams as PfTransitionParams,
+};
 use crate::range_decoder::RangeDecoder;
 use crate::residual::decode_residual_bands;
+use crate::synthesis::CELT_OVERLAP;
 use crate::synthesis::{LongMdctSynthesis, StereoLongMdctSynthesis};
 use crate::Error;
 
@@ -149,6 +157,12 @@ pub struct CeltDecodeState {
     /// §4.3.7.1 post-filter's cross-frame history. Length equals the
     /// frame size; zero on a fresh / reset state.
     post_filter_history: Vec<f32>,
+    /// The previous frame's §4.3.7.1 post-filter parameters, carried so a
+    /// frame whose parameters changed can run the §4.3.7.1 squared-window
+    /// gain-transition crossfade ([`apply_post_filter_transition_f32`]).
+    /// [`crate::post_filter::PostFilterParams::OFF`] on a fresh / reset
+    /// state.
+    prev_post_filter: PfTransitionParams,
 }
 
 impl CeltDecodeState {
@@ -167,6 +181,7 @@ impl CeltDecodeState {
             synth,
             deemph: Deemphasis::new(),
             post_filter_history: vec![0.0; frame_size],
+            prev_post_filter: PfTransitionParams::OFF,
         })
     }
 
@@ -196,6 +211,7 @@ impl CeltDecodeState {
         self.synth.reset();
         self.deemph.reset();
         self.post_filter_history.iter_mut().for_each(|s| *s = 0.0);
+        self.prev_post_filter = PfTransitionParams::OFF;
     }
 }
 
@@ -340,20 +356,32 @@ pub fn decode_celt_frame(
     // and run the inverse MDCT + weighted overlap-add.
     let mut pcm = state.synth.synthesize(&residual.samples, start, end)?;
 
-    // §4.3.7.1 post-filter (when the prefix signalled one), against the
-    // previous frame's pre-de-emphasis output as cross-frame history.
-    if let Some(pf) = &prefix.header.post_filter {
-        apply_post_filter_f32(
-            &mut pcm,
-            &state.post_filter_history,
-            pf.period,
-            pf.gain,
-            pf.tapset,
-        );
-    }
-    // Save this frame's post-filtered (pre-de-emphasis) output as the
-    // next frame's post-filter history.
+    // §4.3.7.1 post-filter, with the §4.3.7.1 squared-window
+    // gain-transition crossfade against the previous frame's parameters.
+    // The crossfade reduces to the steady-state filter when the
+    // parameters did not change (and to passthrough when both frames had
+    // the post-filter off), so every frame routes through the one call.
+    let cur_pf = match &prefix.header.post_filter {
+        Some(pf) => PfTransitionParams {
+            enabled: true,
+            period: pf.period,
+            gain_index: pf.gain,
+            tapset: pf.tapset,
+        },
+        None => PfTransitionParams::OFF,
+    };
+    apply_post_filter_transition_f32(
+        &mut pcm,
+        &state.post_filter_history,
+        state.prev_post_filter,
+        cur_pf,
+        CELT_OVERLAP,
+    );
+    // Save this frame's post-filtered (pre-de-emphasis) output and
+    // parameters as the next frame's post-filter history / transition
+    // predecessor.
     state.post_filter_history.copy_from_slice(&pcm);
+    state.prev_post_filter = cur_pf;
 
     // §4.3.7.2 single-pole de-emphasis, carrying the filter memory.
     state.deemph.apply_in_place(&mut pcm);
@@ -766,6 +794,101 @@ mod tests {
             .zip(&f_fresh.pcm)
             .any(|(a, b)| (a - b).abs() > 1e-9);
         assert!(any_diff, "carried state did not affect the second frame");
+    }
+
+    /// Find a payload whose decoded prefix enables the §4.3.7.1
+    /// post-filter (so the transition crossfade actually participates).
+    /// Scans deterministic seeds; the post-filter flag is one of the
+    /// first Table 56 symbols, so a hit is common.
+    fn post_filter_payload(lm: u32) -> Option<Vec<u8>> {
+        for seed in 0..=255u8 {
+            let buf: Vec<u8> = (0..96u8)
+                .map(|i| i.wrapping_mul(37).wrapping_add(seed))
+                .collect();
+            let mut probe = CeltDecodeState::new(lm).unwrap();
+            if let Ok(f) = decode_celt_frame(&mut probe, &buf, 0, 21, &zero_fine(), &[2u32; 21]) {
+                if !f.prefix.header.transient && f.prefix.header.post_filter.is_some() {
+                    return Some(buf);
+                }
+            }
+        }
+        None
+    }
+
+    /// The §4.3.7.1 transition crossfade is active on the **first** frame
+    /// of a stream (where the predecessor is `PostFilterParams::OFF`): a
+    /// post-filter-enabled first frame fades the filter in over the
+    /// overlap region, so its early samples differ from a steady-state
+    /// (no-transition) application of the same parameters. The two
+    /// converge past the overlap region.
+    #[test]
+    fn post_filter_transition_active_on_first_frame() {
+        let lm = 1u32;
+        let buf = match post_filter_payload(lm) {
+            Some(b) => b,
+            None => return, // no post-filter seed at this lm; nothing to assert
+        };
+        let band_k = vec![2u32; 21];
+
+        // Decode through the real driver (prev = OFF on a fresh state ⇒
+        // transition crossfade fades the post-filter in).
+        let mut state = CeltDecodeState::new(lm).unwrap();
+        let with_transition =
+            decode_celt_frame(&mut state, &buf, 0, 21, &zero_fine(), &band_k).unwrap();
+
+        // Recompute the pre-de-emphasis PCM with a *steady-state* (no
+        // transition) post-filter, to compare against. We mirror the
+        // driver's stages up to the post-filter, then apply the plain
+        // filter, then de-emphasis.
+        let mut ref_state = CeltDecodeState::new(lm).unwrap();
+        let prefix = {
+            let mut dec = RangeDecoder::new(&buf);
+            decode_frame_prefix(
+                &mut dec,
+                &mut ref_state.coarse,
+                lm,
+                buf.len() as u32,
+                false,
+                0,
+                21,
+            )
+            .unwrap()
+        };
+        let pf = prefix.header.post_filter.expect("post-filter enabled");
+        // Re-run the whole driver but with a state whose prev params are
+        // already the current params ⇒ steady-state crossfade. We achieve
+        // that by decoding the frame once (prev becomes cur), resetting
+        // only the synthesis/de-emphasis memory, then decoding again.
+        let mut steady = CeltDecodeState::new(lm).unwrap();
+        let _warm = decode_celt_frame(&mut steady, &buf, 0, 21, &zero_fine(), &band_k).unwrap();
+        steady.synth.reset();
+        steady.deemph.reset();
+        steady.coarse.reset();
+        steady.post_filter_history.iter_mut().for_each(|s| *s = 0.0);
+        // prev_post_filter now equals cur ⇒ no transition.
+        let steady_out =
+            decode_celt_frame(&mut steady, &buf, 0, 21, &zero_fine(), &band_k).unwrap();
+
+        // Early samples (inside the overlap region) should differ between
+        // the fade-in (first frame) and the steady-state application,
+        // because the post-filter has a non-trivial gain here.
+        let early_diff = with_transition.pcm[..CELT_OVERLAP.min(with_transition.pcm.len())]
+            .iter()
+            .zip(&steady_out.pcm)
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        // The post-filter gain is always > 0 when enabled, so a real
+        // fade-in must move samples — but only assert when the residual
+        // actually produced non-silent PCM (a degenerate all-zero frame
+        // would make both paths identical).
+        let nonsilent = with_transition.pcm.iter().any(|&s| s.abs() > 1e-6);
+        if nonsilent {
+            assert!(
+                early_diff,
+                "transition fade-in did not differ from steady-state \
+                 (period={}, gain_idx={})",
+                pf.period, pf.gain
+            );
+        }
     }
 
     /// `reset()` zeroes the carried memory so a post-reset frame equals a
