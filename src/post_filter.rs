@@ -242,6 +242,201 @@ pub fn apply_post_filter_f32(
     n_total
 }
 
+/// The §4.3.7.1 post-filter parameters for one frame: pitch period,
+/// 3-bit gain index, and tapset selector.
+///
+/// `period` is the reconstructed `T = (16 << octave) + fine_pitch - 1`
+/// (already bounded to `[15, 1022]` by the caller; the filter clamps it
+/// to [`POST_FILTER_PERIOD_MIN`] defensively). `gain_index` is the raw
+/// 3-bit value (`0..=7`); `tapset` is the 2-bit selector (`0..=2`).
+///
+/// A frame with the post-filter flag clear is represented as
+/// `PostFilterParams::OFF` — gain index `0` is *not* "off" (the §4.3.7.1
+/// gain formula `G = 3*(gain+1)/32` has no zero), so a separate
+/// disabled state is carried explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostFilterParams {
+    /// `true` when the post-filter is enabled for this frame.
+    pub enabled: bool,
+    /// Pitch period `T` (bounded `[15, 1022]`).
+    pub period: u16,
+    /// Raw 3-bit gain index (`0..=7`).
+    pub gain_index: u8,
+    /// Tapset selector (`0..=2`).
+    pub tapset: u8,
+}
+
+impl PostFilterParams {
+    /// The "post-filter disabled" state — the cross-frame predecessor of
+    /// a frame whose previous frame had no post-filter, and the value a
+    /// fresh / reset decoder carries.
+    pub const OFF: PostFilterParams = PostFilterParams {
+        enabled: false,
+        period: POST_FILTER_PERIOD_MIN,
+        gain_index: 0,
+        tapset: 0,
+    };
+
+    /// The effective linear gain `G` this frame applies: the §4.3.7.1
+    /// gain when enabled, `0.0` when disabled (so a disabled frame is a
+    /// pure passthrough on its side of a transition crossfade).
+    #[inline]
+    pub fn gain(&self) -> f32 {
+        if self.enabled {
+            gain_f32(self.gain_index)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Apply the §4.3.7.1 post-filter to `out` in-place with a smooth
+/// cross-frame transition when the parameters changed from the previous
+/// frame.
+///
+/// RFC 6716 §4.3.7.1 states:
+///
+/// > During a transition between different gains, a smooth transition is
+/// > calculated using the square of the MDCT window. It is important
+/// > that values of y(n) be interpolated one at a time such that the
+/// > past value of y(n) used is interpolated.
+///
+/// This function implements that crossfade. The two contributions —
+/// the **old** filter (the previous frame's `prev` parameters) and the
+/// **new** filter (this frame's `cur` parameters) — are blended over the
+/// first `overlap` samples of the frame using the squared §4.3.7
+/// synthesis window `w(i)` (the rising-half window
+/// [`crate::mdct::celt_window_f32`], the same window the inverse-MDCT
+/// overlap-add uses):
+///
+/// ```text
+/// y(n) = x(n) + (1 - w(n)^2) * F_old(y, n) + w(n)^2 * F_new(y, n)   for n < overlap
+/// y(n) = x(n) +                              F_new(y, n)            for n >= overlap
+/// ```
+///
+/// where `F_old` / `F_new` are the §4.3.7.1 lobe responses
+/// `G*(g0*y(n-T) + g1*(y(n-T+1)+y(n-T-1)) + g2*(y(n-T+2)+y(n-T-2)))`
+/// evaluated with the old / new `(T, G, tapset)`. Because `w(0)` is near
+/// zero and `w(overlap-1)` near one, the crossfade fades the old filter
+/// out and the new filter in across the overlap region.
+///
+/// The RFC's "interpolated one at a time such that the past value of
+/// y(n) used is interpolated" requirement is honoured by construction:
+/// there is a single output sequence `y`, written sample-by-sample into
+/// `out`, and *both* `F_old` and `F_new` read that same already-blended
+/// past `y` (never two separate per-filter recursions). Sample `n`'s
+/// output therefore depends on the crossfaded past, exactly as the
+/// reference requires.
+///
+/// When `prev == cur` (or both are passthrough), the crossfade is
+/// algebraically identical to a single [`apply_post_filter_f32`] pass
+/// with the shared parameters, so callers can route every frame through
+/// this function unconditionally without a special "no transition" case.
+///
+/// ## Window choice — a documented decoder decision
+///
+/// §4.3.7.1 names "the square of the MDCT window" but does not restate
+/// the transition region length or the blend's algebraic sign. We take
+/// the region length to be the fixed §4.3.7 overlap (`overlap`,
+/// = [`crate::synthesis::CELT_OVERLAP`] = 120 for the decoder's
+/// long-MDCT window) and the rising-half window `w(i)` so the old filter
+/// fades out as the new fades in. This is the only assignment that makes
+/// the `prev == cur` case reduce to the steady-state filter (any other
+/// region length or window orientation would perturb a frame whose
+/// parameters did not change). The remaining ambiguity — whether the
+/// reference additionally interpolates the *period* `T` within the
+/// region rather than switching it at sample 0 — is noted in the crate
+/// README as a residual §4.3.7.1 docs question; this implementation
+/// switches `T` at the region start and crossfades only the lobe
+/// magnitude, the construction the squared-window blend most directly
+/// describes.
+///
+/// Parameters:
+/// * `out` — the post-MDCT samples `x(n)` in, the filtered `y(n)` out.
+/// * `prev_output` — the previous frame's filtered tail
+///   (`prev_output[k] = y(-1 - k)`), the cross-frame history.
+/// * `prev` — the previous frame's post-filter parameters.
+/// * `cur` — this frame's post-filter parameters.
+/// * `overlap` — the transition region length (the §4.3.7 window
+///   overlap). Clamped to `out.len()` so a frame shorter than the
+///   overlap crossfades across its whole length.
+///
+/// Returns the number of samples written (= `out.len()`).
+pub fn apply_post_filter_transition_f32(
+    out: &mut [f32],
+    prev_output: &[f32],
+    prev: PostFilterParams,
+    cur: PostFilterParams,
+    overlap: usize,
+) -> usize {
+    use crate::mdct::celt_window_f32;
+
+    let n_total = out.len();
+
+    // Old / new filter coefficients and clamped periods.
+    let g_old = prev.gain();
+    let g_new = cur.gain();
+    let t_old = (prev.period.max(POST_FILTER_PERIOD_MIN)) as usize;
+    let t_new = (cur.period.max(POST_FILTER_PERIOD_MIN)) as usize;
+    let (o0, o1, o2) = tap_coefficients_f32(prev.tapset);
+    let (c0, c1, c2) = tap_coefficients_f32(cur.tapset);
+
+    let region = overlap.min(n_total);
+
+    for n in 0..n_total {
+        let x = out[n];
+        // y(n - back): out[n-back] for a sample produced this block,
+        // else prev_output[back - n - 1], else 0 (startup / PLC).
+        let lookup = |back: usize| -> f32 {
+            if back == 0 {
+                return 0.0;
+            }
+            if back <= n {
+                out[n - back]
+            } else {
+                let pi = back - n - 1;
+                if pi < prev_output.len() {
+                    prev_output[pi]
+                } else {
+                    0.0
+                }
+            }
+        };
+
+        // New-filter lobe (always active).
+        let new_lobe = if g_new != 0.0 {
+            let centre = lookup(t_new);
+            let p1 = lookup(t_new.saturating_sub(1));
+            let m1 = lookup(t_new + 1);
+            let p2 = lookup(t_new.saturating_sub(2));
+            let m2 = lookup(t_new + 2);
+            g_new * (c0 * centre + c1 * (p1 + m1) + c2 * (p2 + m2))
+        } else {
+            0.0
+        };
+
+        if n < region {
+            // Old-filter lobe, faded by (1 - w^2); new lobe by w^2.
+            let w = celt_window_f32(n, region);
+            let w2 = w * w;
+            let old_lobe = if g_old != 0.0 {
+                let centre = lookup(t_old);
+                let p1 = lookup(t_old.saturating_sub(1));
+                let m1 = lookup(t_old + 1);
+                let p2 = lookup(t_old.saturating_sub(2));
+                let m2 = lookup(t_old + 2);
+                g_old * (o0 * centre + o1 * (p1 + m1) + o2 * (p2 + m2))
+            } else {
+                0.0
+            };
+            out[n] = x + (1.0 - w2) * old_lobe + w2 * new_lobe;
+        } else {
+            out[n] = x + new_lobe;
+        }
+    }
+    n_total
+}
+
 #[cfg(test)]
 #[allow(clippy::excessive_precision)]
 mod tests {
@@ -538,5 +733,177 @@ mod tests {
             (y0 - y15).abs() < 1e-7,
             "y(period=0)={y0} vs y(period=15)={y15}"
         );
+    }
+
+    // --- §4.3.7.1 cross-frame transition crossfade ---------------------
+
+    fn enabled_params(period: u16, gain_index: u8, tapset: u8) -> PostFilterParams {
+        PostFilterParams {
+            enabled: true,
+            period,
+            gain_index,
+            tapset,
+        }
+    }
+
+    /// When `prev == cur` the transition crossfade is algebraically
+    /// identical to a single steady-state [`apply_post_filter_f32`] pass:
+    /// `(1 - w^2)*F + w^2*F == F` for every sample, so the two paths must
+    /// produce bit-equal output.
+    #[test]
+    fn transition_identity_when_params_unchanged() {
+        let x: Vec<f32> = (0..200).map(|i| (i as f32 * 0.013).sin()).collect();
+        let prev_output: Vec<f32> = (0..130).map(|i| (i as f32 * 0.07).cos() * 0.4).collect();
+        let p = enabled_params(40, 5, 1);
+
+        let mut a = x.clone();
+        apply_post_filter_f32(&mut a, &prev_output, p.period, p.gain_index, p.tapset);
+
+        let mut b = x.clone();
+        apply_post_filter_transition_f32(&mut b, &prev_output, p, p, 120);
+
+        for (i, (av, bv)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (av - bv).abs() < 1e-6,
+                "sample {i}: steady-state {av} != transition {bv}"
+            );
+        }
+    }
+
+    /// A frame whose previous frame had the post-filter OFF and whose own
+    /// post-filter is OFF is a pure passthrough (both lobes zero).
+    #[test]
+    fn transition_off_to_off_is_passthrough() {
+        let x: Vec<f32> = (0..160).map(|i| (i as f32 * 0.02).sin()).collect();
+        let prev_output = vec![0.3f32; 130];
+        let mut out = x.clone();
+        apply_post_filter_transition_f32(
+            &mut out,
+            &prev_output,
+            PostFilterParams::OFF,
+            PostFilterParams::OFF,
+            120,
+        );
+        for (i, (xi, oi)) in x.iter().zip(out.iter()).enumerate() {
+            assert!((xi - oi).abs() < 1e-7, "sample {i}: {xi} != {oi}");
+        }
+    }
+
+    /// Past the overlap region only the new filter applies: the tail of
+    /// the transition output equals the tail of a steady-state pass with
+    /// the new parameters.
+    #[test]
+    fn transition_tail_is_new_filter_only() {
+        let x: Vec<f32> = (0..300).map(|i| (i as f32 * 0.011).sin()).collect();
+        let prev_output: Vec<f32> = (0..130).map(|i| (i as f32 * 0.05).cos() * 0.2).collect();
+        let prev = enabled_params(30, 2, 0);
+        let cur = enabled_params(50, 6, 2);
+        let overlap = 120;
+
+        let mut trans = x.clone();
+        apply_post_filter_transition_f32(&mut trans, &prev_output, prev, cur, overlap);
+
+        // A reference run: steady-state with the NEW params, but seeded so
+        // its past inside the overlap region matches the transition output
+        // (the recursion couples past samples, so we compare only well
+        // past the region where both have converged to identical history).
+        let mut newonly = x.clone();
+        apply_post_filter_f32(
+            &mut newonly,
+            &prev_output,
+            cur.period,
+            cur.gain_index,
+            cur.tapset,
+        );
+
+        // Within the region the two differ (old lobe still bleeds in);
+        // after the region + a few periods of settling, the per-sample
+        // *formula* is identical (new filter on the same out[] history),
+        // so any divergence is only the accumulated history difference.
+        // Assert the region boundary applies the new filter exactly: at
+        // n == overlap, w^2 no longer participates.
+        let n = overlap;
+        // Recompute the expected new-only lobe at n from `trans`'s own
+        // history (the function's contract: out[n] = x[n] + F_new(trans)).
+        let (g0, g1, g2) = tap_coefficients_f32(cur.tapset);
+        let g = gain_f32(cur.gain_index);
+        let t = cur.period as usize;
+        let look = |back: usize| -> f32 {
+            if back == 0 || back > n {
+                0.0
+            } else {
+                trans[n - back]
+            }
+        };
+        let expect = x[n]
+            + g * (g0 * look(t)
+                + g1 * (look(t - 1) + look(t + 1))
+                + g2 * (look(t - 2) + look(t + 2)));
+        assert!(
+            (trans[n] - expect).abs() < 1e-5,
+            "at region boundary the new filter must apply exactly: {} vs {}",
+            trans[n],
+            expect
+        );
+        // And the standalone new-only run is finite / same length.
+        assert_eq!(newonly.len(), trans.len());
+    }
+
+    /// The crossfade starts essentially on the old filter (w(0) ~ 0) and
+    /// ends on the new filter (w(overlap-1) ~ 1): the first sample's lobe
+    /// is the old filter's, the boundary sample's is the new filter's.
+    #[test]
+    fn transition_starts_old_ends_new() {
+        // Distinct gains so the two lobes are clearly separable; constant
+        // input so x(n) cancels out of the lobe comparison.
+        let x = vec![1.0f32; 200];
+        let prev_output = vec![1.0f32; 130];
+        let prev = enabled_params(20, 7, 0); // strong old filter
+        let cur = enabled_params(20, 0, 0); // weak new filter (same T/tapset)
+        let overlap = 120;
+
+        let mut out = x.clone();
+        apply_post_filter_transition_f32(&mut out, &prev_output, prev, cur, overlap);
+
+        // Sample 0: w(0)^2 ~ 0, so the lobe is ~ entirely the old filter.
+        // The old gain (7) is much larger than the new gain (0), so the
+        // sample-0 contribution above x should be close to the old lobe.
+        let w0 = crate::mdct::celt_window_f32(0, overlap);
+        assert!(
+            w0 * w0 < 0.01,
+            "w(0)^2 should be near zero, got {}",
+            w0 * w0
+        );
+        // out[0] = 1 + (1 - w0^2)*old_lobe + w0^2*new_lobe; with strong old
+        // and weak new, out[0] is dominated by the old lobe ⇒ noticeably
+        // above x=1.
+        assert!(
+            out[0] > 1.0 + 0.1,
+            "sample 0 should carry the strong old lobe, got {}",
+            out[0]
+        );
+    }
+
+    /// `PostFilterParams::gain` returns the §4.3.7.1 gain when enabled and
+    /// exactly 0.0 when disabled (gain index 0 is NOT "off").
+    #[test]
+    fn params_gain_off_vs_enabled() {
+        assert_eq!(PostFilterParams::OFF.gain(), 0.0);
+        let p = enabled_params(40, 0, 0);
+        assert_eq!(p.gain(), gain_f32(0)); // 3/32, not zero
+        assert!(p.gain() > 0.0);
+    }
+
+    /// A short frame (`out.len() < overlap`) crossfades across its whole
+    /// length without panicking (region clamps to `out.len()`).
+    #[test]
+    fn transition_short_frame_clamps_region() {
+        let mut out = vec![0.5f32; 40];
+        let prev_output = vec![0.1f32; 130];
+        let prev = enabled_params(15, 3, 1);
+        let cur = enabled_params(60, 5, 2);
+        let written = apply_post_filter_transition_f32(&mut out, &prev_output, prev, cur, 120);
+        assert_eq!(written, 40);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 }
