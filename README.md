@@ -179,6 +179,13 @@ CELT frame header (RFC 6716 §4.3 prefix + §4.3.5 anti-collapse):
   the band shape vectors in the bitstream.
 * `CeltFrameHeader::post_filter_gain_q15()` rebuilds the §4.3.7.1
   gain `G = 3*(gain+1)/32` in Q15 fixed-point.
+* `CeltFrameHeader::encode_prefix(enc)` is the exact inverse of
+  `decode_prefix`: it serialises the Table-56 prefix (silence →
+  post-filter flag + its four §4.3.7.1 parameters, with `fine_pitch`
+  reconstructed from `period` → transient → intra) into a `RangeEncoder`.
+  `encode_anti_collapse_flag(enc, transient, on)` writes the §4.3.5 bit
+  at the post-band-shape position (no-op on non-transient frames). Both
+  reject out-of-range fields with `Error::InvalidParameter`.
 
 Coarse-energy decoding (RFC 6716 §4.3.2.1 + Appendix A `laplace.c`
 / `quant_bands.c`):

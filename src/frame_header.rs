@@ -29,6 +29,8 @@
 //! RFC 6716 (`docs/audio/opus/rfc6716-opus.txt`).
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// Post-filter parameters carried in the CELT frame header
 /// (RFC 6716 §4.3.7.1).
@@ -161,6 +163,64 @@ impl CeltFrameHeader {
         }
     }
 
+    /// Encode the always-present prefix of the CELT frame header into
+    /// the range coder — the exact inverse of [`Self::decode_prefix`]
+    /// (RFC 6716 §4.3 Table 56 order: silence → post-filter flag + its
+    /// four §4.3.7.1 parameters → transient → intra).
+    ///
+    /// The `anti_collapse_on` field is **not** written here: §4.3.5
+    /// places the anti-collapse bit after the band shape vectors, so it
+    /// is emitted separately by [`encode_anti_collapse_flag`] at the
+    /// right bitstream position. For a post-filter-enabled header the
+    /// `fine_pitch` raw value is reconstructed from `period` as
+    /// `fine_pitch = period + 1 - (16 << octave)` (the inverse of the
+    /// §4.3.7.1 `T = (16<<octave) + fine_pitch - 1` mapping) and written
+    /// in `4 + octave` raw bits. Returns [`Error::InvalidParameter`] for
+    /// an out-of-range field (`octave > 5`, `gain > 7`, `tapset > 2`, or
+    /// a `period` whose `fine_pitch` does not fit in `4 + octave` bits).
+    pub fn encode_prefix(&self, enc: &mut RangeEncoder) -> Result<(), Error> {
+        // §4.3 Table 56: silence flag, icdf [1, 0], ftb=15.
+        enc.enc_icdf(usize::from(self.silence), SILENCE_ICDF, 15)?;
+
+        // §4.3 Table 56: post-filter flag, logp=1.
+        let pf_on = self.post_filter.is_some();
+        enc.enc_bit_logp(u32::from(pf_on), 1)?;
+
+        if let Some(pf) = self.post_filter {
+            if pf.octave > 5 || pf.gain > 7 || pf.tapset > 2 {
+                return Err(Error::InvalidParameter);
+            }
+            // Octave: uniform(6).
+            enc.enc_uint(u32::from(pf.octave), 6)?;
+
+            // Period: 4 + octave raw bits, inverting
+            // T = (16 << octave) + fine_pitch - 1.
+            let raw_period_bits = 4 + u32::from(pf.octave);
+            let base = 16u32 << pf.octave;
+            let fine_pitch = (u32::from(pf.period) + 1)
+                .checked_sub(base)
+                .ok_or(Error::InvalidParameter)?;
+            if fine_pitch >= (1u32 << raw_period_bits) {
+                return Err(Error::InvalidParameter);
+            }
+            enc.enc_bits(fine_pitch, raw_period_bits)?;
+
+            // Gain: 3 raw bits.
+            enc.enc_bits(u32::from(pf.gain), 3)?;
+
+            // Tapset: icdf [2, 1, 0], ftb=2.
+            enc.enc_icdf(usize::from(pf.tapset), TAPSET_ICDF, 2)?;
+        }
+
+        // §4.3.1: transient flag, logp=3.
+        enc.enc_bit_logp(u32::from(self.transient), 3)?;
+
+        // §4.3.2.1: intra flag, logp=3.
+        enc.enc_bit_logp(u32::from(self.intra), 3)?;
+
+        Ok(())
+    }
+
     /// Reconstruct the post-filter gain `G = 3*(gain+1)/32` as a Q15
     /// fixed-point value (RFC 6716 §4.3.7.1). Returns 0 when the
     /// post-filter is disabled.
@@ -193,6 +253,24 @@ pub fn decode_anti_collapse_flag(dec: &mut RangeDecoder<'_>, transient: bool) ->
     }
     // PDF {1, 1}/2 → logp=1.
     dec.dec_bit_logp(1) == 1
+}
+
+/// Encode the §4.3.5 anti-collapse bit, or skip it — the inverse of
+/// [`decode_anti_collapse_flag`].
+///
+/// On a transient frame the `{1, 1}/2` bit (logp=1) is written; on a
+/// non-transient frame nothing is emitted (the decoder does not read it
+/// either). Must be called at the same bitstream position the decode
+/// side reads it — after the band shape vectors, per Table 56.
+pub fn encode_anti_collapse_flag(
+    enc: &mut RangeEncoder,
+    transient: bool,
+    anti_collapse_on: bool,
+) -> Result<(), Error> {
+    if !transient {
+        return Ok(());
+    }
+    enc.enc_bit_logp(u32::from(anti_collapse_on), 1)
 }
 
 #[cfg(test)]
@@ -414,5 +492,138 @@ mod tests {
         } else {
             assert!(final_hdr.anti_collapse_on.is_none());
         }
+    }
+
+    // ---- encode-direction round-trips (§4.3 prefix inverse) ----
+
+    /// `encode_prefix` → `decode_prefix` recovers every header field
+    /// across the cartesian product of silence/transient/intra and a
+    /// representative set of post-filter parameter combinations.
+    #[test]
+    fn encode_decode_prefix_roundtrip() {
+        let post_filters = [
+            None,
+            Some(PostFilter {
+                octave: 0,
+                period: 16, // fine_pitch = 1: (16<<0)+1-1 = 16.
+                gain: 0,
+                tapset: 0,
+            }),
+            Some(PostFilter {
+                octave: 5,
+                period: 1022, // max period.
+                gain: 7,
+                tapset: 2,
+            }),
+            Some(PostFilter {
+                octave: 3,
+                period: 200,
+                gain: 4,
+                tapset: 1,
+            }),
+        ];
+        for &silence in &[false, true] {
+            for &transient in &[false, true] {
+                for &intra in &[false, true] {
+                    for pf in &post_filters {
+                        let hdr = CeltFrameHeader {
+                            silence,
+                            post_filter: *pf,
+                            transient,
+                            intra,
+                            anti_collapse_on: None,
+                        };
+                        let mut enc = RangeEncoder::new();
+                        hdr.encode_prefix(&mut enc).unwrap();
+                        let frame = enc.finish();
+                        let mut dec = RangeDecoder::new(&frame);
+                        let decoded = CeltFrameHeader::decode_prefix(&mut dec);
+                        assert_eq!(decoded.silence, silence);
+                        assert_eq!(decoded.transient, transient);
+                        assert_eq!(decoded.intra, intra);
+                        assert_eq!(decoded.post_filter, *pf, "pf mismatch");
+                        assert!(!dec.has_error());
+                    }
+                }
+            }
+        }
+    }
+
+    /// `encode_anti_collapse_flag` round-trips the bit on transient
+    /// frames and is a no-op on non-transient frames.
+    #[test]
+    fn encode_decode_anti_collapse_roundtrip() {
+        for &transient in &[false, true] {
+            for &ac in &[false, true] {
+                let mut enc = RangeEncoder::new();
+                encode_anti_collapse_flag(&mut enc, transient, ac).unwrap();
+                let frame = enc.finish();
+                let mut dec = RangeDecoder::new(&frame);
+                let recovered = decode_anti_collapse_flag(&mut dec, transient);
+                if transient {
+                    assert_eq!(recovered, ac, "transient ac mismatch");
+                } else {
+                    assert!(!recovered, "non-transient must read false");
+                }
+                assert!(!dec.has_error());
+            }
+        }
+    }
+
+    /// A full prefix + anti-collapse stream encodes and decodes back in
+    /// the §4.3.5 bitstream order (prefix first, anti-collapse after the
+    /// band region — here simulated by a raw-bit gap representing the
+    /// shape symbols).
+    #[test]
+    fn encode_decode_prefix_then_anti_collapse() {
+        let hdr = CeltFrameHeader {
+            silence: false,
+            post_filter: Some(PostFilter {
+                octave: 2,
+                period: 80,
+                gain: 5,
+                tapset: 1,
+            }),
+            transient: true,
+            intra: false,
+            anti_collapse_on: None,
+        };
+        let mut enc = RangeEncoder::new();
+        hdr.encode_prefix(&mut enc).unwrap();
+        // Simulate the band-shape region with a few range symbols.
+        enc.enc_uint(7, 16).unwrap();
+        encode_anti_collapse_flag(&mut enc, hdr.transient, true).unwrap();
+        let frame = enc.finish();
+
+        let mut dec = RangeDecoder::new(&frame);
+        let decoded = CeltFrameHeader::decode_prefix(&mut dec);
+        assert_eq!(decoded.post_filter, hdr.post_filter);
+        assert!(decoded.transient);
+        assert_eq!(dec.dec_uint(16).unwrap(), 7);
+        let ac = decode_anti_collapse_flag(&mut dec, decoded.transient);
+        assert!(ac, "anti-collapse bit lost");
+        assert!(!dec.has_error());
+    }
+
+    /// Out-of-range post-filter fields are rejected by `encode_prefix`.
+    #[test]
+    fn encode_prefix_rejects_out_of_range() {
+        let bad_octave = CeltFrameHeader {
+            silence: false,
+            post_filter: Some(PostFilter {
+                octave: 6, // > 5
+                period: 80,
+                gain: 0,
+                tapset: 0,
+            }),
+            transient: false,
+            intra: false,
+            anti_collapse_on: None,
+        };
+        let mut enc = RangeEncoder::new();
+        assert_eq!(
+            bad_octave.encode_prefix(&mut enc),
+            Err(Error::InvalidParameter)
+        );
     }
 }

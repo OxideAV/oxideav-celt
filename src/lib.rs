@@ -353,7 +353,9 @@ pub use fine_energy::{
     FinalizePriority, FinalizeResult, MAX_FINE_BITS,
 };
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
-pub use frame_header::{decode_anti_collapse_flag, CeltFrameHeader, PostFilter};
+pub use frame_header::{
+    decode_anti_collapse_flag, encode_anti_collapse_flag, CeltFrameHeader, PostFilter,
+};
 pub use frame_synthesis::{
     decode_celt_frame, CeltDecodeState, DecodedFrame, PostFilterParams, StereoCeltDecodeState,
     StereoDecodedFrame,

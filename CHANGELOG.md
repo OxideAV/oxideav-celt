@@ -6,6 +6,23 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — §4.3 frame-prefix *encode* (inverse of
+  `decode_prefix`):** `CeltFrameHeader::encode_prefix(enc)` writes the
+  always-present Table-56 prefix — silence (icdf), post-filter flag +
+  its four §4.3.7.1 parameters (octave `uniform(6)`, `fine_pitch` in
+  `4+octave` raw bits reconstructed from `period`, gain 3 raw bits,
+  tapset icdf), transient and intra flags — in exact decode order, and
+  `encode_anti_collapse_flag(enc, transient, on)` writes the §4.3.5
+  `{1,1}/2` bit on transient frames (no-op otherwise), matching the
+  post-band-shape bitstream position. Validated by a 32-combination
+  silence × transient × intra × post-filter round-trip through
+  `decode_prefix`, an anti-collapse round-trip, a combined
+  prefix → shape-symbols → anti-collapse stream in §4.3.5 order, and
+  out-of-range post-filter field rejection. +4 tests (588 lib tests
+  total). Provenance: RFC 6716 §4.3 / §4.3.7.1 / §4.3.5
+  (`docs/audio/opus/rfc6716-opus.txt`). Clean-room: algebraic inverse of
+  the existing prefix decode; no external library source.
+
 * **Round-371 (2026-06-25) — §4.3.4.2 PVQ shape *encode* into the range
   coder (inverse of `decode_pulses`):** `encode_pulses(enc, pulses, n,
   k)` maps a pulse vector to its codeword index (via the existing
