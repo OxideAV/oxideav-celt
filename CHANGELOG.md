@@ -6,6 +6,21 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — §4.3.4.5 TF-parameter *encode* (inverse of
+  `decode_tf_parameters`):** `encode_tf_changes` recovers each band's
+  toggle bit from the cumulative per-band TF choice (`tf_changes[k] !=
+  tf_changes[k-1]`, `tf_changes[-1] = false`) and writes it with the
+  §4.3.4.5 first/subsequent-band logp; `encode_tf_select` re-evaluates
+  the "can it have an impact" gate (`tf_select_matters`) and writes the
+  `{1,1}/2` bit only when open (rejecting a non-zero `tf_select` under a
+  closed gate); `encode_tf_parameters` chains both in Table-56 order.
+  Validated by `tf_changes` round-trips over seven patterns × transient,
+  a full-group round-trip across every LM × pattern × gate-consistent
+  `tf_select`, and closed-gate rejection. +3 tests (591 lib tests total).
+  Provenance: RFC 6716 §4.3.4.5 (`docs/audio/opus/rfc6716-opus.txt`).
+  Clean-room: algebraic inverse of the existing TF decode; no external
+  library source.
+
 * **Round-371 (2026-06-25) — §4.3 frame-prefix *encode* (inverse of
   `decode_prefix`):** `CeltFrameHeader::encode_prefix(enc)` writes the
   always-present Table-56 prefix — silence (icdf), post-filter flag +

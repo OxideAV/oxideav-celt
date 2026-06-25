@@ -393,6 +393,13 @@ Time-frequency change parameters (RFC 6716 §4.3.4.5 + §4.3.1):
 * `decode_tf_parameters(dec, start, end, is_transient, lm)`
   orchestrates the full §4.3.4.5 walk in Table 56 order and returns
   a `TfParameters { tf_changes, tf_select, tf_select_decoded }`.
+* `encode_tf_changes` / `encode_tf_select` / `encode_tf_parameters` are
+  the exact inverses: `encode_tf_changes` recovers each band's toggle bit
+  from the cumulative per-band TF choice and writes it with the
+  first/subsequent-band logp; `encode_tf_select` re-evaluates the
+  "can it have an impact" gate and emits the `{1,1}/2` bit only when
+  open; `encode_tf_parameters` chains both in Table-56 order. A
+  closed-gate non-zero `tf_select` is rejected.
 * The four tables themselves are exposed as `pub const`s
   (`TABLE_60_NON_TRANSIENT_SEL0`, `TABLE_61_NON_TRANSIENT_SEL1`,
   `TABLE_62_TRANSIENT_SEL0`, `TABLE_63_TRANSIENT_SEL1`),

@@ -56,6 +56,8 @@
 //! was consulted.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// Number of `(LM, tf_change)` columns in each TF adjustment sub-table.
 ///
@@ -367,6 +369,94 @@ pub fn decode_tf_parameters(
         tf_select,
         tf_select_decoded,
     }
+}
+
+// ---------------------------------------------------------------------
+// Encode direction (RFC 6716 §4.3.4.5, the inverse of the decode above).
+// ---------------------------------------------------------------------
+
+/// Encode the per-band `tf_change` bits — the inverse of
+/// [`decode_tf_changes`].
+///
+/// `tf_changes` is the **cumulative** per-band TF choice the decoder
+/// reconstructs (length `end - start`). The decoder forms each band's
+/// value by toggling a running accumulator (initialised to `false`) on a
+/// rare-"1" symbol, so the encoder recovers the toggle bit for band `k`
+/// as `tf_changes[k] != tf_changes[k-1]` (`tf_changes[-1] = false`) and
+/// writes it with the §4.3.4.5 first/subsequent-band logp. A no-op for
+/// an empty slice.
+pub fn encode_tf_changes(
+    enc: &mut RangeEncoder,
+    tf_changes: &[bool],
+    is_transient: bool,
+) -> Result<(), Error> {
+    let first_logp = if is_transient {
+        FIRST_BAND_LOGP_TRANSIENT
+    } else {
+        FIRST_BAND_LOGP_NON_TRANSIENT
+    };
+    let cont_logp = if is_transient {
+        CONT_BAND_LOGP_TRANSIENT
+    } else {
+        CONT_BAND_LOGP_NON_TRANSIENT
+    };
+    let mut prev = false;
+    for (k, &cur) in tf_changes.iter().enumerate() {
+        let logp = if k == 0 { first_logp } else { cont_logp };
+        let toggle = cur != prev;
+        enc.enc_bit_logp(u32::from(toggle), logp)?;
+        prev = cur;
+    }
+    Ok(())
+}
+
+/// Encode the global `tf_select` flag iff it would matter — the inverse
+/// of [`decode_tf_select`].
+///
+/// The §4.3.4.5 "can have an impact" gate ([`tf_select_matters`]) is
+/// re-evaluated from the cumulative `tf_changes`; when it passes, the
+/// `{1,1}/2` bit is written, otherwise nothing is emitted (matching the
+/// gated-off decode that leaves `tf_select = 0`). Returns
+/// [`Error::InvalidParameter`] if the caller asks to write a non-zero
+/// `tf_select` while the gate is closed (it would be unrecoverable).
+pub fn encode_tf_select(
+    enc: &mut RangeEncoder,
+    is_transient: bool,
+    lm: u8,
+    tf_changes: &[bool],
+    tf_select: u8,
+) -> Result<(), Error> {
+    if !tf_select_matters(is_transient, lm, tf_changes) {
+        // Gate closed: the decoder will default tf_select to 0, so the
+        // only consistent value to "encode" is 0 (writing nothing).
+        return if tf_select == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidParameter)
+        };
+    }
+    if tf_select > 1 {
+        return Err(Error::InvalidParameter);
+    }
+    enc.enc_bit_logp(u32::from(tf_select), TF_SELECT_LOGP)
+}
+
+/// Encode the full §4.3.4.5 TF-parameter group in Table 56 order — the
+/// inverse of [`decode_tf_parameters`].
+///
+/// Writes the per-band `tf_change` toggles, then the `tf_select` bit if
+/// the gate is open. The `tf_select_decoded` field of `params` is
+/// advisory; the gate is recomputed from `tf_changes` so the emitted
+/// bitstream stays self-consistent with what `decode_tf_parameters`
+/// reads back.
+pub fn encode_tf_parameters(
+    enc: &mut RangeEncoder,
+    params: &TfParameters,
+    is_transient: bool,
+    lm: u8,
+) -> Result<(), Error> {
+    encode_tf_changes(enc, &params.tf_changes, is_transient)?;
+    encode_tf_select(enc, is_transient, lm, &params.tf_changes, params.tf_select)
 }
 
 #[cfg(test)]
@@ -758,5 +848,91 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- encode-direction round-trips (§4.3.4.5 inverse) ----
+
+    /// `encode_tf_changes` → `decode_tf_changes` recovers the cumulative
+    /// per-band TF choice for a spread of patterns, both transient and
+    /// non-transient.
+    #[test]
+    fn encode_decode_tf_changes_roundtrip() {
+        let patterns: &[&[bool]] = &[
+            &[],
+            &[false],
+            &[true],
+            &[false, false, false],
+            &[true, true, true],
+            &[false, true, true, false, true],
+            &[true, false, false, true, true, false, true],
+        ];
+        for &is_transient in &[false, true] {
+            for pat in patterns {
+                let mut enc = RangeEncoder::new();
+                encode_tf_changes(&mut enc, pat, is_transient).unwrap();
+                let frame = enc.finish();
+                let mut dec = RangeDecoder::new(&frame);
+                let recovered = decode_tf_changes(&mut dec, 0, pat.len(), is_transient);
+                assert_eq!(&recovered, pat, "transient={is_transient} pat={pat:?}");
+                assert!(!dec.has_error());
+            }
+        }
+    }
+
+    /// Full TF-parameter group round-trip: encode then decode recovers
+    /// `tf_changes` and `tf_select` across every LM and a few patterns.
+    #[test]
+    fn encode_decode_tf_parameters_roundtrip() {
+        let patterns: &[&[bool]] = &[
+            &[false, false, false, false],
+            &[true, false, true, false],
+            &[true, true, false, true, false, true],
+        ];
+        for lm in 0u8..=3 {
+            for &is_transient in &[false, true] {
+                for pat in patterns {
+                    // Choose a tf_select consistent with the gate.
+                    let gate = tf_select_matters(is_transient, lm, pat);
+                    let sel_values: &[u8] = if gate { &[0, 1] } else { &[0] };
+                    for &sel in sel_values {
+                        let params = TfParameters {
+                            tf_changes: pat.to_vec(),
+                            tf_select: sel,
+                            tf_select_decoded: gate,
+                        };
+                        let mut enc = RangeEncoder::new();
+                        encode_tf_parameters(&mut enc, &params, is_transient, lm).unwrap();
+                        let frame = enc.finish();
+                        let mut dec = RangeDecoder::new(&frame);
+                        let recovered =
+                            decode_tf_parameters(&mut dec, 0, pat.len(), is_transient, lm);
+                        assert_eq!(recovered.tf_changes, *pat, "lm={lm} t={is_transient}");
+                        assert_eq!(recovered.tf_select, sel, "lm={lm} sel mismatch");
+                        assert_eq!(recovered.tf_select_decoded, gate);
+                        assert!(!dec.has_error());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Encoding a non-zero `tf_select` while the gate is closed is
+    /// rejected (it would be unrecoverable).
+    #[test]
+    fn encode_tf_select_closed_gate_rejects_nonzero() {
+        // A non-transient frame whose tf_changes are all the same TF
+        // choice and whose LM has identical sel0/sel1 columns closes the
+        // gate. LM=0 non-transient: sel0 col0 = 0, sel1 col0 = 0 → equal
+        // for tf_change=false; an all-false pattern closes the gate.
+        let pat = [false, false, false];
+        assert!(!tf_select_matters(false, 0, &pat));
+        let mut enc = RangeEncoder::new();
+        assert_eq!(
+            encode_tf_select(&mut enc, false, 0, &pat, 1),
+            Err(Error::InvalidParameter)
+        );
+        // Zero is fine (writes nothing).
+        let mut enc2 = RangeEncoder::new();
+        assert_eq!(encode_tf_select(&mut enc2, false, 0, &pat, 0), Ok(()));
     }
 }

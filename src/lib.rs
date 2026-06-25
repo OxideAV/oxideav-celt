@@ -403,9 +403,10 @@ pub use synthesis::{
     CELT_OVERLAP,
 };
 pub use tf_change::{
-    decode_tf_changes, decode_tf_parameters, decode_tf_select, tf_adjustment, tf_select_matters,
-    TfParameters, LM_VALUES, TABLE_60_NON_TRANSIENT_SEL0, TABLE_61_NON_TRANSIENT_SEL1,
-    TABLE_62_TRANSIENT_SEL0, TABLE_63_TRANSIENT_SEL1, TF_CHANGE_VALUES,
+    decode_tf_changes, decode_tf_parameters, decode_tf_select, encode_tf_changes,
+    encode_tf_parameters, encode_tf_select, tf_adjustment, tf_select_matters, TfParameters,
+    LM_VALUES, TABLE_60_NON_TRANSIENT_SEL0, TABLE_61_NON_TRANSIENT_SEL1, TABLE_62_TRANSIENT_SEL0,
+    TABLE_63_TRANSIENT_SEL1, TF_CHANGE_VALUES,
 };
 
 /// Crate-local error type. The encoder, frame-level decoder, and
