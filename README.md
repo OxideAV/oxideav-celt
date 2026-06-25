@@ -78,10 +78,15 @@ are growing: the §4.3.4.2 PVQ codeword index encode
 (`encode_pulses_to_index`, the exact inverse of the decode loop), the
 §5.3.8.1 PVQ codeword search (`pvq_search` → `encode_unit_shape`) giving
 the full input-vector → integer-codeword → bitstream-index PVQ encode
-chain, and — new in r371 — the **§5.1 range encoder** (`RangeEncoder`),
-the bit-exact inverse of the §4.1 range decoder, which serialises every
-encode-side range symbol into a frame. The energy-quantization encode and
-the codec-registration entry point still return `Error::NotImplemented`.
+chain, the **§5.1 range encoder** (`RangeEncoder`, new in r371) — the
+bit-exact inverse of the §4.1 range decoder that serialises every
+encode-side range symbol into a frame — and the **§4.3.2.2 fine-energy
+encode** (`quantize_fine_energy_band` → `encode_fine_energy[_band]`, also
+r371), the inverse of `decode_fine_energy` that quantises a correction to
+the band's index `f` and writes it as `B_i` raw bits. The coarse
+§4.3.2.1 Laplace energy encode (DOCS-GAP, same boundary as the coarse
+decode) and the codec-registration entry point still return
+`Error::NotImplemented`.
 
 **Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
 the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps
@@ -346,6 +351,17 @@ Fine-energy refinement (RFC 6716 §4.3.2.2):
 * `MAX_FINE_BITS = 8` caps the per-band fine-bit count (the §4.3.3
   allocator never exceeds this in practice; the Q14 closed-form is
   exact for `b_bits <= 13`).
+* `quantize_fine_energy_band(correction_q14, b_bits)` inverts the
+  §4.3.2.2 decode map, returning the quantizer index
+  `f = clamp(floor((correction + 1/2)*2^B), 0, 2^B - 1)`. Round-trips
+  exactly with `fine_correction_q14` on the grid (`quantize ∘ decode ==
+  id` over every legal `(f, B)`).
+* `encode_fine_energy_band(enc, f, b_bits)` /
+  `encode_fine_energy(enc, f_per_band, bits_per_band)` write the chosen
+  `f` as `B_i` raw bits through the §5.1 `RangeEncoder` — the exact
+  inverse of `decode_fine_energy_band` / `decode_fine_energy`. `B_i == 0`
+  is a no-op; an `f` exceeding `b_bits` is rejected with
+  `Error::InvalidParameter`.
 
 Time-frequency change parameters (RFC 6716 §4.3.4.5 + §4.3.1):
 

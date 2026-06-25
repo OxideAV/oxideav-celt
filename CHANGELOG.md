@@ -6,6 +6,27 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — §4.3.2.2 fine-energy *encode* (the inverse
+  of `decode_fine_energy`):** `quantize_fine_energy_band(correction_q14,
+  b_bits)` inverts the §4.3.2.2 decode map `correction = (f+1/2)/2^B -
+  1/2` to recover the quantizer index `f = clamp(floor((correction +
+  1/2)*2^B), 0, 2^B - 1)`; `encode_fine_energy_band` /
+  `encode_fine_energy` write the chosen `f` as `B_i` raw bits through the
+  new §5.1 `RangeEncoder` (`enc_bits`, LSB-first), the exact inverse of
+  `decode_fine_energy_band` / `decode_fine_energy`. `B_i == 0` is a
+  no-op on both sides. Validated by an exhaustive grid round-trip
+  (`quantize ∘ fine_correction_q14 == id` over every legal `(f, B)` for
+  `B ∈ 1..=8`), an `encode → finish → decode` bit-exact round-trip over
+  every legal `(f, B)`, endpoint clamping, out-of-range `f` rejection,
+  and a full 21-band envelope round-trip whose raw-bit budget matches
+  `sum(B_i)`. This completes the energy-quantisation encode for the fine
+  step (the coarse §4.3.2.1 Laplace encode remains DOCS-GAP blocked, same
+  boundary as the coarse decode). +6 tests (580 lib tests total).
+  Provenance: RFC 6716 §4.3.2.2 (`docs/audio/opus/rfc6716-opus.txt` lines
+  6081–6099) + the §5.1 `RangeEncoder` landed earlier this round.
+  Clean-room: pure algebraic inverse of the existing §4.3.2.2 decode map;
+  no external library source consulted.
+
 * **Round-371 (2026-06-25) — §5.1 range encoder (the exact inverse of
   the §4.1 range decoder):** new `range_encoder` module with the
   bit-exact CELT/SILK range *encoder* per RFC 6716 §5.1

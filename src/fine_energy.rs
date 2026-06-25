@@ -83,6 +83,8 @@
 
 use crate::coarse_energy::NUM_BANDS;
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// Upper bound on the number of fine bits the §4.3.3 bit allocator can
 /// assign to any single band.
@@ -375,6 +377,85 @@ pub fn finalize_extra_bits(
 
     result.bits_unused = remaining;
     result
+}
+
+// ---------------------------------------------------------------------
+// Encode direction (RFC 6716 §4.3.2.2, the inverse of the decode above).
+// ---------------------------------------------------------------------
+
+/// Quantize a fine-energy correction to the §4.3.2.2 integer `f`.
+///
+/// The decode mapping is `correction = (f + 1/2)/2^B - 1/2`, so the
+/// encoder inverts it: `f = round((correction + 1/2) * 2^B - 1/2) =
+/// floor((correction + 1/2) * 2^B)`, clamped to the legal range
+/// `[0, 2^B - 1]`. `correction_q14` is the target correction in Q14
+/// (1.0 base-2 log = `1 << 14`); a value in `[-8192, 8192)` maps onto
+/// the band's quantizer grid. `b_bits == 0` yields `f = 0` (no
+/// refinement bit to transmit).
+///
+/// The result is the unique `f` whose [`fine_correction_q14`] is the
+/// nearest grid point at or below `correction_q14 + half_step`, so
+/// `decode` of the returned `f` recovers the closest representable
+/// correction — `quantize_fine_energy_band` then
+/// `fine_correction_q14` is the §4.3.2.2 round-trip on the grid.
+pub fn quantize_fine_energy_band(correction_q14: i32, b_bits: u32) -> u32 {
+    if b_bits == 0 {
+        return 0;
+    }
+    let b = b_bits.min(MAX_FINE_BITS);
+    // f = floor((correction + 1/2) * 2^B). In Q14:
+    //   (correction_q14 + 2^13) gives (correction + 1/2) in Q14;
+    //   multiply by 2^B and divide by 2^14 (the Q14 unit) → >> (14 - B).
+    let shifted = correction_q14 as i64 + (1i64 << 13);
+    // Guard the negative side: a correction below -1/2 clamps to f = 0.
+    if shifted <= 0 {
+        return 0;
+    }
+    let f = (shifted << b) >> 14;
+    let max_f = (1i64 << b) - 1;
+    f.clamp(0, max_f) as u32
+}
+
+/// Encode the §4.3.2.2 fine-energy refinement `f` for one band into the
+/// range encoder's raw-bit channel (the exact inverse of
+/// [`decode_fine_energy_band`]).
+///
+/// `f` must lie in `[0, 2^b_bits)`. When `b_bits == 0` this is a no-op
+/// (the band gets no fine refinement and no raw bit is written), exactly
+/// mirroring the decode side. The `b_bits` raw bits are written
+/// LSB-first via [`RangeEncoder::enc_bits`] (§5.1.3), so a subsequent
+/// [`decode_fine_energy_band`] over the finished frame recovers the same
+/// `f`. Returns [`Error::InvalidParameter`] if `f` does not fit in
+/// `b_bits` bits.
+pub fn encode_fine_energy_band(enc: &mut RangeEncoder, f: u32, b_bits: u32) -> Result<(), Error> {
+    if b_bits == 0 {
+        return Ok(());
+    }
+    let b = b_bits.min(MAX_FINE_BITS);
+    if b < 32 && f >= (1u32 << b) {
+        return Err(Error::InvalidParameter);
+    }
+    enc.enc_bits(f, b)
+}
+
+/// Encode the §4.3.2.2 fine refinement for every band, given each
+/// band's chosen quantizer index `f_per_band[i]` and bit count
+/// `bits_per_band[i] == B_i`.
+///
+/// Bands with `B_i == 0` write nothing, matching [`decode_fine_energy`].
+/// The total raw bits written equals `sum(bits_per_band)`. Returns the
+/// first [`Error::InvalidParameter`] encountered (an `f` exceeding its
+/// band's bit width); on success every band's `f` is recoverable by
+/// [`decode_fine_energy`] over the finished frame.
+pub fn encode_fine_energy(
+    enc: &mut RangeEncoder,
+    f_per_band: &[u32; NUM_BANDS],
+    bits_per_band: &[u32; NUM_BANDS],
+) -> Result<(), Error> {
+    for b in 0..NUM_BANDS {
+        encode_fine_energy_band(enc, f_per_band[b], bits_per_band[b])?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -789,5 +870,114 @@ mod tests {
         assert_eq!(r.bits_consumed, 5);
         let after_final = dec.tell();
         assert_eq!(after_final - after_fine, 5);
+    }
+
+    // ---- encode-direction tests (§4.3.2.2 inverse) ----
+
+    /// `quantize_fine_energy_band` is the inverse of the decode grid:
+    /// quantizing the grid point produced by every legal `f`, then
+    /// re-decoding, recovers the same `f`.
+    #[test]
+    fn quantize_recovers_every_grid_point() {
+        for b in 1..=MAX_FINE_BITS {
+            for f in 0..(1u32 << b) {
+                let correction = fine_correction_q14(f, b);
+                let f2 = quantize_fine_energy_band(correction, b);
+                assert_eq!(f2, f, "b={b} f={f} correction={correction}");
+            }
+        }
+    }
+
+    /// `quantize_fine_energy_band` clamps out-of-range targets to the
+    /// grid endpoints.
+    #[test]
+    fn quantize_clamps_endpoints() {
+        for b in 1..=MAX_FINE_BITS {
+            // Below -1/2 → f = 0.
+            assert_eq!(quantize_fine_energy_band(-20000, b), 0, "b={b} low");
+            // At or above +1/2 → f = 2^b - 1.
+            assert_eq!(
+                quantize_fine_energy_band(20000, b),
+                (1u32 << b) - 1,
+                "b={b} high"
+            );
+        }
+        // b = 0: always 0.
+        assert_eq!(quantize_fine_energy_band(0, 0), 0);
+        assert_eq!(quantize_fine_energy_band(8000, 0), 0);
+    }
+
+    /// `encode_fine_energy_band` → `decode_fine_energy_band` round-trips
+    /// every legal `f` bit-exactly through the range coder.
+    #[test]
+    fn encode_decode_single_band_roundtrip() {
+        for b in 1..=MAX_FINE_BITS {
+            for f in 0..(1u32 << b) {
+                let mut enc = RangeEncoder::new();
+                encode_fine_energy_band(&mut enc, f, b).unwrap();
+                let frame = enc.finish();
+                let mut dec = RangeDecoder::new(&frame);
+                let correction = decode_fine_energy_band(&mut dec, b);
+                assert_eq!(correction, fine_correction_q14(f, b), "b={b} f={f}");
+                assert!(!dec.has_error());
+            }
+        }
+    }
+
+    /// `b_bits == 0` encode is a no-op: no raw bits written, nothing to
+    /// recover.
+    #[test]
+    fn encode_zero_bits_is_noop() {
+        let mut enc = RangeEncoder::new();
+        let before = enc.tell();
+        encode_fine_energy_band(&mut enc, 0, 0).unwrap();
+        assert_eq!(enc.tell(), before);
+    }
+
+    /// An `f` that does not fit in `b_bits` is rejected.
+    #[test]
+    fn encode_out_of_range_f_rejected() {
+        let mut enc = RangeEncoder::new();
+        assert_eq!(
+            encode_fine_energy_band(&mut enc, 4, 2),
+            Err(Error::InvalidParameter)
+        );
+    }
+
+    /// Full 21-band fine-energy encode → decode recovers every band's
+    /// correction, with the raw-bit budget matching `sum(bits_per_band)`.
+    #[test]
+    fn encode_decode_all_bands_roundtrip() {
+        // Vary the per-band bit counts and pick a pseudo-random f per
+        // band that fits each width.
+        let mut bits_per_band = [0u32; NUM_BANDS];
+        let mut f_per_band = [0u32; NUM_BANDS];
+        for b in 0..NUM_BANDS {
+            let width = b as u32 % (MAX_FINE_BITS + 1);
+            bits_per_band[b] = width;
+            f_per_band[b] = if width == 0 {
+                0
+            } else {
+                ((b as u32 * 7 + 3) % (1 << width)).min((1 << width) - 1)
+            };
+        }
+        let mut enc = RangeEncoder::new();
+        encode_fine_energy(&mut enc, &f_per_band, &bits_per_band).unwrap();
+        let frame = enc.finish();
+
+        let mut dec = RangeDecoder::new(&frame);
+        let before = dec.tell();
+        let corrections = decode_fine_energy(&mut dec, &bits_per_band);
+        let after = dec.tell();
+        let total_bits: u32 = bits_per_band.iter().sum();
+        assert_eq!(after - before, total_bits);
+        for b in 0..NUM_BANDS {
+            assert_eq!(
+                corrections[b],
+                fine_correction_q14(f_per_band[b], bits_per_band[b]),
+                "band {b}"
+            );
+        }
+        assert!(!dec.has_error());
     }
 }
