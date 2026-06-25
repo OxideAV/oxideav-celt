@@ -6,6 +6,15 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — §4.3.4.3 spread *encode* (inverse of
+  `decode_spread`):** `encode_spread(enc, spread)` writes the Table-56
+  `spread` field (PDF `{7,2,21,2}/32`) via the §5.1.2.3 ICDF path, using
+  the same `SPREAD_ICDF` table/`ftb` the decoder reads. Validated by a
+  per-variant round-trip and a back-to-back spread stream. +2 tests
+  (593 lib tests total). Provenance: RFC 6716 §4.3.4.3 + Table 56
+  (`docs/audio/opus/rfc6716-opus.txt`). Clean-room: ICDF inverse of the
+  existing spread decode; no external library source.
+
 * **Round-371 (2026-06-25) — §4.3.4.5 TF-parameter *encode* (inverse of
   `decode_tf_parameters`):** `encode_tf_changes` recovers each band's
   toggle bit from the cumulative per-band TF choice (`tf_changes[k] !=

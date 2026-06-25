@@ -441,7 +441,8 @@ Spreading parameter (RFC 6716 §4.3.4.3 + Table 56 + Table 59):
 * `decode_spread(dec)` reads the §4.3.4.3 spread field with PDF
   `{7, 2, 21, 2}/32` via the §4.1.3.3 ICDF path. Returns one of
   the four `Spread` variants `{None, Light, Normal, Aggressive}`
-  in raw-value order (`spread = 0..=3`).
+  in raw-value order (`spread = 0..=3`). `encode_spread(enc, spread)`
+  is the exact inverse, writing the same ICDF symbol.
 * `Spread::f_r()` is the Table 59 lookup: `None` (`spread=0`),
   `Some(15)` (`spread=1`), `Some(10)` (`spread=2`), `Some(5)`
   (`spread=3`). `f_r = None` means the spreading rotation is the

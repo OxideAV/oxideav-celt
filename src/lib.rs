@@ -387,8 +387,8 @@ pub use range_decoder::RangeDecoder;
 pub use range_encoder::{RangeEncoder, REM_EMPTY};
 pub use residual::{decode_residual_bands, ResidualSpectrum};
 pub use spread::{
-    decode_spread, pre_rotation_stride, rotation_gain_ratio, rotation_gain_squared_ratio, Spread,
-    DEFAULT_SPREAD,
+    decode_spread, encode_spread, pre_rotation_stride, rotation_gain_ratio,
+    rotation_gain_squared_ratio, Spread, DEFAULT_SPREAD,
 };
 pub use spread_rotation::{
     apply_2d_rotation, apply_nd_rotation, apply_nd_rotation_multi_block, apply_pre_rotation,

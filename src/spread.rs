@@ -59,6 +59,8 @@
 //! consulted.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// The four legal spread parameter values per RFC 6716 §4.3.4.3.
 ///
@@ -164,6 +166,18 @@ pub fn decode_spread(dec: &mut RangeDecoder<'_>) -> Spread {
         2 => Spread::Normal,
         _ => Spread::Aggressive,
     }
+}
+
+/// Encode the spreading parameter into the range coder — the exact
+/// inverse of [`decode_spread`] (RFC 6716 §4.3.4.3 + Table 56 `spread`
+/// row).
+///
+/// Writes one symbol with PDF `{7, 2, 21, 2}/32` via the §5.1.2.3 ICDF
+/// path, using the same `SPREAD_ICDF` table / `ftb` the decoder reads.
+/// A subsequent [`decode_spread`] over the finished frame recovers the
+/// same [`Spread`] variant.
+pub fn encode_spread(enc: &mut RangeEncoder, spread: Spread) -> Result<(), Error> {
+    enc.enc_icdf(usize::from(spread.as_u8()), SPREAD_ICDF, SPREAD_FTB)
 }
 
 /// Rotation-gain numerator and denominator for the §4.3.4.3 spreading
@@ -467,5 +481,47 @@ mod tests {
             s,
             Spread::None | Spread::Light | Spread::Normal | Spread::Aggressive
         ));
+    }
+
+    /// `encode_spread` → `decode_spread` recovers every variant.
+    #[test]
+    fn encode_decode_spread_roundtrip() {
+        for spread in [
+            Spread::None,
+            Spread::Light,
+            Spread::Normal,
+            Spread::Aggressive,
+        ] {
+            let mut enc = RangeEncoder::new();
+            encode_spread(&mut enc, spread).unwrap();
+            let frame = enc.finish();
+            let mut dec = RangeDecoder::new(&frame);
+            assert_eq!(decode_spread(&mut dec), spread);
+            assert!(!dec.has_error());
+        }
+    }
+
+    /// Multiple spread symbols back-to-back decode in order (the bias
+    /// the PDF gives the bulk Normal mode does not corrupt others).
+    #[test]
+    fn encode_decode_spread_stream() {
+        let seq = [
+            Spread::Normal,
+            Spread::None,
+            Spread::Aggressive,
+            Spread::Light,
+            Spread::Normal,
+            Spread::Normal,
+        ];
+        let mut enc = RangeEncoder::new();
+        for &s in &seq {
+            encode_spread(&mut enc, s).unwrap();
+        }
+        let frame = enc.finish();
+        let mut dec = RangeDecoder::new(&frame);
+        for &s in &seq {
+            assert_eq!(decode_spread(&mut dec), s);
+        }
+        assert!(!dec.has_error());
     }
 }
