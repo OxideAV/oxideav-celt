@@ -6,6 +6,20 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — §4.3.3 band-allocation field *encode*
+  (inverse of `decode_band_allocation`):** `encode_alloc_trim` (Table-58
+  icdf), `encode_skip_flag` / `encode_dual_stereo` (`{1,1}/2`),
+  `encode_intensity_band` (`enc_uint(offset, coded_bands+1)`), and the
+  `encode_band_allocation` orchestrator write the four §4.3.3 scalar
+  fields in Table-56 order, each emitted only when its gate is open —
+  the exact inverse of the gated decode. Validated by a round-trip
+  sweeping all-open / mono / all-closed gates × trim × skip × intensity
+  offset × dual, asserting gated-off fields decode back to their §4.3.3
+  defaults, plus out-of-range rejection. +2 tests (595 lib tests total).
+  Provenance: RFC 6716 §4.3.3 + Table 58 (`docs/audio/opus/rfc6716-opus.txt`).
+  Clean-room: gate-respecting inverse of the existing field decode; no
+  external library source.
+
 * **Round-371 (2026-06-25) — §4.3.4.3 spread *encode* (inverse of
   `decode_spread`):** `encode_spread(enc, spread)` writes the Table-56
   `spread` field (PDF `{7,2,21,2}/32`) via the §5.1.2.3 ICDF path, using

@@ -66,6 +66,8 @@
 //! was consulted.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// Default value of the allocation trim per RFC 6716 §4.3.3.
 ///
@@ -420,6 +422,86 @@ pub fn decode_band_allocation(
         out.dual_stereo = d;
     }
     out
+}
+
+// ---------------------------------------------------------------------
+// Encode direction (RFC 6716 §4.3.3, the inverse of the decode above).
+// ---------------------------------------------------------------------
+
+/// Encode the §4.3.3 allocation-trim parameter — inverse of
+/// [`decode_alloc_trim`]. A no-op when `gated == false` (the field is
+/// not emitted; the decoder defaults to `5`). Returns
+/// [`Error::InvalidParameter`] for `trim > 10`.
+pub fn encode_alloc_trim(enc: &mut RangeEncoder, gated: bool, trim: u8) -> Result<(), Error> {
+    if !gated {
+        return Ok(());
+    }
+    if trim as usize >= ALLOC_TRIM_ICDF.len() {
+        return Err(Error::InvalidParameter);
+    }
+    enc.enc_icdf(usize::from(trim), ALLOC_TRIM_ICDF, ALLOC_TRIM_FTB)
+}
+
+/// Encode the §4.3.3 binary skip flag (`{1,1}/2`) — inverse of
+/// [`decode_skip_flag`]. A no-op when `gated == false`.
+pub fn encode_skip_flag(enc: &mut RangeEncoder, gated: bool, skip: bool) -> Result<(), Error> {
+    if !gated {
+        return Ok(());
+    }
+    enc.enc_bit_logp(u32::from(skip), 1)
+}
+
+/// Encode the §4.3.3 intensity-band offset — inverse of
+/// [`decode_intensity_band`]. A no-op when `gated == false` or
+/// `coded_bands == 0`. Returns [`Error::InvalidParameter`] if
+/// `offset > coded_bands`.
+pub fn encode_intensity_band(
+    enc: &mut RangeEncoder,
+    gated: bool,
+    coded_bands: u32,
+    offset: u32,
+) -> Result<(), Error> {
+    if !gated || coded_bands == 0 {
+        return Ok(());
+    }
+    if offset > coded_bands {
+        return Err(Error::InvalidParameter);
+    }
+    enc.enc_uint(offset, coded_bands + 1)
+}
+
+/// Encode the §4.3.3 binary dual-stereo flag (`{1,1}/2`) — inverse of
+/// [`decode_dual_stereo`]. A no-op when `gated == false`.
+pub fn encode_dual_stereo(enc: &mut RangeEncoder, gated: bool, dual: bool) -> Result<(), Error> {
+    if !gated {
+        return Ok(());
+    }
+    enc.enc_bit_logp(u32::from(dual), 1)
+}
+
+/// Encode the four §4.3.3 band-allocation scalar fields in Table 56
+/// order (trim → skip → intensity → dual) — inverse of
+/// [`decode_band_allocation`].
+///
+/// Each field is written only if its gate is open, exactly mirroring
+/// the gated decode; the range encoder advances through the gated-on
+/// fields only. Returns the first [`Error::InvalidParameter`] from an
+/// out-of-range field (`alloc_trim > 10`, `intensity_band_offset >
+/// coded_bands`).
+pub fn encode_band_allocation(
+    enc: &mut RangeEncoder,
+    gates: BandAllocationGates,
+    alloc: &BandAllocation,
+) -> Result<(), Error> {
+    encode_alloc_trim(enc, gates.trim_gated, alloc.alloc_trim)?;
+    encode_skip_flag(enc, gates.skip_gated, alloc.skip)?;
+    encode_intensity_band(
+        enc,
+        gates.intensity_gated,
+        gates.coded_bands,
+        alloc.intensity_band_offset,
+    )?;
+    encode_dual_stereo(enc, gates.dual_gated, alloc.dual_stereo)
 }
 
 #[cfg(test)]
@@ -957,5 +1039,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- encode-direction round-trips (§4.3.3 field inverse) ----
+
+    /// `encode_band_allocation` → `decode_band_allocation` recovers
+    /// every field across all-gates-open and all-gates-closed, plus a
+    /// stereo case exercising intensity + dual.
+    #[test]
+    fn encode_decode_band_allocation_roundtrip() {
+        use crate::range_encoder::RangeEncoder;
+
+        let all_open = BandAllocationGates {
+            trim_gated: true,
+            skip_gated: true,
+            intensity_gated: true,
+            dual_gated: true,
+            coded_bands: 21,
+        };
+        let mono_trim_skip = BandAllocationGates {
+            trim_gated: true,
+            skip_gated: true,
+            intensity_gated: false,
+            dual_gated: false,
+            coded_bands: 21,
+        };
+        let all_closed = BandAllocationGates {
+            trim_gated: false,
+            skip_gated: false,
+            intensity_gated: false,
+            dual_gated: false,
+            coded_bands: 21,
+        };
+
+        for &gates in &[all_open, mono_trim_skip, all_closed] {
+            for trim in [0u8, 5, 10] {
+                for &skip in &[false, true] {
+                    for offset in [0u32, 7, 21] {
+                        for &dual in &[false, true] {
+                            let alloc = BandAllocation {
+                                alloc_trim: trim,
+                                skip,
+                                intensity_band_offset: offset,
+                                dual_stereo: dual,
+                            };
+                            let mut enc = RangeEncoder::new();
+                            encode_band_allocation(&mut enc, gates, &alloc).unwrap();
+                            let frame = enc.finish();
+                            let mut dec = RangeDecoder::new(&frame);
+                            let decoded = decode_band_allocation(&mut dec, gates);
+                            // Each field matches the input only where its
+                            // gate is open; gated-off fields decode to the
+                            // §4.3.3 defaults.
+                            let exp = BandAllocation {
+                                alloc_trim: if gates.trim_gated { trim } else { 5 },
+                                skip: gates.skip_gated && skip,
+                                intensity_band_offset: if gates.intensity_gated {
+                                    offset
+                                } else {
+                                    0
+                                },
+                                dual_stereo: gates.dual_gated && dual,
+                            };
+                            assert_eq!(decoded, exp, "gates={gates:?}");
+                            assert!(!dec.has_error());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Out-of-range fields are rejected by the field encoders.
+    #[test]
+    fn encode_band_allocation_rejects_out_of_range() {
+        use crate::range_encoder::RangeEncoder;
+        let mut enc = RangeEncoder::new();
+        assert_eq!(
+            encode_alloc_trim(&mut enc, true, 11),
+            Err(Error::InvalidParameter)
+        );
+        assert_eq!(
+            encode_intensity_band(&mut enc, true, 10, 11),
+            Err(Error::InvalidParameter)
+        );
     }
 }

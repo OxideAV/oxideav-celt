@@ -269,6 +269,13 @@ Bit-allocation field decoders (RFC 6716 §4.3.3 + Table 58):
   every gated-off field. The orchestrator does not touch the
   range decoder for gated-off fields, so caller-side
   `ec_tell_frac()` accounting stays accurate.
+* `encode_alloc_trim` / `encode_skip_flag` / `encode_intensity_band` /
+  `encode_dual_stereo` and the `encode_band_allocation(enc, gates,
+  alloc)` orchestrator are the exact inverses: each field is written
+  only when its gate is open, in Table-56 order, leaving the range
+  encoder untouched for gated-off fields. Out-of-range fields
+  (`alloc_trim > 10`, `intensity_band_offset > coded_bands`) are
+  rejected with `Error::InvalidParameter`.
 
 Initial reservations budget walk (RFC 6716 §4.3.3 + clean-room
 narrative §2.5):

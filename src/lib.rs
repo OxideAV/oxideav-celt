@@ -324,8 +324,9 @@ pub use band_split::{
 };
 pub use bit_allocation::{
     decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,
-    decode_skip_flag, intensity_rsv, reserve_stereo, BandAllocation, BandAllocationGates,
-    DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE,
+    decode_skip_flag, encode_alloc_trim, encode_band_allocation, encode_dual_stereo,
+    encode_intensity_band, encode_skip_flag, intensity_rsv, reserve_stereo, BandAllocation,
+    BandAllocationGates, DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE,
 };
 pub use bits_to_pulses::{
     bits_to_pulses_band_loop, bits_to_pulses_band_loop_cached, bits_to_pulses_search,
