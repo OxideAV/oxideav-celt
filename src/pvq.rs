@@ -86,6 +86,8 @@
 //! position reconstruction loop.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// Sentinel for "codebook size exceeds 32 bits" — never reached for
 /// legal PVQ inputs because §4.3.4.4 splits large bands before they hit
@@ -634,6 +636,46 @@ pub fn normalize_to_unit_l2(pulses: &[i32]) -> Vec<f32> {
 pub fn decode_unit_shape(dec: &mut RangeDecoder<'_>, n: u32, k: u32) -> Option<Vec<f32>> {
     let pulses = decode_pulses(dec, n, k)?;
     Some(normalize_to_unit_l2(&pulses))
+}
+
+/// Serialise a §4.3.4.2 pulse vector into the range coder — the exact
+/// inverse of [`decode_pulses`].
+///
+/// `pulses` must be a valid codeword (`pulses.len() == N` and
+/// `sum(|pulses|) == K`). The function maps it to its codeword index
+/// via [`encode_pulses_to_index`] and writes that index with
+/// [`RangeEncoder::enc_uint`] over `V(N, K)` — exactly the
+/// `dec_uint(V(N, K))` symbol [`decode_pulses`] consumes. A subsequent
+/// [`decode_pulses`] over the finished frame recovers the same vector.
+///
+/// Returns [`Error::InvalidParameter`] when the codebook size is zero or
+/// saturates the §4.3.4.4 32-bit bound, or when `pulses` is not a valid
+/// `(N, K)` codeword.
+pub fn encode_pulses(enc: &mut RangeEncoder, pulses: &[i32], n: u32, k: u32) -> Result<(), Error> {
+    let v_nk = v_count(n, k);
+    if v_nk == 0 || v_nk == V_COUNT_SATURATION {
+        return Err(Error::InvalidParameter);
+    }
+    let index = encode_pulses_to_index(pulses, n, k).ok_or(Error::InvalidParameter)?;
+    enc.enc_uint(index, v_nk)
+}
+
+/// Quantise an input vector `x` onto the §4.3.4.2 codebook and serialise
+/// the resulting codeword into the range coder — the encode-side
+/// counterpart of [`decode_unit_shape`].
+///
+/// Runs the §5.3.8.1 [`pvq_search`], encodes the integer pulse vector
+/// with [`encode_pulses`], and returns the quantised pulse vector `y`
+/// (so the caller can keep it for the §4.3.4.3 reverse spreading and the
+/// gain bookkeeping). `decode_pulses` over the finished frame recovers
+/// `y` exactly; `normalize_to_unit_l2(y)` is the unit-norm band shape
+/// `decode_unit_shape` would return. Returns [`Error::InvalidParameter`]
+/// on a search/encode rejection (`N == 0` with `K > 0`, a saturated
+/// `V(N, K)`).
+pub fn encode_shape(enc: &mut RangeEncoder, x: &[f32], n: u32, k: u32) -> Result<Vec<i32>, Error> {
+    let y = pvq_search(x, n, k).ok_or(Error::InvalidParameter)?;
+    encode_pulses(enc, &y, n, k)?;
+    Ok(y)
 }
 
 #[cfg(test)]
@@ -1324,5 +1366,87 @@ mod tests {
         // A saturated V(N, K) means the caller must split per §4.3.4.4
         // before getting here; we refuse to fabricate an index.
         assert!(decode_pulses(&mut dec, 180, 180).is_none());
+    }
+
+    // ---------- range-coder serialise round-trip (encode_pulses) ----------
+
+    /// `encode_pulses` → `decode_pulses` recovers the exact pulse vector
+    /// through the §5.1 range coder, across a spread of `(N, K)`.
+    #[test]
+    fn encode_pulses_roundtrip_through_range_coder() {
+        // Exhaustively enumerate every codeword for several small
+        // (N, K) and confirm each survives the range-coder round-trip.
+        for (n, k) in [(1u32, 1u32), (2, 1), (2, 2), (3, 2), (4, 3), (5, 2)] {
+            let v_nk = v_count(n, k);
+            for index in 0..v_nk {
+                let pulses = decode_index_to_pulses(index, n, k).unwrap();
+                let mut enc = RangeEncoder::new();
+                encode_pulses(&mut enc, &pulses, n, k).unwrap();
+                let frame = enc.finish();
+                let mut dec = RangeDecoder::new(&frame);
+                let recovered = decode_pulses(&mut dec, n, k).unwrap();
+                assert_eq!(recovered, pulses, "n={n} k={k} index={index}");
+                assert!(!dec.has_error());
+            }
+        }
+    }
+
+    /// Multiple PVQ bands serialised back-to-back into one frame decode
+    /// back in order — the per-band shape stream a real CELT frame packs.
+    #[test]
+    fn encode_pulses_multiband_stream() {
+        let bands: &[(u32, u32, u32)] = &[(4, 2, 3), (6, 3, 17), (2, 1, 0), (8, 4, 100)];
+        let mut enc = RangeEncoder::new();
+        let mut expected = Vec::new();
+        for &(n, k, idx) in bands {
+            let pulses = decode_index_to_pulses(idx % v_count(n, k), n, k).unwrap();
+            encode_pulses(&mut enc, &pulses, n, k).unwrap();
+            expected.push((n, k, pulses));
+        }
+        let frame = enc.finish();
+        let mut dec = RangeDecoder::new(&frame);
+        for (n, k, pulses) in &expected {
+            let recovered = decode_pulses(&mut dec, *n, *k).unwrap();
+            assert_eq!(&recovered, pulses, "n={n} k={k}");
+        }
+        assert!(!dec.has_error());
+    }
+
+    /// `encode_shape` quantises an input vector, serialises it, and the
+    /// decoder recovers the same quantised pulse vector — the full
+    /// input-vector → range-coded-bitstream → pulse-vector PVQ shape
+    /// encode chain.
+    #[test]
+    fn encode_shape_roundtrip() {
+        let x = [0.9f32, -0.3, 0.1, -0.7, 0.2, 0.05];
+        let n = x.len() as u32;
+        for k in [1u32, 2, 3, 5] {
+            let mut enc = RangeEncoder::new();
+            let y = encode_shape(&mut enc, &x, n, k).unwrap();
+            // The quantiser must produce a valid (N, K) codeword.
+            assert_eq!(y.iter().map(|v| v.unsigned_abs()).sum::<u32>(), k);
+            let frame = enc.finish();
+            let mut dec = RangeDecoder::new(&frame);
+            let recovered = decode_pulses(&mut dec, n, k).unwrap();
+            assert_eq!(recovered, y, "k={k}");
+            assert!(!dec.has_error());
+        }
+    }
+
+    /// `encode_pulses` rejects a saturated codebook and a malformed
+    /// codeword.
+    #[test]
+    fn encode_pulses_rejects_invalid() {
+        let mut enc = RangeEncoder::new();
+        // Saturated V(N, K).
+        assert_eq!(
+            encode_pulses(&mut enc, &[1; 180], 180, 180),
+            Err(Error::InvalidParameter)
+        );
+        // Wrong magnitude sum (claims K=3 but sums to 2).
+        assert_eq!(
+            encode_pulses(&mut enc, &[1, 1, 0], 3, 3),
+            Err(Error::InvalidParameter)
+        );
     }
 }

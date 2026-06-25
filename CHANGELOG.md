@@ -6,6 +6,26 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — §4.3.4.2 PVQ shape *encode* into the range
+  coder (inverse of `decode_pulses`):** `encode_pulses(enc, pulses, n,
+  k)` maps a pulse vector to its codeword index (via the existing
+  `encode_pulses_to_index`) and writes it with `RangeEncoder::enc_uint`
+  over `V(N, K)` — exactly the `dec_uint(V(N, K))` symbol
+  `decode_pulses` consumes. `encode_shape(enc, x, n, k)` chains the
+  §5.3.8.1 `pvq_search` quantiser with `encode_pulses`, giving the full
+  input-vector → range-coded-bitstream → pulse-vector PVQ shape encode
+  chain (the encode-side counterpart of `decode_unit_shape`). Validated
+  by exhaustively enumerating every codeword for several small `(N, K)`
+  and round-tripping each through `encode_pulses → finish →
+  decode_pulses`, a back-to-back multi-band shape stream, an
+  `encode_shape → decode_pulses` quantise-and-recover round-trip, and
+  saturated/malformed-codeword rejection. With the §5.1 range encoder
+  and the §4.3.2.2 fine-energy encode, the PVQ shape now has a complete
+  bitstream serialiser. +4 tests (584 lib tests total). Provenance: RFC
+  6716 §4.3.4.2 + §5.1 (`docs/audio/opus/rfc6716-opus.txt`). Clean-room:
+  composes the existing decode-inverse index map with the §5.1 encoder;
+  no external library source consulted.
+
 * **Round-371 (2026-06-25) — §4.3.2.2 fine-energy *encode* (the inverse
   of `decode_fine_energy`):** `quantize_fine_energy_band(correction_q14,
   b_bits)` inverts the §4.3.2.2 decode map `correction = (f+1/2)/2^B -

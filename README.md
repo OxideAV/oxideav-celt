@@ -771,6 +771,12 @@ Pyramid Vector Quantizer (RFC 6716 §4.3.4.2 decode + §5.3.8.1 encode):
   both transmits the codeword index and keeps the quantized integer
   pulse vector. The full encode chain: input vector → integer codeword
   → bitstream index. `decode_index_to_pulses(index) == pulses` always.
+* `encode_pulses(enc, pulses, n, k)` — serialises a pulse vector into
+  the §5.1 range coder (`encode_pulses_to_index` → `enc_uint(index,
+  V(N,K))`), the exact inverse of `decode_pulses`. `encode_shape(enc, x,
+  n, k)` chains `pvq_search` with it, returning the quantised pulse
+  vector — the full input-vector → range-coded-bitstream → pulse-vector
+  PVQ shape encode (encode-side counterpart of `decode_unit_shape`).
 * `V_COUNT_SATURATION = u32::MAX` — sentinel for the over-budget
   codebook case (callers that hit it must split per §4.3.4.4
   before retrying).

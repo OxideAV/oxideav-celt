@@ -377,8 +377,9 @@ pub use pulse_cache::{
     CACHE_INDEX50,
 };
 pub use pvq::{
-    decode_index_to_pulses, decode_pulses, decode_unit_shape, encode_pulses_to_index,
-    encode_unit_shape, normalize_to_unit_l2, pvq_search, v_count, V_COUNT_SATURATION,
+    decode_index_to_pulses, decode_pulses, decode_unit_shape, encode_pulses,
+    encode_pulses_to_index, encode_shape, encode_unit_shape, normalize_to_unit_l2, pvq_search,
+    v_count, V_COUNT_SATURATION,
 };
 pub use range_decoder::RangeDecoder;
 pub use range_encoder::{RangeEncoder, REM_EMPTY};
