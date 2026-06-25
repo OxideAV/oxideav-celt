@@ -73,14 +73,34 @@ the clean-room narrative §2.7 defer to the reference implementation.
 Both `decode_celt_frame` and `decode_stereo_frame` reject a transient
 frame with `Error::NotImplemented` rather than mis-decode it.
 
-**Encode building blocks, in progress.** The first encode-direction
-primitives are in place: the §4.3.4.2 PVQ codeword index encode
-(`encode_pulses_to_index`, the exact inverse of the decode loop) and the
-§5.3.8.1 PVQ codeword search (`pvq_search` → `encode_unit_shape`), giving
+**Encode building blocks, in progress.** The encode-direction primitives
+are growing: the §4.3.4.2 PVQ codeword index encode
+(`encode_pulses_to_index`, the exact inverse of the decode loop), the
+§5.3.8.1 PVQ codeword search (`pvq_search` → `encode_unit_shape`) giving
 the full input-vector → integer-codeword → bitstream-index PVQ encode
-chain (the range *encoder* that would serialise the index, the
-energy-quantization encode, and the codec-registration entry point still
-return `Error::NotImplemented`).
+chain, and — new in r371 — the **§5.1 range encoder** (`RangeEncoder`),
+the bit-exact inverse of the §4.1 range decoder, which serialises every
+encode-side range symbol into a frame. The energy-quantization encode and
+the codec-registration entry point still return `Error::NotImplemented`.
+
+**Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
+the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps
+the §5.1 four-tuple state `(val, rng, rem, ext)` and exposes `encode`
+(§5.1.1 generic `(fl, fh, ft)` symbol), `encode_bin` (§5.1.2.1),
+`enc_bit_logp` (§5.1.2.2), `enc_icdf` (§5.1.2.3, reusing the decoder's
+icdf tables), `enc_bits` (§5.1.3 raw bits from the end), `enc_uint`
+(§5.1.4, with the `ftb > 8` range-coded-top-8-bits + raw-remainder
+split), and `finish` (§5.1.5 `ec_enc_done`: the maximal-trailing-zeros
+`end` selection, carry flush, and range/raw byte merge). Renormalization
+(§5.1.1.1) drives the §5.1.1.2 carry-propagation / output-buffering
+scheme (the deferred `rem`/`ext` byte accounting). `tell()` / `tell_frac()`
+(§5.1.6) report the **same** budget the decoder reports after the same
+symbols — the §5.1 / §4.1.6 lockstep hook that CELT bit allocation
+depends on. Verified by full round-trips through `RangeDecoder`
+(`tests/range_codec_roundtrip.rs`): every symbol type, the large-`ft`
+split path, mixed interleaved streams, and 1000-op deterministic random
+streams recover bit-exactly with matching `rng`/`tell`/`tell_frac` at
+every step.
 
 **Documented allocation→pulses seam.** `tests/allocation_to_pulses.rs`
 composes the fully-specified §4.3.3 modules on *both sides* of the one

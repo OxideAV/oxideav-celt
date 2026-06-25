@@ -6,6 +6,38 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — §5.1 range encoder (the exact inverse of
+  the §4.1 range decoder):** new `range_encoder` module with the
+  bit-exact CELT/SILK range *encoder* per RFC 6716 §5.1
+  (`docs/audio/opus/rfc6716-opus.txt` lines 7352–7620). `RangeEncoder`
+  keeps the §5.1 four-tuple state `(val, rng, rem, ext)` and implements
+  every encode primitive: `encode` (§5.1.1 generic `(fl, fh, ft)`
+  symbol), `encode_bin` (§5.1.2.1), `enc_bit_logp` (§5.1.2.2),
+  `enc_icdf` (§5.1.2.3, sharing the decoder's icdf tables), `enc_bits`
+  (§5.1.3 raw bits packed from the end), `enc_uint` (§5.1.4, including
+  the `ftb > 8` range-coded-top-8-bits + raw-remainder split),
+  renormalization (§5.1.1.1) with carry propagation / output buffering
+  (§5.1.1.2, the `rem`/`ext` deferred-carry scheme), `finish` (§5.1.5
+  `ec_enc_done`: the maximal-trailing-zeros `end` choice, carry flush,
+  and range/raw byte merge), and `tell`/`tell_frac` budget accounting
+  (§5.1.6) that reports the **same** value the decoder reports after the
+  same symbols. Validated by full round-trips through the existing
+  `RangeDecoder`: 11 lib tests + a `tests/range_codec_roundtrip.rs`
+  integration suite (4 tests) drive every symbol type, the
+  large-`ft` split path, mixed interleaved streams, and 500/1000-op
+  deterministic pseudo-random streams, asserting bit-exact symbol
+  recovery and `rng`/`tell`/`tell_frac` encoder↔decoder lockstep at
+  every step (the §5.1 / §4.1.6 conformance hook). This is the
+  foundation for the CELT encode direction — every encode-side range
+  symbol (silence/post-filter/transient flags, the PVQ codeword index
+  from `encode_pulses_to_index`, coarse-energy Laplace, allocation
+  fields) now has a bit-packer to serialise into. +15 tests (574 lib
+  tests total). Provenance: RFC 6716 §5.1 (range encoder) and §4.1.6
+  (bit-usage accounting), both in-repo at
+  `docs/audio/opus/rfc6716-opus.txt`. Clean-room: the encoder is derived
+  purely as the algebraic inverse of the already-implemented §4.1
+  decoder plus the §5.1 prose; no external library source was consulted.
+
 * **Round-364 (2026-06-24) — §4.3.7.1 post-filter cross-frame
   gain-transition crossfade:** `apply_post_filter_transition_f32` +
   `PostFilterParams` implement the §4.3.7.1 smooth transition between

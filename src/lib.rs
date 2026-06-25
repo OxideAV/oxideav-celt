@@ -292,6 +292,7 @@ pub mod post_filter;
 pub mod pulse_cache;
 pub mod pvq;
 pub mod range_decoder;
+pub mod range_encoder;
 pub mod residual;
 pub mod spread;
 pub mod spread_rotation;
@@ -379,6 +380,7 @@ pub use pvq::{
     encode_unit_shape, normalize_to_unit_l2, pvq_search, v_count, V_COUNT_SATURATION,
 };
 pub use range_decoder::RangeDecoder;
+pub use range_encoder::{RangeEncoder, REM_EMPTY};
 pub use residual::{decode_residual_bands, ResidualSpectrum};
 pub use spread::{
     decode_spread, pre_rotation_stride, rotation_gain_ratio, rotation_gain_squared_ratio, Spread,
