@@ -6,6 +6,20 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-371 (2026-06-25) — assembled control-symbol encode chain
+  (integration test):** `tests/control_encode_roundtrip.rs` chains the
+  round's encode primitives in RFC 6716 Table-56 relative order — frame
+  prefix → TF parameters → spread → band-allocation fields → fine energy
+  → a PVQ band shape — into one `RangeEncoder` frame and decodes the
+  whole sequence back through the matching decoders, asserting every
+  value (header fields, tf_changes/tf_select, spread, trim/skip, per-band
+  fine corrections, quantised pulse vector) is recovered bit-exactly,
+  for both a non-transient post-filter-on frame and a transient
+  post-filter-off frame. Demonstrates the encode primitives compose
+  exactly as the decoder reads them (the §4.3.2.1 coarse-energy Laplace
+  block, which sits between the prefix and TF params in a real frame,
+  remains DOCS-GAP blocked on the encode side and is omitted). +2 tests.
+
 * **Round-371 (2026-06-25) — §4.3.3 band-allocation field *encode*
   (inverse of `decode_band_allocation`):** `encode_alloc_trim` (Table-58
   icdf), `encode_skip_flag` / `encode_dual_stereo` (`{1,1}/2`),

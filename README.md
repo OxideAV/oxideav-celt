@@ -83,10 +83,18 @@ bit-exact inverse of the §4.1 range decoder that serialises every
 encode-side range symbol into a frame — and the **§4.3.2.2 fine-energy
 encode** (`quantize_fine_energy_band` → `encode_fine_energy[_band]`, also
 r371), the inverse of `decode_fine_energy` that quantises a correction to
-the band's index `f` and writes it as `B_i` raw bits. The coarse
-§4.3.2.1 Laplace energy encode (DOCS-GAP, same boundary as the coarse
-decode) and the codec-registration entry point still return
-`Error::NotImplemented`.
+the band's index `f` and writes it as `B_i` raw bits. r371 also added the
+inverses of the remaining fully-specified control symbols: the §4.3
+frame prefix (`CeltFrameHeader::encode_prefix` +
+`encode_anti_collapse_flag`), the §4.3.4.5 TF parameters
+(`encode_tf_parameters`), the §4.3.4.3 spread (`encode_spread`), the
+§4.3.3 band-allocation fields (`encode_band_allocation`), and the
+§4.3.4.2 PVQ shape into the range coder (`encode_pulses` /
+`encode_shape`). `tests/control_encode_roundtrip.rs` chains them in
+Table-56 order into one frame and decodes the whole thing back
+bit-exactly. The coarse §4.3.2.1 Laplace energy encode (DOCS-GAP, same
+boundary as the coarse decode) and the codec-registration entry point
+still return `Error::NotImplemented`.
 
 **Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
 the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps
