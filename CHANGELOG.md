@@ -6,6 +6,22 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — §4.3.2.1 Laplace-symbol *encode*
+  (`ec_laplace_encode`, inverse of `ec_laplace_decode`):** builds the
+  same `{fl, fs}` sub-interval the decoder recovers for a signed value
+  and commits it to the §5.1 `RangeEncoder` with the 15-bit total
+  (`ec_encode(fl, min(fl+fs, 32768), 32768)`). Mirrors the decode walk
+  step for step — magnitude-1 seed, the `fs *= 2` / `decay` geometric
+  body, the `LAPLACE_MINP` flat tail, and the sign placement — clamping
+  an unrepresentable magnitude to the largest value the decoder can
+  ever produce and returning the actually-encoded value. Validated by
+  single-symbol and multi-symbol round-trips through `ec_laplace_decode`
+  over a parameter spread, across **every `E_PROB_MODEL` cell**, plus a
+  clamp-corner round-trip. +4 tests. Provenance: clean-room narrative
+  `docs/audio/celt/spec/celt-laplace-decode.md` §5 (the documented
+  mirror-image encoder interval construction) + RFC 6716 §4.3.2.1. No
+  external library source consulted.
+
 * **Round-371 (2026-06-25) — assembled control-symbol encode chain
   (integration test):** `tests/control_encode_roundtrip.rs` chains the
   round's encode primitives in RFC 6716 Table-56 relative order — frame

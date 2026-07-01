@@ -46,6 +46,8 @@
 //! library source was consulted.
 
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// Base-2 log of the minimum probability floor of an energy delta
 /// (out of 32768). The §4.3.2.1 constant is 0
@@ -147,6 +149,100 @@ pub fn ec_laplace_decode(dec: &mut RangeDecoder<'_>, fs0: u32, decay: u32) -> i3
     debug_assert!(fm < (fl + fs).min(FT_TOTAL));
     dec.dec_update(fl, (fl + fs).min(FT_TOTAL), FT_TOTAL);
     val
+}
+
+/// Encode one signed value drawn from the §4.3.2.1 Laplace
+/// distribution — the exact inverse of [`ec_laplace_decode`].
+///
+/// This builds the same `{fl, fs}` sub-interval the decoder recovers
+/// for `value`, then commits it to the range encoder with the 15-bit
+/// total (`ec_encode(fl, min(fl + fs, 32768), 32768)`). The
+/// mirror-image interval construction is documented as wire-format
+/// facts in the clean-room narrative
+/// `docs/audio/celt/spec/celt-laplace-decode.md` §5 ("The encoder
+/// builds the same `{fl, fs}` interval for a given magnitude by the
+/// mirror-image process — start at `fl = fs` for nonzero values,
+/// multiply `fs` by 2 and shrink by `decay` per magnitude, switch to
+/// the `LAPLACE_MINP` floor once `fs` reaches 0, and finally place the
+/// sign by adding `fs` (positive) or not (negative)").
+///
+/// * `value` — the signed magnitude to code (0 codes the central span).
+/// * `fs0` — probability of the value 0 (Q15, `prob << 7`).
+/// * `decay` — tail decay rate (Q14, `decay << 6`, below 16384).
+///
+/// A magnitude so large that its interval would exceed the 15-bit
+/// space is **clamped** to the largest representable value in that
+/// direction — the same range the decoder can ever produce. The
+/// function returns the value it actually encoded (equal to `value`
+/// except in the clamped corner) so the caller can update the
+/// coarse-energy prediction state with the quantity the decoder will
+/// reconstruct.
+///
+/// Returns [`Error::InvalidParameter`] only if the underlying
+/// [`RangeEncoder::encode`] rejects the interval (a finalized stream);
+/// the interval itself is always well-formed by construction.
+pub fn ec_laplace_encode(
+    enc: &mut RangeEncoder,
+    value: i32,
+    fs0: u32,
+    decay: u32,
+) -> Result<i32, Error> {
+    debug_assert!(fs0 > 0 && fs0 < FT_TOTAL, "fs0 out of (0, 32768): {fs0}");
+    debug_assert!(decay < 16384, "decay out of [0, 16384): {decay}");
+    let mut fl: u32 = 0;
+    let mut fs = fs0;
+    let mut encoded: i32 = 0;
+    if value != 0 {
+        let sign_neg = value < 0;
+        let mag = value.unsigned_abs();
+        // Step onto magnitude 1 (mirror of decode step 3).
+        fl = fs0;
+        fs = laplace_get_freq1(fs0, decay) + LAPLACE_MINP;
+        let mut m: u32 = 1;
+        // Walk down the decaying body to the target magnitude
+        // (mirror of decode step 4).
+        while fs > LAPLACE_MINP && m < mag {
+            fs *= 2;
+            fl += fs;
+            fs = ((fs - 2 * LAPLACE_MINP) * decay) >> 15;
+            fs += LAPLACE_MINP;
+            m += 1;
+        }
+        if m < mag {
+            // Flat tail: fs has bottomed out at LAPLACE_MINP and every
+            // remaining magnitude occupies 2*LAPLACE_MINP ticks (a ±
+            // pair). Advance by `di` magnitudes in one step (mirror of
+            // decode step 5), clamped so the chosen half stays inside
+            // the 15-bit space.
+            let want_di = mag - m;
+            let high_reserve = if sign_neg {
+                // negative half is [fl, fl + fs); its high end must be
+                // <= FT_TOTAL, so keep fl + fs <= FT_TOTAL.
+                LAPLACE_MINP
+            } else {
+                // positive half is [fl + fs, fl + 2*fs); keep its high
+                // end fl + 2*fs <= FT_TOTAL.
+                2 * LAPLACE_MINP
+            };
+            let headroom = FT_TOTAL.saturating_sub(fl + high_reserve);
+            let di_max = headroom / (2 * LAPLACE_MINP);
+            let di = want_di.min(di_max);
+            fl += 2 * di * LAPLACE_MINP;
+            m += di;
+        }
+        // Resolve the sign and final interval (mirror of decode step 6).
+        if sign_neg {
+            encoded = -(m as i32);
+        } else {
+            fl += fs;
+            encoded = m as i32;
+        }
+    }
+    let fh = (fl + fs).min(FT_TOTAL);
+    debug_assert!(fl < FT_TOTAL);
+    debug_assert!(fl < fh);
+    enc.encode(fl, fh, FT_TOTAL)?;
+    Ok(encoded)
 }
 
 #[cfg(test)]
@@ -301,6 +397,128 @@ mod tests {
         for _ in 0..8 {
             let v = ec_laplace_decode(&mut dec, 2816, 11_392);
             assert!(v.unsigned_abs() < FT_TOTAL / 2);
+        }
+    }
+
+    /// The encoder is the exact inverse of the decoder: for a spread of
+    /// `(fs0, decay)` parameters, every value in a modest magnitude
+    /// range round-trips through `ec_laplace_encode` → `finish` →
+    /// `ec_laplace_decode` to the value the encoder reported it wrote.
+    #[test]
+    fn encode_decode_roundtrip_single_symbol() {
+        let params: &[(u32, u32)] = &[
+            (9216, 8128),
+            (128, 11_392),
+            (24_576, 640),
+            (4096, 0),
+            (2816, 11_392),
+            (5376, 9088),
+        ];
+        for &(fs0, decay) in params {
+            for value in -12i32..=12 {
+                let mut enc = RangeEncoder::new();
+                let encoded = ec_laplace_encode(&mut enc, value, fs0, decay).unwrap();
+                assert_eq!(
+                    encoded, value,
+                    "value {value} clamped unexpectedly for fs0={fs0} decay={decay}"
+                );
+                let out = enc.finish();
+                let mut dec = RangeDecoder::new(&out);
+                let got = ec_laplace_decode(&mut dec, fs0, decay);
+                assert_eq!(
+                    got, encoded,
+                    "roundtrip mismatch value={value} fs0={fs0} decay={decay}"
+                );
+                assert!(!dec.has_error());
+            }
+        }
+    }
+
+    /// A back-to-back stream of Laplace symbols with mixed parameters
+    /// round-trips in order through a single frame.
+    #[test]
+    fn encode_decode_roundtrip_symbol_stream() {
+        let stream: &[(i32, u32, u32)] = &[
+            (0, 9216, 8128),
+            (3, 128, 11_392),
+            (-2, 24_576, 640),
+            (1, 4096, 0),
+            (-5, 2816, 11_392),
+            (7, 5376, 9088),
+            (0, 128, 11_392),
+            (-1, 9216, 8128),
+        ];
+        let mut enc = RangeEncoder::new();
+        let mut expected = Vec::new();
+        for &(v, fs0, decay) in stream {
+            expected.push(ec_laplace_encode(&mut enc, v, fs0, decay).unwrap());
+        }
+        let out = enc.finish();
+        let mut dec = RangeDecoder::new(&out);
+        for (i, (&(_, fs0, decay), &exp)) in stream.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(ec_laplace_decode(&mut dec, fs0, decay), exp, "symbol {i}");
+        }
+        assert!(!dec.has_error());
+    }
+
+    /// Every `(prob, decay)` cell in the staged `E_PROB_MODEL` table
+    /// round-trips a representative value set, confirming the encoder
+    /// inverts the decoder across the entire parameter space the
+    /// coarse-energy path uses.
+    #[test]
+    fn encode_decode_roundtrip_all_prob_model_cells() {
+        let values = [-4i32, -1, 0, 1, 2, 6];
+        for lm_row in E_PROB_MODEL.iter() {
+            for intra_row in lm_row.iter() {
+                for cell in intra_row.iter() {
+                    let fs0 = (cell.prob as u32) << 7;
+                    let decay = (cell.decay as u32) << 6;
+                    let mut enc = RangeEncoder::new();
+                    let mut expected = Vec::new();
+                    for &v in &values {
+                        expected.push(ec_laplace_encode(&mut enc, v, fs0, decay).unwrap());
+                    }
+                    let out = enc.finish();
+                    let mut dec = RangeDecoder::new(&out);
+                    for (&exp, &v) in expected.iter().zip(values.iter()) {
+                        // The chosen values are all inside the
+                        // representable range, so no clamping occurs.
+                        assert_eq!(exp, v, "clamp at prob={} decay={}", cell.prob, cell.decay);
+                        assert_eq!(
+                            ec_laplace_decode(&mut dec, fs0, decay),
+                            exp,
+                            "roundtrip prob={} decay={}",
+                            cell.prob,
+                            cell.decay
+                        );
+                    }
+                    assert!(!dec.has_error());
+                }
+            }
+        }
+    }
+
+    /// A magnitude too large for the 15-bit space is clamped to the
+    /// largest representable value, and the clamped value still
+    /// round-trips (the decoder can never produce anything larger).
+    #[test]
+    fn encode_clamps_unrepresentable_magnitude() {
+        // A high zero-probability leaves little tail room, so a large
+        // magnitude must clamp.
+        let fs0 = 32_000u32;
+        let decay = 64u32;
+        for &value in &[10_000i32, -10_000, 20_000, -20_000] {
+            let mut enc = RangeEncoder::new();
+            let encoded = ec_laplace_encode(&mut enc, value, fs0, decay).unwrap();
+            assert!(
+                encoded.unsigned_abs() <= value.unsigned_abs(),
+                "clamp grew the magnitude: {value} -> {encoded}"
+            );
+            assert_eq!(encoded.signum(), value.signum(), "clamp flipped the sign");
+            let out = enc.finish();
+            let mut dec = RangeDecoder::new(&out);
+            assert_eq!(ec_laplace_decode(&mut dec, fs0, decay), encoded);
+            assert!(!dec.has_error());
         }
     }
 }

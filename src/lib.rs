@@ -365,7 +365,9 @@ pub use hadamard::{
     apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
     HADAMARD_LEVEL_SCALE,
 };
-pub use laplace::{ec_laplace_decode, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN};
+pub use laplace::{
+    ec_laplace_decode, ec_laplace_encode, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN,
+};
 pub use mdct::{
     build_low_overlap_window_f32, build_window_half_f32, celt_window_f32, imdct_naive_f32,
     mdct_naive_f32, MdctSynthesis, BASIC_WINDOW_HALF, BASIC_WINDOW_LEN,
