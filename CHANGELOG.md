@@ -6,6 +6,25 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — §4.3.2.1 coarse-energy *encode*
+  (`encode_coarse_energy`, inverse of `decode_coarse_energy`):** given
+  the encoder's chosen per-band target log-2 energies, walks the same
+  band-major/channel-minor order, quantizes each band's prediction
+  error to the nearest integer 6 dB step
+  `qi = round(target - prediction)` (the natural inverse of the decoder
+  reconstruction `E = prediction + qi`), and writes it through the same
+  budget-keyed dispatch the decoder uses (≥15 bits → Laplace, ≥2 →
+  2-bit zig-zag `SMALL_ENERGY_ICDF`, ≥1 → one `{1,1}/2` bit, else
+  implicit `qi = -1`). Updates the prediction state with the actually
+  coded `qi` so the two sides stay in exact range-coder lockstep.
+  Validated by encode→decode round-trips reconstructing the identical
+  `state.energy` across mono/stereo × intra/inter × every frame size on
+  the full-Laplace path, a nearest-step reconstruction bound, a
+  low-budget fallback round-trip, and out-of-range rejection. +4 tests.
+  Provenance: RFC 6716 §4.3.2.1 + `celt-coarse-energy-and-allocation.md`
+  §1.3 (the documented decode recursion whose inverse this is). No
+  external library source consulted.
+
 * **Round-382 (2026-07-02) — §4.3.2.1 Laplace-symbol *encode*
   (`ec_laplace_encode`, inverse of `ec_laplace_decode`):** builds the
   same `{fl, fs}` sub-interval the decoder recovers for a signed value

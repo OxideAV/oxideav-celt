@@ -334,8 +334,8 @@ pub use bits_to_pulses::{
     EIGHTH_BITS_PER_BIT, K_SEARCH_CAP, LAST_BALANCE_DIVISOR, SECOND_TO_LAST_BALANCE_DIVISOR,
 };
 pub use coarse_energy::{
-    decode_coarse_energy, CoarseEnergyState, BETA_COEF_Q15, INTRA_ALPHA_Q15, INTRA_BETA_Q15,
-    MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, SMALL_ENERGY_ICDF,
+    decode_coarse_energy, encode_coarse_energy, CoarseEnergyState, BETA_COEF_Q15, INTRA_ALPHA_Q15,
+    INTRA_BETA_Q15, MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, SMALL_ENERGY_ICDF,
 };
 pub use deemphasis::{deemphasize_in_place_f32, Deemphasis, ALPHA_P_F32, ALPHA_P_Q15};
 pub use denormalization::{

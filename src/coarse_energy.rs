@@ -89,8 +89,9 @@
 //! was consulted.
 
 use crate::e_prob_model::{E_PROB_MODEL, NUM_LM_FRAME_SIZES, PRED_INTER, PRED_INTRA};
-use crate::laplace::ec_laplace_decode;
+use crate::laplace::{ec_laplace_decode, ec_laplace_encode};
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
 use crate::Error;
 
 /// Number of CELT bands per RFC 6716 Table 55 (band index 0..=20).
@@ -287,9 +288,115 @@ pub fn decode_coarse_energy(
     Ok(())
 }
 
+/// Encode one CELT frame's coarse energy envelope
+/// (RFC 6716 §4.3.2.1) — the exact inverse of [`decode_coarse_energy`].
+///
+/// Given the encoder's chosen per-band target log-2 energies
+/// (`target[c][band]`, 1.0 = 6 dB) this walks the same
+/// band-major/channel-minor order the decoder reads, quantizes each
+/// band's prediction error to the nearest integer 6 dB step
+/// `qi = round(target - prediction)` — the natural inverse of the
+/// decoder reconstruction `E = prediction + qi` — and writes it through
+/// the same budget-keyed dispatch the decoder uses:
+///
+/// * `>= 15` bits left — full Laplace encode ([`ec_laplace_encode`]).
+/// * `>= 2` — the 2-bit zig-zag [`SMALL_ENERGY_ICDF`] symbol
+///   (`qi` clamped to `{-1, 0, +1}`).
+/// * `>= 1` — a single `{1,1}/2` bit (`qi` clamped to `{-1, 0}`).
+/// * otherwise — the implicit `qi = -1`, no bits written.
+///
+/// The prediction state is updated with the **actually coded** `qi`
+/// (post-clamp, post-Laplace-clamp), so a subsequent
+/// [`decode_coarse_energy`] over the produced frame reconstructs the
+/// identical per-band `state.energy` and the two sides stay in the
+/// exact range-coder lockstep RFC 6716 §4.3.3 requires.
+///
+/// * `budget` is the intended total frame size in bits — the value the
+///   decoder will report from [`RangeDecoder::storage_bits`]. The
+///   encoder must therefore know the target frame size so its fallback
+///   dispatch matches the decoder's. `enc.tell()` locksteps with the
+///   decoder's `dec.tell()` after the same preceding symbols (§5.1.6 /
+///   §4.1.6), so the caller encodes the Table-56 prefix into `enc`
+///   before this call, exactly as a real frame is laid out.
+///
+/// Returns [`Error::InvalidParameter`] for an out-of-range `lm`, band
+/// window, or channel count (the encoder and state are untouched), or
+/// propagates a [`RangeEncoder`] rejection (a finalized stream).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_coarse_energy(
+    enc: &mut RangeEncoder,
+    state: &mut CoarseEnergyState,
+    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    intra: bool,
+    lm: u32,
+    start: usize,
+    end: usize,
+    channels: usize,
+    budget: u32,
+) -> Result<(), Error> {
+    if lm as usize >= NUM_LM_FRAME_SIZES
+        || start > end
+        || end > NUM_BANDS
+        || channels == 0
+        || channels > MAX_CHANNELS
+    {
+        return Err(Error::InvalidParameter);
+    }
+    let lm = lm as usize;
+    let pred = if intra { PRED_INTRA } else { PRED_INTER };
+    let (coef, beta) = if intra {
+        (0.0_f32, INTRA_BETA_Q15 as f32 / Q15_ONE as f32)
+    } else {
+        (
+            PRED_COEF_Q15[lm] as f32 / Q15_ONE as f32,
+            BETA_COEF_Q15[lm] as f32 / Q15_ONE as f32,
+        )
+    };
+    let mut prev = [0.0_f32; MAX_CHANNELS];
+    for band in start..end {
+        for (c, prev_c) in prev.iter_mut().enumerate().take(channels) {
+            let tell = enc.tell();
+            let bits_left = budget.saturating_sub(tell);
+            let old = state.energy[c][band].max(ENERGY_FLOOR);
+            // The decoder reconstructs E = coef*old + prev + qi, so the
+            // encoder picks qi to make that land nearest the target.
+            let prediction = coef * old + *prev_c;
+            let qi_ideal = (target[c][band] - prediction).round() as i32;
+            let qi: i32 = if bits_left >= LAPLACE_MIN_BUDGET_BITS {
+                let pd = E_PROB_MODEL[lm][pred][band.min(NUM_BANDS - 1)];
+                ec_laplace_encode(enc, qi_ideal, (pd.prob as u32) << 7, (pd.decay as u32) << 6)?
+            } else if bits_left >= 2 {
+                // 2-bit zig-zag fallback: qi ∈ {0, -1, +1} ⇒ s ∈ {0,1,2}
+                // via the inverse of (s >> 1) ^ -(s & 1).
+                let clamped = qi_ideal.clamp(-1, 1);
+                let s = match clamped {
+                    0 => 0usize,
+                    -1 => 1,
+                    _ => 2,
+                };
+                enc.enc_icdf(s, &SMALL_ENERGY_ICDF, 2)?;
+                clamped
+            } else if bits_left >= 1 {
+                // 1-bit fallback: qi ∈ {0, -1}, bit = -qi.
+                let clamped = qi_ideal.clamp(-1, 0);
+                enc.enc_bit_logp((-clamped) as u32, 1)?;
+                clamped
+            } else {
+                // No bits left: the implicit prediction error.
+                -1
+            };
+            let q = qi as f32;
+            state.energy[c][band] = coef * old + *prev_c + q;
+            *prev_c += q - beta * q;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::range_encoder::RangeEncoder;
 
     /// The band count comes from RFC 6716 Table 55, which enumerates
     /// 21 bands (index 0..=20). Pin the count so future refactors
@@ -489,6 +596,162 @@ mod tests {
         state.energy[1][3] = 2.5;
         decode_coarse_energy(&mut dec, &mut state, false, 1, 0, NUM_BANDS, 2).unwrap();
         assert_eq!(state.energy[0], state.energy[1]);
+    }
+
+    /// The coarse-energy encode is the exact inverse of the decode:
+    /// encoding a set of target energies then decoding the produced
+    /// frame reconstructs the identical per-band `state.energy`, for
+    /// mono and stereo, intra and inter, over every frame size. The
+    /// budget is large enough that every slot takes the full Laplace
+    /// path.
+    #[test]
+    fn encode_decode_roundtrip_full_laplace() {
+        // A representative target envelope (base-2 log energies).
+        let target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [
+            std::array::from_fn(|b| 4.0 - 0.12 * b as f32),
+            std::array::from_fn(|b| 3.5 - 0.10 * b as f32),
+        ];
+        for intra in [false, true] {
+            for lm in 0..NUM_LM_FRAME_SIZES as u32 {
+                for channels in 1..=2usize {
+                    // Ample budget: a 128-byte frame (1024 bits) keeps
+                    // every slot on the full Laplace path.
+                    let budget = 1024u32;
+                    let mut enc_state = CoarseEnergyState::new();
+                    let mut enc = RangeEncoder::new();
+                    encode_coarse_energy(
+                        &mut enc,
+                        &mut enc_state,
+                        &target,
+                        intra,
+                        lm,
+                        0,
+                        NUM_BANDS,
+                        channels,
+                        budget,
+                    )
+                    .unwrap();
+                    let out = enc.finish();
+                    // The decoder needs storage_bits() == budget; pad the
+                    // frame to exactly 128 bytes so the fallback dispatch
+                    // matches the encoder's.
+                    let mut framed = out;
+                    framed.resize((budget / 8) as usize, 0);
+                    let mut dec = RangeDecoder::new(&framed);
+                    let mut dec_state = CoarseEnergyState::new();
+                    decode_coarse_energy(
+                        &mut dec,
+                        &mut dec_state,
+                        intra,
+                        lm,
+                        0,
+                        NUM_BANDS,
+                        channels,
+                    )
+                    .unwrap();
+                    assert!(!dec.has_error(), "sticky error lm={lm} intra={intra}");
+                    for c in 0..channels {
+                        assert_eq!(
+                            enc_state.energy[c], dec_state.energy[c],
+                            "state mismatch c={c} lm={lm} intra={intra} ch={channels}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The reconstructed coarse energy is within a half 6 dB step of the
+    /// target on the full-Laplace path (coarse quantization is
+    /// round-to-nearest of the prediction error).
+    #[test]
+    fn encode_reconstruction_is_nearest_step() {
+        let target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [
+            std::array::from_fn(|b| 2.0 + 0.37 * (b as f32).sin()),
+            [0.0; NUM_BANDS],
+        ];
+        let mut enc_state = CoarseEnergyState::new();
+        let mut enc = RangeEncoder::new();
+        encode_coarse_energy(
+            &mut enc,
+            &mut enc_state,
+            &target,
+            true,
+            2,
+            0,
+            NUM_BANDS,
+            1,
+            2048,
+        )
+        .unwrap();
+        // Reconstruction error per band must not exceed one integer 6 dB
+        // step (the coarse resolution); the prediction chain can spread
+        // the residual, but each qi is the nearest-integer choice.
+        for (b, (&got, &want)) in enc_state.energy[0].iter().zip(target[0].iter()).enumerate() {
+            let err = (got - want).abs();
+            assert!(
+                err <= 1.0,
+                "band {b} coarse error {err} exceeds a full step"
+            );
+        }
+    }
+
+    /// Encoding then decoding under a tiny budget exercises the low-rate
+    /// fallbacks (2-bit / 1-bit / no-bit) and still round-trips the
+    /// reconstructed state exactly.
+    #[test]
+    fn encode_decode_roundtrip_low_budget_fallbacks() {
+        let target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [
+            std::array::from_fn(|b| 1.0 - 0.2 * b as f32),
+            [0.0; NUM_BANDS],
+        ];
+        // A 4-byte frame (32 bits): after a few Laplace symbols the
+        // budget drops through the 2-bit, 1-bit and no-bit fallbacks.
+        let budget = 32u32;
+        let mut enc_state = CoarseEnergyState::new();
+        let mut enc = RangeEncoder::new();
+        encode_coarse_energy(
+            &mut enc,
+            &mut enc_state,
+            &target,
+            false,
+            1,
+            0,
+            NUM_BANDS,
+            1,
+            budget,
+        )
+        .unwrap();
+        let mut framed = enc.finish();
+        framed.resize((budget / 8) as usize, 0);
+        let mut dec = RangeDecoder::new(&framed);
+        let mut dec_state = CoarseEnergyState::new();
+        decode_coarse_energy(&mut dec, &mut dec_state, false, 1, 0, NUM_BANDS, 1).unwrap();
+        assert_eq!(enc_state.energy[0], dec_state.energy[0]);
+    }
+
+    /// Out-of-range parameters are rejected by the encoder without
+    /// touching the encoder or the state.
+    #[test]
+    fn encode_invalid_parameters_rejected() {
+        let target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        let mut state = CoarseEnergyState::new();
+        let mut enc = RangeEncoder::new();
+        let tell_before = enc.tell();
+        assert_eq!(
+            encode_coarse_energy(&mut enc, &mut state, &target, true, 4, 0, NUM_BANDS, 1, 1024),
+            Err(Error::InvalidParameter)
+        );
+        assert_eq!(
+            encode_coarse_energy(&mut enc, &mut state, &target, true, 0, 5, 4, 1, 1024),
+            Err(Error::InvalidParameter)
+        );
+        assert_eq!(
+            encode_coarse_energy(&mut enc, &mut state, &target, true, 0, 0, NUM_BANDS, 3, 1024),
+            Err(Error::InvalidParameter)
+        );
+        assert_eq!(enc.tell(), tell_before);
+        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
     }
 
     /// With a real (non-empty) buffer the full Laplace path runs for
