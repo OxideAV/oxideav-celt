@@ -6,6 +6,22 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — coarse-energy encode in the Table-56 frame
+  chain (integration test):** `tests/coarse_energy_frame_roundtrip.rs`
+  places the §4.3.2.1 coarse-energy block in its real frame position —
+  between the frame prefix and the TF parameters (RFC 6716 §4.3, Table
+  56) — chaining prefix → coarse energy → TF parameters → spread into
+  one `RangeEncoder` frame and decoding it back, closing the gap
+  `control_encode_roundtrip.rs` documents (it omitted coarse energy
+  because the encode side did not exist). The frame carries no raw-bit
+  symbols (post-filter off), so the finished bytes are padded to a fixed
+  length and the decoder's `storage_bits()` equals the encoder's
+  budget, keeping the coarse-energy budget dispatch in lockstep. Covers
+  mono/intra, stereo/inter (both channels' coarse interleave), and two
+  consecutive frames sharing a `CoarseEnergyState` (the second frame's
+  inter-frame time-arm prediction runs against the first's reconstructed
+  energies). +3 tests.
+
 * **Round-382 (2026-07-02) — §4.3.2.1 coarse-energy *encode*
   (`encode_coarse_energy`, inverse of `decode_coarse_energy`):** given
   the encoder's chosen per-band target log-2 energies, walks the same
