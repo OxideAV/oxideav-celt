@@ -6,6 +6,20 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — energy encode→decode pipeline (integration
+  test):** `tests/energy_encode_pipeline.rs` drives the whole encoder
+  energy front-end into the decoder energy back-end end-to-end —
+  **analyze** an MDCT spectrum into per-band coarse-energy targets +
+  unit shapes (§4.3.6 inverse), **encode** the coarse energy from those
+  targets (§4.3.2.1), **decode** it back and assemble the Q8 envelope
+  (§4.3.2), then **denormalize** the analyzed shapes at the
+  reconstructed energies (§4.3.6) and confirm the recovered spectrum
+  tracks the original to the coarse 6 dB resolution (per-band amplitude
+  ratio within 2^±0.25). Asserts the coarse reconstruction is within a
+  half 6 dB step, that the §4.3.2.2 fine step (applied arithmetically)
+  never worsens and is bounded by the fine step, and that the encoder /
+  decoder coarse state matches bit-exactly. +1 test.
+
 * **Round-382 (2026-07-02) — §4.3.6 band energy *analysis* (encode
   front-end, `band_analysis` module):** the exact inverse of the §4.3.6
   denormalization. `analyze_band_f32` splits an MDCT-domain band into
