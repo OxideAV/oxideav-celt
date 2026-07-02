@@ -309,8 +309,66 @@ impl RangeEncoder {
     /// buffer (the last range byte ORed into any raw bits sharing it).
     /// After this call no further symbols may be encoded.
     pub fn finish(mut self) -> Vec<u8> {
+        self.finalize_state();
+        self.assemble()
+    }
+
+    /// Finalize the stream into a frame of **exactly** `target_len`
+    /// bytes (RFC 6716 §5.1 frame layout).
+    ///
+    /// The range-coded prefix occupies the front of the frame and the
+    /// §5.1.3 raw bits occupy the back (they are read from the frame
+    /// end by [`crate::range_decoder::RangeDecoder::dec_bits`]); the
+    /// bytes between are zero. This is the assembly a real CELT frame
+    /// needs when the encoder targets a fixed frame size — the §4.3.3
+    /// budget both sides compute from `storage_bits()` — because
+    /// post-`finish` zero-padding would displace the raw-bit region
+    /// away from the frame end the decoder reads it from.
+    ///
+    /// Per §5.1.5, when the two regions meet in a shared boundary byte
+    /// the final range byte is ORed with the raw bits packed there.
+    /// This implementation accepts a one-byte overlap through that OR
+    /// merge and rejects anything tighter with
+    /// [`Error::InvalidParameter`] (the target frame is too small for
+    /// the symbols already written).
+    pub fn finish_to_size(mut self, target_len: usize) -> Result<Vec<u8>, Error> {
+        self.finalize_state();
+        // Front: range-coded bytes (+ buffered rem byte).
+        let mut front = self.buf.clone();
+        if self.rem != REM_EMPTY {
+            front.push(self.rem as u8);
+        }
+        // Back: raw bytes reversed so raw[0] lands at the frame end.
+        let mut back: Vec<u8> = self.raw.clone();
+        back.reverse();
+
+        if front.len() + back.len() <= target_len {
+            let mut out = vec![0u8; target_len];
+            out[..front.len()].copy_from_slice(&front);
+            let raw_start = target_len - back.len();
+            out[raw_start..].copy_from_slice(&back);
+            Ok(out)
+        } else if front.len() + back.len() == target_len + 1 && !front.is_empty() {
+            // §5.1.5 shared-byte merge: the last range byte and the
+            // first (frame-order) raw byte share one slot; OR them.
+            let mut out = vec![0u8; target_len];
+            out[..front.len()].copy_from_slice(&front);
+            let raw_start = target_len - back.len();
+            out[raw_start] |= back[0];
+            out[raw_start + 1..].copy_from_slice(&back[1..]);
+            Ok(out)
+        } else {
+            Err(Error::InvalidParameter)
+        }
+    }
+
+    /// The §5.1.5 `ec_enc_done` state flush shared by [`Self::finish`]
+    /// and [`Self::finish_to_size`]: choose the maximal-trailing-zeros
+    /// `end` value, emit its high bits through the carry path, and
+    /// flush any pending `rem`/`ext` carries. Idempotent.
+    fn finalize_state(&mut self) {
         if self.finished {
-            return self.assemble();
+            return;
         }
         self.finished = true;
 
@@ -321,7 +379,7 @@ impl RangeEncoder {
         // Equivalent construction: starting from the most significant
         // bit of rng, find the largest mask `m = (1<<b)-1` with
         // `(val + m) & ~m` still < val + rng, then end = (val+m) & ~m.
-        let mut l = self.val;
+        let l = self.val;
         let r = self.val.wrapping_add(self.rng);
         // Find largest b such that ((l + (1<<b) - 1) & ~((1<<b)-1)) lies
         // in [val, val+rng). We grow b from the bit length of rng down.
@@ -330,7 +388,6 @@ impl RangeEncoder {
         // The valid range size is rng; the maximal power-of-two block
         // that fits is bounded by ilog(rng).
         let max_b = 32 - self.rng.leading_zeros();
-        let mut chosen_b = 0u32;
         for b in (0..=max_b).rev() {
             let m: u32 = if b == 32 { u32::MAX } else { (1u32 << b) - 1 };
             // Round l up to the next multiple of 2^b.
@@ -342,12 +399,9 @@ impl RangeEncoder {
             // not wrap in legal traffic (rng <= 2**31), compare directly.
             if cand >= l && cand_top < r {
                 end = cand;
-                chosen_b = b;
                 break;
             }
         }
-        let _ = chosen_b;
-        let _ = &mut l;
 
         // §5.1.5: while end != 0, send the top 9 bits (end>>23) to the
         // carry buffer and shift end left by 8 (masking to 31 bits).
@@ -361,8 +415,6 @@ impl RangeEncoder {
         if (self.rem != 0 && self.rem != REM_EMPTY) || self.ext > 0 {
             self.carry_out(0);
         }
-
-        self.assemble()
     }
 
     /// Current whole-bit budget produced so far (RFC 6716 §5.1.6,
@@ -702,6 +754,52 @@ mod tests {
         assert_eq!(enc.enc_uint(1, 1), Err(Error::InvalidParameter)); // ft<=1,t!=0
                                                                       // ft<=1 with t==0 is a no-op success.
         assert_eq!(enc.enc_uint(0, 1), Ok(()));
+    }
+
+    /// `finish_to_size` places raw bits at the frame END, so a decoder
+    /// over the fixed-size frame recovers both range symbols and raw
+    /// bits — the property plain `finish` + zero-padding lacks.
+    #[test]
+    fn finish_to_size_keeps_raw_bits_at_frame_end() {
+        for target in [16usize, 24, 64] {
+            let mut enc = RangeEncoder::new();
+            enc.enc_bit_logp(1, 3).unwrap();
+            enc.enc_uint(1234, 5000).unwrap();
+            enc.enc_bits(0x5A, 8).unwrap();
+            enc.enc_bits(0x3, 2).unwrap();
+            enc.enc_bit_logp(0, 2).unwrap();
+            let frame = enc.finish_to_size(target).unwrap();
+            assert_eq!(frame.len(), target);
+            let mut dec = RangeDecoder::new(&frame);
+            assert_eq!(dec.storage_bits(), (target * 8) as u32);
+            assert_eq!(dec.dec_bit_logp(3), 1);
+            assert_eq!(dec.dec_uint(5000).unwrap(), 1234);
+            assert_eq!(dec.dec_bits(8), 0x5A);
+            assert_eq!(dec.dec_bits(2), 0x3);
+            assert_eq!(dec.dec_bit_logp(2), 0);
+            assert!(!dec.has_error());
+        }
+    }
+
+    /// `finish_to_size` with a target too small for the written symbols
+    /// is rejected; a raw-bits-only stream still lands at the end.
+    #[test]
+    fn finish_to_size_bounds() {
+        // Too small: 200 raw bits cannot fit in 8 bytes.
+        let mut enc = RangeEncoder::new();
+        for _ in 0..25 {
+            enc.enc_bits(0xFF, 8).unwrap();
+        }
+        assert_eq!(enc.finish_to_size(8), Err(Error::InvalidParameter));
+
+        // Raw-only: the bits land at the very end of the frame.
+        let mut enc2 = RangeEncoder::new();
+        enc2.enc_bits(0xAB, 8).unwrap();
+        let frame = enc2.finish_to_size(6).unwrap();
+        assert_eq!(frame.len(), 6);
+        assert_eq!(frame[5], 0xAB);
+        let mut dec = RangeDecoder::new(&frame);
+        assert_eq!(dec.dec_bits(8), 0xAB);
     }
 
     /// A long pseudo-random stream of mixed symbols survives a full

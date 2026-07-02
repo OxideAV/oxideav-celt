@@ -284,6 +284,7 @@ pub mod derive_pulses;
 pub mod e_prob_model;
 pub mod fine_energy;
 pub mod frame_decode;
+pub mod frame_encode;
 pub mod frame_header;
 pub mod frame_synthesis;
 pub mod hadamard;
@@ -361,6 +362,7 @@ pub use fine_energy::{
     quantize_fine_energy_f32, FinalizePriority, FinalizeResult, FINE_Q14_ONE, MAX_FINE_BITS,
 };
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
+pub use frame_encode::{encode_frame_prefix, FramePrefixSpec};
 pub use frame_header::{
     decode_anti_collapse_flag, encode_anti_collapse_flag, CeltFrameHeader, PostFilter,
 };

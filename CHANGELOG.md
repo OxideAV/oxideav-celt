@@ -6,6 +6,40 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — Table-56 frame-prefix *encode* driver
+  (`encode_frame_prefix`, inverse of `decode_frame_prefix`):** the
+  encode-side integration spine. Writes the header scalars → §4.3.2.1
+  coarse energy (mutating the shared `CoarseEnergyState`) → §4.3.4.5 TF
+  parameters → §4.3.4.3 spread → §4.3.3 dynalloc band boosts → §4.3.3
+  band-allocation fields, in exact Table-56 order, threading the
+  reservation/boost budget between steps via the §5.1.6/§4.1.6
+  `tell_frac` lockstep so every gate fires identically on both sides.
+  `FramePrefixSpec` carries the encoder's chosen control values; the
+  returned `FramePrefix` is the decoder's view (gated-off fields
+  normalized to §4.3.3 defaults, boosts gate-truncated). Validated by
+  full-prefix round-trips through `decode_frame_prefix` reconstructing
+  the identical `FramePrefix` field-for-field — mono/intra with
+  post-filter raw bits + boosts + trim/skip, stereo/inter with
+  intensity/dual, and a Hybrid (17..21) window — plus bad-input
+  rejection. +4 tests. Provenance: RFC 6716 Table 56 + §4.3.3 +
+  `celt-coarse-energy-and-allocation.md` §§2.1–2.7 (the same sources the
+  decode driver transcribes). No external library source consulted.
+
+* **Round-382 (2026-07-02) — §5.1 fixed-size frame assembly
+  (`RangeEncoder::finish_to_size`):** finalizes the stream into a frame
+  of exactly `target_len` bytes with the range-coded prefix at the
+  front, the §5.1.3 raw bits at the back (where
+  `RangeDecoder::dec_bits` reads them from), and zero fill between —
+  the assembly a fixed-budget CELT frame needs, because post-`finish`
+  zero-padding displaces the raw-bit region away from the frame end.
+  Accepts the §5.1.5 one-byte shared-boundary OR merge; a target too
+  small for the written symbols is rejected. The §5.1.5 `ec_enc_done`
+  flush is factored into a shared `finalize_state` used by both finish
+  paths. Validated by fixed-size round-trips mixing range symbols and
+  raw bits at several target sizes, a raw-only frame-end placement
+  check, and the too-small rejection. +2 tests. Provenance: RFC 6716
+  §5.1 / §5.1.3 / §5.1.5. No external library source consulted.
+
 * **Round-382 (2026-07-02) — §4.3.3 band-boost (dynalloc) *encode*
   (`encode_band_boosts`, inverse of `decode_band_boosts`):** walks the
   same per-band dynalloc-logp loop the decoder runs, writing a `1`
