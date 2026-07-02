@@ -73,28 +73,42 @@ the clean-room narrative §2.7 defer to the reference implementation.
 Both `decode_celt_frame` and `decode_stereo_frame` reject a transient
 frame with `Error::NotImplemented` rather than mis-decode it.
 
-**Encode building blocks, in progress.** The encode-direction primitives
-are growing: the §4.3.4.2 PVQ codeword index encode
-(`encode_pulses_to_index`, the exact inverse of the decode loop), the
-§5.3.8.1 PVQ codeword search (`pvq_search` → `encode_unit_shape`) giving
-the full input-vector → integer-codeword → bitstream-index PVQ encode
-chain, the **§5.1 range encoder** (`RangeEncoder`, new in r371) — the
-bit-exact inverse of the §4.1 range decoder that serialises every
-encode-side range symbol into a frame — and the **§4.3.2.2 fine-energy
-encode** (`quantize_fine_energy_band` → `encode_fine_energy[_band]`, also
-r371), the inverse of `decode_fine_energy` that quantises a correction to
-the band's index `f` and writes it as `B_i` raw bits. r371 also added the
-inverses of the remaining fully-specified control symbols: the §4.3
-frame prefix (`CeltFrameHeader::encode_prefix` +
-`encode_anti_collapse_flag`), the §4.3.4.5 TF parameters
-(`encode_tf_parameters`), the §4.3.4.3 spread (`encode_spread`), the
-§4.3.3 band-allocation fields (`encode_band_allocation`), and the
-§4.3.4.2 PVQ shape into the range coder (`encode_pulses` /
-`encode_shape`). `tests/control_encode_roundtrip.rs` chains them in
-Table-56 order into one frame and decodes the whole thing back
-bit-exactly. The coarse §4.3.2.1 Laplace energy encode (DOCS-GAP, same
-boundary as the coarse decode) and the codec-registration entry point
-still return `Error::NotImplemented`.
+**End-to-end mono frame encode (spectrum → bytes → PCM), r382.** The
+encode direction now closes the loop: `encode_celt_frame` chains §4.3.6
+band analysis (per-band log-2 energy + unit shape, the `band_analysis`
+module) → the full Table-56 prefix encode (`encode_frame_prefix`:
+header → **§4.3.2.1 coarse energy** → TF → spread → **§4.3.3 dynalloc
+band boosts** → band-allocation fields, threading the reservation/boost
+budget through the §5.1.6/§4.1.6 `tell_frac` lockstep so every gate
+fires identically on both sides) → §4.3.2.2 fine-energy quantization +
+raw-bit encode → §4.3.4.2 PVQ shape search + encode per band → the
+§5.1.5 **fixed-size frame assembly** (`RangeEncoder::finish_to_size`:
+range symbols from the front, raw bits at the frame end, zero fill
+between). A `decode_celt_frame` pass over the produced bytes
+reconstructs the encoder's residual spectrum **bit-exactly** and emits
+PCM; `encode_celt_frame_auto` → `decode_celt_frame_auto` is a fully
+self-contained codec loop where both sides derive `band_k` from the
+bit-identical prefix (no allocation exchanged out of band), proven
+across multi-frame streams at every `LM`. The r382 encode primitives
+underneath: `ec_laplace_encode` (the §4.3.2.1 Laplace symbol encode —
+the mirror-image interval construction documented in the clean-room
+narrative §5), `encode_coarse_energy` (nearest-6 dB-step
+prediction-error quantization through the same budget-keyed dispatch
+the decoder runs), `encode_band_boosts` (the gate-respecting §4.3.3
+dynalloc inverse), and `quantize_fine_energy_f32` (f32-residual fine
+quantization). Earlier rounds supplied the §4.3.4.2 PVQ index
+encode/search (`encode_pulses_to_index`, `pvq_search`, `encode_shape`),
+the §5.1 range encoder, and the per-symbol control-field encoders
+(`encode_prefix`, `encode_tf_parameters`, `encode_spread`,
+`encode_band_allocation`, `encode_fine_energy`).
+`tests/frame_encode_decode.rs` and `tests/control_encode_roundtrip.rs`
+pin the full-loop and per-symbol round-trips. The frame encoder pins
+spread = `None` and all-zero `tf_changes` (legal encoder choices; a
+non-identity spread/TF needs the inverse §4.3.4.3/§4.3.4.5 orthonormal
+transforms before the PVQ search — fully specified, not yet
+implemented). The PCM→MDCT analysis front end (forward windowing +
+pre-emphasis) and the codec-registration entry point are the remaining
+encode-side gaps; `mdct_naive_f32` (the forward MDCT) already exists.
 
 **Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
 the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps
@@ -1165,8 +1179,10 @@ the staged docs. Since `decode_celt_frame` only handles non-transient
 frames (where §4.3.5 does not even decode the anti-collapse bit), the
 gap does not block the mono long-MDCT path.
 
-The encoder and codec-registration entry points with the runtime still
-return `Error::NotImplemented`.
+The codec-registration entry points with the runtime still return
+`Error::NotImplemented`; the mono MDCT-domain frame encoder is
+`encode_celt_frame` / `encode_celt_frame_auto` (see the encode status
+section above).
 
 ## Clean-room provenance
 
