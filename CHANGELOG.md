@@ -6,6 +6,24 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — §4.3.3 band-boost (dynalloc) *encode*
+  (`encode_band_boosts`, inverse of `decode_band_boosts`):** walks the
+  same per-band dynalloc-logp loop the decoder runs, writing a `1`
+  while the band still owes boost quanta from the caller's
+  `target_boost` and a terminating `0` — emitted only when the decoder
+  would go on to read it (the §4.3.3 `tell + logp < total_bits +
+  total_boost` AND `boost < cap` gates still open), so the two sides
+  evaluate every gate identically via the §5.1.6/§4.1.6 `tell_frac`
+  lockstep. Targets floor to the band's `quanta` grid and truncate at
+  the gates; the returned `BoostResult` is what a matching decode
+  reconstructs. Validated by encode→decode round-trips over zero /
+  mixed / oversized targets (full `BoostResult` equality), an
+  exact-honour case, the starved-budget zero-bit path, and bad-input
+  rejection. +4 tests. Provenance: RFC 6716 §4.3.3 lines 6339–6360 +
+  `celt-coarse-energy-and-allocation.md` §2.3 (the documented decode
+  loop whose gate-respecting inverse this is). No external library
+  source consulted.
+
 * **Round-382 (2026-07-02) — §4.3.2.2 fine-energy quantization from an
   f32 residual (`quantize_fine_energy_f32`):** the encoder-natural entry
   point for the fine step. After the §4.3.2.1 coarse step reconstructs

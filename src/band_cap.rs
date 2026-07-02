@@ -34,6 +34,8 @@
 
 use crate::coarse_energy::NUM_BANDS;
 use crate::range_decoder::RangeDecoder;
+use crate::range_encoder::RangeEncoder;
+use crate::Error;
 
 /// CELT cache.caps cache, 8 rows × 21 bands per RFC 6716 §4.3.3 +
 /// `docs/audio/celt/tables/cache_caps50.csv`.
@@ -309,9 +311,209 @@ pub fn decode_band_boosts(
     })
 }
 
+/// Encode the §4.3.3 band-boost loop — the exact inverse of
+/// [`decode_band_boosts`].
+///
+/// Walks the same per-band dynalloc-logp loop the decoder runs, but
+/// instead of reading each gated bit it **writes** one: a `1` while the
+/// band still owes boost quanta from `target_boost`, then a terminating
+/// `0` — emitted only when the decoder would go on to read it (the
+/// §4.3.3 gate `tell + dynalloc_loop_logp < total_bits + total_boost`
+/// AND `boost < cap[band]` still open). The encoder's
+/// [`RangeEncoder::tell_frac`] locksteps with the decoder's after the
+/// same symbols (§5.1.6 / §4.1.6), so the two sides evaluate every gate
+/// identically.
+///
+/// `target_boost[i]` is the desired boost for coded band `start + i`,
+/// in 1/8 bits. A target that is not a multiple of the band's `quanta`
+/// (`min(8*N, max(48, N))`) is floored to the nearest multiple; a
+/// target the running budget or the band cap cannot absorb is truncated
+/// at the point the gate closes — the decoder can never reconstruct
+/// more than the gates admit, so the encoder never writes more.
+///
+/// Returns the [`BoostResult`] that a matching [`decode_band_boosts`]
+/// over the finished frame reconstructs (per-band boosts actually
+/// encoded, `total_boost`, and the exit `total_bits`). Callers that
+/// need the request honoured exactly compare `result.boost` with
+/// `target_boost`.
+///
+/// Returns [`Error::InvalidParameter`] on inconsistent slice lengths /
+/// band window, or propagates a [`RangeEncoder`] rejection.
+pub fn encode_band_boosts(
+    enc: &mut RangeEncoder,
+    start: u32,
+    end: u32,
+    bins_per_band: &[u32],
+    caps: &[i16],
+    total_bits: i32,
+    target_boost: &[i32],
+) -> Result<BoostResult, Error> {
+    if start > end || end > NUM_BANDS as u32 {
+        return Err(Error::InvalidParameter);
+    }
+    let coded_bands = (end - start) as usize;
+    if bins_per_band.len() != coded_bands
+        || caps.len() != coded_bands
+        || target_boost.len() != coded_bands
+    {
+        return Err(Error::InvalidParameter);
+    }
+    let mut boost = vec![0i32; coded_bands];
+    let mut total_boost: i32 = 0;
+    let mut total_bits = total_bits;
+    // §4.3.3: dynalloc_logp starts at 6 (p = 1/64 for the first boost).
+    let mut dynalloc_logp: u32 = 6;
+
+    for (idx, ((&n, &cap_b), &want)) in bins_per_band
+        .iter()
+        .zip(caps.iter())
+        .zip(target_boost.iter())
+        .enumerate()
+    {
+        let n_i32 = n as i32;
+        let quanta = (8 * n_i32).min(n_i32.max(48));
+        // Floor the request to a whole number of quanta (the §4.3.3
+        // boost step is quantized); a negative request is zero.
+        let mut want_steps = if quanta > 0 { want.max(0) / quanta } else { 0 };
+        let mut band_boost: i32 = 0;
+        let mut dynalloc_loop_logp = dynalloc_logp;
+
+        loop {
+            let tell = enc.tell_frac() as i32;
+            // Same gates as the decode loop: when either closes, the
+            // decoder stops without reading, so the encoder stops
+            // without writing.
+            if tell + dynalloc_loop_logp as i32 >= total_bits + total_boost {
+                break;
+            }
+            if band_boost >= cap_b as i32 {
+                break;
+            }
+            if want_steps > 0 {
+                // One more boost for this band.
+                enc.enc_bit_logp(1, dynalloc_loop_logp)?;
+                want_steps -= 1;
+                band_boost += quanta;
+                total_boost += quanta;
+                total_bits -= quanta;
+                dynalloc_loop_logp = 1;
+            } else {
+                // Terminate the band: the decoder reads this 0 and
+                // breaks.
+                enc.enc_bit_logp(0, dynalloc_loop_logp)?;
+                break;
+            }
+        }
+
+        boost[idx] = band_boost;
+        if band_boost != 0 && dynalloc_logp > 2 {
+            dynalloc_logp -= 1;
+        }
+    }
+
+    Ok(BoostResult {
+        boost,
+        total_boost,
+        total_bits_remaining: total_bits,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `encode_band_boosts` → `decode_band_boosts` round-trips: the
+    /// decoder reconstructs exactly the boosts the encoder reported it
+    /// wrote, and the two `BoostResult`s agree field for field.
+    #[test]
+    fn encode_decode_boost_roundtrip() {
+        // 6 bands with mixed bin counts; ample budget.
+        let bins = [4u32, 8, 8, 16, 24, 32];
+        let mut caps = [0i16; 6];
+        assert!(compute_band_caps(2, false, 1, &bins, &mut caps));
+        let total_bits = 8000i32;
+
+        let targets: &[[i32; 6]] = &[
+            [0, 0, 0, 0, 0, 0],
+            // quanta per band: min(8N, max(48, N)) = [32, 48, 48, 48, 48, 48]... N=4 → 32.
+            [32, 0, 48, 0, 96, 48],
+            [64, 48, 0, 144, 0, 0],
+            // Oversized requests truncate at the cap / budget.
+            [30000, 0, 0, 0, 0, 30000],
+        ];
+        for target in targets {
+            let mut enc = RangeEncoder::new();
+            let enc_result =
+                encode_band_boosts(&mut enc, 0, 6, &bins, &caps, total_bits, target).unwrap();
+            let mut frame = enc.finish();
+            // Pad so the decoder's tell_frac gates see the same running
+            // budget arithmetic (the gates only use tell_frac, which is
+            // frame-length independent, but keep the frame non-empty).
+            frame.resize(frame.len().max(8), 0);
+            let mut dec = RangeDecoder::new(&frame);
+            let dec_result = decode_band_boosts(&mut dec, 0, 6, &bins, &caps, total_bits).unwrap();
+            assert_eq!(dec_result, enc_result, "target {target:?}");
+            assert!(!dec.has_error());
+        }
+    }
+
+    /// A target that is a whole number of quanta and inside every gate
+    /// is honoured exactly.
+    #[test]
+    fn encode_boosts_honours_feasible_target() {
+        let bins = [8u32, 8, 8];
+        let mut caps = [0i16; 3];
+        assert!(compute_band_caps(1, false, 1, &bins, &mut caps));
+        // quanta = min(64, max(48, 8)) = 48 for every band.
+        let target = [48i32, 96, 48];
+        let mut enc = RangeEncoder::new();
+        let result = encode_band_boosts(&mut enc, 0, 3, &bins, &caps, 8000, &target).unwrap();
+        assert_eq!(result.boost, target.to_vec());
+        assert_eq!(result.total_boost, 192);
+        // Non-multiple targets floor to the quanta grid.
+        let mut enc2 = RangeEncoder::new();
+        let result2 =
+            encode_band_boosts(&mut enc2, 0, 3, &bins, &caps, 8000, &[50, 47, -3]).unwrap();
+        assert_eq!(result2.boost, vec![48, 0, 0]);
+    }
+
+    /// A starved budget closes the outer gate immediately: no bits are
+    /// written, all boosts are zero — matching the decoder's "inner
+    /// loop may not run even once" path.
+    #[test]
+    fn encode_boosts_starved_budget_writes_nothing() {
+        let bins = [8u32, 8];
+        let mut caps = [0i16; 2];
+        assert!(compute_band_caps(0, false, 1, &bins, &mut caps));
+        let mut enc = RangeEncoder::new();
+        let tell_before = enc.tell_frac();
+        let result = encode_band_boosts(&mut enc, 0, 2, &bins, &caps, 0, &[48, 48]).unwrap();
+        assert_eq!(result.boost, vec![0, 0]);
+        assert_eq!(result.total_boost, 0);
+        assert_eq!(
+            enc.tell_frac(),
+            tell_before,
+            "bits written on a closed gate"
+        );
+    }
+
+    /// Inconsistent inputs are rejected.
+    #[test]
+    fn encode_boosts_rejects_bad_inputs() {
+        let mut enc = RangeEncoder::new();
+        let bins = [8u32; 3];
+        let caps = [100i16; 3];
+        // target length mismatch.
+        assert_eq!(
+            encode_band_boosts(&mut enc, 0, 3, &bins, &caps, 1000, &[0, 0]),
+            Err(Error::InvalidParameter)
+        );
+        // band window out of range.
+        assert_eq!(
+            encode_band_boosts(&mut enc, 0, 22, &bins, &caps, 1000, &[0, 0, 0]),
+            Err(Error::InvalidParameter)
+        );
+    }
 
     /// CACHE_CAPS50 has 8 rows × 21 bands (RFC 6716 §4.3.3 +
     /// `docs/audio/celt/tables/cache_caps50.meta`).

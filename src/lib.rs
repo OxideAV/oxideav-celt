@@ -311,7 +311,9 @@ pub use band_analysis::{
     analyze_band_f32, analyze_bands_f32, band_energy_f32, band_log_energy_f32, BandAnalysis,
     SILENCE_LOG_ENERGY,
 };
-pub use band_cap::{compute_band_caps, decode_band_boosts, BoostResult, CACHE_CAPS50};
+pub use band_cap::{
+    compute_band_caps, decode_band_boosts, encode_band_boosts, BoostResult, CACHE_CAPS50,
+};
 pub use band_decode::{decode_band_shape, BandShape};
 pub use band_energy::{
     assemble_band_log_energy_f32, assemble_band_log_energy_q8, log_energy_f32_to_q8,
