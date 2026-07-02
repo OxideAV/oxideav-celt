@@ -4,6 +4,54 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/OxideAV/oxideav-celt/compare/v0.1.9...v0.1.10) - 2026-07-02
+
+### Other
+
+- README — document the r382 end-to-end mono frame encode subsystem
+- caller-input-free encode (encode_celt_frame_auto) — self-contained codec loop
+- full mono CELT frame encoder (encode_celt_frame) + end-to-end round-trip
+- Table-56 frame-prefix encode driver + §5.1 fixed-size frame assembly
+- §4.3.3 band-boost (dynalloc) encode (encode_band_boosts)
+- §4.3.2.2 fine-energy quantization from an f32 residual
+- energy encode->decode pipeline integration test
+- §4.3.6 band energy analysis (encode front-end)
+- coarse-energy encode in the Table-56 frame chain (integration test)
+- §4.3.2.1 coarse-energy encode (encode_coarse_energy)
+- §4.3.2.1 Laplace-symbol encode (ec_laplace_encode)
+- assembled control-symbol encode chain integration test
+- §4.3.3 band-allocation field encode — inverse of decode_band_allocation
+- §4.3.4.3 spread encode — inverse of decode_spread
+- §4.3.4.5 TF-parameter encode — inverse of decode_tf_parameters
+- §4.3 frame-prefix encode — inverse of decode_prefix
+- §4.3.4.2 PVQ shape encode into the range coder
+- §4.3.2.2 fine-energy encode — inverse of decode_fine_energy
+- §5.1 range encoder — exact inverse of the §4.1 range decoder
+- extend §4.3.7.1 post-filter transition to the stereo path
+- wire §4.3.7.1 post-filter transition into decode_celt_frame
+- §4.3.7.1 post-filter cross-frame gain-transition crossfade
+- caller-input-free mono decode — derive_band_pulses + decode_celt_frame_auto
+- paraphrase two residual reference-code mentions in doc comments
+- fix laplace_constants test for standalone CI (no docs/ include_str!)
+- stereo frame-decode integration test (tests/stereo_decode.rs)
+- stereo frame-decode driver (bitstream prefix + coarse energy -> interleaved PCM)
+- re-anchor §4.3.2.1 Laplace/coarse-energy provenance to clean-room narrative
+- PVQ encode→decode round-trip integration test
+- PVQ encoder codeword search (§5.3.8.1) + encode_unit_shape
+- PVQ codeword index encode — inverse of §4.3.4.2 decode loop
+- pin documented allocation→pulses→synthesis seam (r348)
+- README — document the stereo synthesis path + sharpen the gap list
+- stereo synthesis-chain integration test (energy → denorm → PCM)
+- stereo long-MDCT synthesis spine (§4.3.6→§4.3.7 per channel)
+- neutralise enumerated-denial prose in e_prob_model provenance doc-comment
+- end-to-end frame decode → PCM orchestrator (RFC 6716 §4.3 Table 56 → §4.3.7)
+- §4.3.6→§4.3.7 long-MDCT synthesis spine (place_residual_spectrum + LongMdctSynthesis)
+- §4.3.3 combined-candidate quality-column search (find_combined_alloc)
+- §4.3.3 per-band shape-allocation assembly at a quality column (alloc_combine)
+- §4.3.4 multi-band residual decode loop (residual)
+- §4.3.4.1 bit-exact pulse-cost cache (cache_index50/cache_bits50)
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 * **Round-382 (2026-07-02) — caller-input-free encode
