@@ -6,6 +6,24 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — §4.3.6 band energy *analysis* (encode
+  front-end, `band_analysis` module):** the exact inverse of the §4.3.6
+  denormalization. `analyze_band_f32` splits an MDCT-domain band into
+  its per-band base-2 log-energy `E = log2(sum(band[i]^2))` (the
+  §4.3.2.1 coarse-energy target `encode_coarse_energy` consumes) and its
+  unit-L2-norm shape `band / sqrt(sum²)` (the §4.3.4.2 PVQ-search input
+  `encode_shape` / `pvq_search` consumes). `band_energy_f32` /
+  `band_log_energy_f32` expose the scalar pieces; `analyze_bands_f32`
+  walks a contiguous 21-band spectrum. A silent band floors at
+  `SILENCE_LOG_ENERGY = -28.0` (well below the §4.3.2.1 `-9.0`
+  prediction clamp) and yields an all-zero shape rather than a
+  non-finite value. Validated by round-tripping against
+  `denormalize_band_f32` (energy recovered to Q8 resolution, shape to
+  1e-5), a unit-norm shape check, the silent-band corner, and the
+  full-spectrum walk. +5 tests. Provenance: RFC 6716 §4.3.6 (one
+  sentence) + the §4.3.2.1 log-2 axis; elementary inverse arithmetic. No
+  external library source consulted.
+
 * **Round-382 (2026-07-02) — coarse-energy encode in the Table-56 frame
   chain (integration test):** `tests/coarse_energy_frame_roundtrip.rs`
   places the §4.3.2.1 coarse-energy block in its real frame position —

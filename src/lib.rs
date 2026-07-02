@@ -268,6 +268,7 @@ use oxideav_core::RuntimeContext;
 
 pub mod alloc_combine;
 pub mod allocation_budget;
+pub mod band_analysis;
 pub mod band_cap;
 pub mod band_decode;
 pub mod band_energy;
@@ -305,6 +306,10 @@ pub use alloc_combine::{
 };
 pub use allocation_budget::{
     compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
+};
+pub use band_analysis::{
+    analyze_band_f32, analyze_bands_f32, band_energy_f32, band_log_energy_f32, BandAnalysis,
+    SILENCE_LOG_ENERGY,
 };
 pub use band_cap::{compute_band_caps, decode_band_boosts, BoostResult, CACHE_CAPS50};
 pub use band_decode::{decode_band_shape, BandShape};
