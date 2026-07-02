@@ -50,11 +50,18 @@
 //! was consulted.
 
 use crate::allocation_budget::compute_initial_reservations;
+use crate::band_analysis::analyze_band_f32;
 use crate::band_cap::{compute_band_caps, encode_band_boosts};
+use crate::band_energy::assemble_band_log_energy_q8;
+use crate::band_layout::{band_bins, coded_total_bins};
+use crate::band_split::band_needs_split;
 use crate::bit_allocation::{encode_band_allocation, BandAllocation};
 use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS, NUM_BANDS};
+use crate::denormalization::denormalize_band_in_place_f32;
+use crate::fine_energy::{encode_fine_energy_band, fine_correction_q14, quantize_fine_energy_f32};
 use crate::frame_decode::FramePrefix;
 use crate::frame_header::CeltFrameHeader;
+use crate::pvq::{encode_pulses, normalize_to_unit_l2, pvq_search};
 use crate::range_encoder::RangeEncoder;
 use crate::spread::{encode_spread, Spread};
 use crate::tf_change::{encode_tf_parameters, tf_select_matters, TfParameters};
@@ -244,6 +251,213 @@ pub fn encode_frame_prefix(
         allocation,
         start,
         end,
+    })
+}
+
+/// The result of encoding one mono CELT frame from an MDCT-domain
+/// spectrum.
+#[derive(Debug, Clone)]
+pub struct EncodedFrame {
+    /// The complete range-coded frame, exactly `frame_bytes` long
+    /// (§5.1 layout: range symbols from the front, §5.1.3 raw bits
+    /// from the back).
+    pub bytes: Vec<u8>,
+    /// The control prefix as the decoder will reconstruct it.
+    pub prefix: FramePrefix,
+    /// The final per-band Q8 log-energy envelope (coarse + fine), on
+    /// the absolute band axis — the envelope the §4.3.6
+    /// denormalization on the decode side reproduces.
+    pub envelope_q8: [i32; NUM_BANDS],
+    /// The encoder's own reconstruction of the coded-window
+    /// denormalized spectrum (`coded_total_bins(start, end, lm)`
+    /// samples): each band is its quantized PVQ pulse vector,
+    /// unit-normalized and scaled by the quantized envelope. A
+    /// matching `decode_residual_bands` pass over `bytes` reproduces
+    /// these samples **bit-exactly** (both sides run the identical
+    /// §4.3.4.2 normalization and §4.3.6 denormalization arithmetic).
+    pub reconstructed_spectrum: Vec<f32>,
+}
+
+/// Encode one **mono, non-transient (single long MDCT)** CELT frame
+/// from an MDCT-domain spectrum — the inverse of
+/// [`crate::frame_synthesis::decode_celt_frame`]'s bitstream walk.
+///
+/// Chains the whole documented encode pipeline: §4.3.6 band analysis
+/// (energy + unit shape, via [`analyze_band_f32`]) → Table-56 prefix
+/// ([`encode_frame_prefix`], including the §4.3.2.1 coarse-energy
+/// quantization against `coarse_state`) → §4.3.2.2 fine-energy
+/// quantization + encode → §4.3.4.2 PVQ shape search + encode per band
+/// → §5.1.5 fixed-size frame assembly
+/// ([`RangeEncoder::finish_to_size`]).
+///
+/// ## Parameters
+///
+/// * `coarse_state` — the encoder's §4.3.2.1 inter-frame prediction
+///   state, mutated with the coded reconstruction (it tracks the
+///   decoder's state exactly).
+/// * `spectrum` — the coded-window MDCT-domain samples, band-contiguous
+///   (`coded_total_bins(start, end, lm)` samples; the
+///   [`crate::synthesis::place_residual_spectrum`] layout).
+/// * `header` — the frame's control scalars. Must be non-silent and
+///   non-transient (`Error::NotImplemented` otherwise — the §4.3.1
+///   short-block geometry is the same docs-gap boundary the decoder
+///   keeps).
+/// * `fine_bits` / `band_k` — the §4.3.2.2 fine-bit and §4.3.4.1 pulse
+///   allocations, the same RFC-deferred §4.3.3 inputs
+///   `decode_celt_frame` takes (identical values must be given to the
+///   decoder).
+///
+/// ## Encoder decisions pinned by this driver
+///
+/// The spread is forced to [`Spread::None`] and every `tf_change` to
+/// zero (both legal encoder choices): the decoder applies the §4.3.4.3
+/// rotation and the §4.3.4.5 Hadamard *after* PVQ decode, so encoding
+/// with a non-identity spread/TF would require searching the PVQ
+/// codebook against the inverse-rotated target. Those inverses are
+/// fully specified (orthonormal transforms) and can land later without
+/// reshaping this driver; forcing the identity keeps the quantized
+/// shape exactly the vector the decoder reconstructs. No band boosts
+/// are requested and the allocation fields stay at their §4.3.3
+/// defaults.
+///
+/// Returns the [`EncodedFrame`] — including the encoder's own
+/// bit-exact reconstruction of what the decoder will produce — or
+/// [`Error::InvalidParameter`] / [`Error::NotImplemented`] on an
+/// out-of-range window, a spectrum length mismatch, a `band_k` length
+/// mismatch, a band whose `V(N, K)` saturates (the §4.3.4.4 split
+/// gap), or a frame the target byte budget cannot hold.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_celt_frame(
+    coarse_state: &mut CoarseEnergyState,
+    spectrum: &[f32],
+    header: &CeltFrameHeader,
+    lm: u32,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+    fine_bits: &[u32; NUM_BANDS],
+    band_k: &[u32],
+) -> Result<EncodedFrame, Error> {
+    if lm > 3 || start > end || end > NUM_BANDS {
+        return Err(Error::InvalidParameter);
+    }
+    if header.transient || header.silence {
+        return Err(Error::NotImplemented);
+    }
+    let coded_bands = end - start;
+    if band_k.len() != coded_bands {
+        return Err(Error::InvalidParameter);
+    }
+    let total_bins = coded_total_bins(start, end, lm).ok_or(Error::InvalidParameter)? as usize;
+    if spectrum.len() != total_bins {
+        return Err(Error::InvalidParameter);
+    }
+
+    // §4.3.6 analysis: split each band into its log-2 energy target and
+    // its unit-norm shape.
+    let mut energy_target: [[f32; NUM_BANDS]; MAX_CHANNELS] = coarse_state.energy;
+    let mut shapes: Vec<Vec<f32>> = Vec::with_capacity(coded_bands);
+    {
+        let mut offset = 0usize;
+        for (band, slot) in energy_target[0]
+            .iter_mut()
+            .enumerate()
+            .take(end)
+            .skip(start)
+        {
+            let n = band_bins(band, lm).ok_or(Error::InvalidParameter)? as usize;
+            let analysis = analyze_band_f32(&spectrum[offset..offset + n]);
+            *slot = analysis.log_energy;
+            shapes.push(analysis.shape);
+            offset += n;
+        }
+    }
+
+    // Table-56 prefix: header → coarse energy → TF (identity) → spread
+    // (None) → boosts (none) → allocation (defaults).
+    let mut enc = RangeEncoder::new();
+    let target_boost = vec![0i32; coded_bands];
+    let spec = FramePrefixSpec {
+        header: CeltFrameHeader {
+            anti_collapse_on: None,
+            ..*header
+        },
+        energy_target: &energy_target,
+        tf: TfParameters {
+            tf_changes: vec![false; coded_bands],
+            tf_select: 0,
+            tf_select_decoded: false,
+        },
+        spread: Spread::None,
+        target_boost: &target_boost,
+        allocation: BandAllocation::defaults(),
+    };
+    let prefix = encode_frame_prefix(
+        &mut enc,
+        coarse_state,
+        &spec,
+        lm,
+        frame_bytes,
+        false,
+        start,
+        end,
+    )?;
+
+    // §4.3.2.2 fine energy: quantize the residual left by the coarse
+    // step and write each band's B_i raw bits, walking all 21 bands in
+    // the same order `decode_fine_energy` reads them.
+    let mut fine_q14 = [0i32; NUM_BANDS];
+    for band in 0..NUM_BANDS {
+        let b_bits = fine_bits[band];
+        let residual = if (start..end).contains(&band) {
+            energy_target[0][band] - coarse_state.energy[0][band]
+        } else {
+            0.0
+        };
+        let f = quantize_fine_energy_f32(residual, b_bits);
+        encode_fine_energy_band(&mut enc, f, b_bits)?;
+        fine_q14[band] = fine_correction_q14(f, b_bits);
+    }
+
+    // §4.3.2 final envelope (coarse + fine), the amplitude the §4.3.6
+    // denormalization applies on both sides.
+    let envelope_q8 = assemble_band_log_energy_q8(coarse_state, 0, Some(&fine_q14), None)
+        .ok_or(Error::InvalidParameter)?;
+
+    // §4.3.4.2 PVQ shape search + encode per band, reconstructing the
+    // decoder's view as we go.
+    let mut reconstructed = Vec::with_capacity(total_bins);
+    for (i, band) in (start..end).enumerate() {
+        let n = band_bins(band, lm).ok_or(Error::InvalidParameter)?;
+        let k = band_k[i];
+        if band_needs_split(n, k) {
+            // The §4.3.4.4 split-gain path is the documented docs gap.
+            return Err(Error::NotImplemented);
+        }
+        if k == 0 || n == 0 {
+            // No pulses: the decoder reconstructs the zero shape (its
+            // §4.3.4.2 normalization degrades all-zero to all-zero).
+            reconstructed.resize(reconstructed.len() + n as usize, 0.0f32);
+            continue;
+        }
+        let pulses = pvq_search(&shapes[i], n, k).ok_or(Error::InvalidParameter)?;
+        encode_pulses(&mut enc, &pulses, n, k)?;
+        // The decoder's exact reconstruction arithmetic: unit-normalize
+        // the integer pulses, then scale by the quantized envelope.
+        let mut band_samples = normalize_to_unit_l2(&pulses);
+        denormalize_band_in_place_f32(&mut band_samples, envelope_q8[band]);
+        reconstructed.extend_from_slice(&band_samples);
+    }
+
+    // §5.1.5 fixed-size assembly: range symbols from the front, raw
+    // bits at the frame end, matching the decoder's storage_bits().
+    let bytes = enc.finish_to_size(frame_bytes as usize)?;
+
+    Ok(EncodedFrame {
+        bytes,
+        prefix,
+        envelope_q8,
+        reconstructed_spectrum: reconstructed,
     })
 }
 

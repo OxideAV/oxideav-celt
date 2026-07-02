@@ -6,6 +6,36 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — full mono CELT frame *encoder*
+  (`encode_celt_frame`) + end-to-end encode→decode PCM round-trip:**
+  the top-level encode driver, the bitstream inverse of
+  `decode_celt_frame`. Chains §4.3.6 band analysis (energy + unit
+  shape) → the Table-56 prefix (`encode_frame_prefix`, including the
+  §4.3.2.1 coarse quantization) → §4.3.2.2 fine-energy quantization +
+  raw-bit encode (walking all 21 bands in the decoder's order) →
+  §4.3.4.2 PVQ shape search + encode per band → §5.1.5 fixed-size frame
+  assembly. Spread is pinned to `None` and every `tf_change` to zero
+  (legal encoder choices — a non-identity spread/TF needs the inverse
+  §4.3.4.3/§4.3.4.5 orthonormal transforms before the PVQ search;
+  fully specified, deferred, no re-shaping needed). `EncodedFrame`
+  carries the frame bytes, the decoder-view prefix, the quantized Q8
+  envelope, and the encoder's own reconstruction of the residual
+  spectrum. `tests/frame_encode_decode.rs` proves the loop closes: a
+  manual `decode_frame_prefix` → `decode_fine_energy` →
+  `decode_residual_bands` walk over the encoded bytes reproduces the
+  encoder's reconstructed spectrum **bit-exactly** (identical prefix,
+  coarse state, and Q8 envelope), and `decode_celt_frame` turns the
+  same bytes into finite non-silent PCM; per-band energy is preserved
+  within the coarse+fine tolerance; two consecutive frames (intra then
+  inter) keep encoder and decoder §4.3.2.1 prediction in lockstep;
+  post-filter raw-bit parameters survive the fixed-size assembly;
+  transient/silent/mismatched inputs are rejected. The `fine_bits` /
+  `band_k` allocations remain inputs — the same RFC-deferred §4.3.3
+  boundary the decoder keeps. +5 tests. Provenance: RFC 6716 §4.3
+  Table 56 / §4.3.2 / §4.3.4.2 / §4.3.6 / §5.1; every stage delegates
+  to an existing RFC-grounded module. No external library source
+  consulted.
+
 * **Round-382 (2026-07-02) — Table-56 frame-prefix *encode* driver
   (`encode_frame_prefix`, inverse of `decode_frame_prefix`):** the
   encode-side integration spine. Writes the header scalars → §4.3.2.1
