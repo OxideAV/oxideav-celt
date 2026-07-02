@@ -6,6 +6,18 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — §4.3.2.2 fine-energy quantization from an
+  f32 residual (`quantize_fine_energy_f32`):** the encoder-natural entry
+  point for the fine step. After the §4.3.2.1 coarse step reconstructs
+  `E_coarse`, the residual `E_target - E_coarse` (f32, `1.0` = 6 dB) is
+  bridged onto the Q14 grid (`round(residual * 2^14)`, via the new
+  `FINE_Q14_ONE` constant) and quantized by `quantize_fine_energy_band`.
+  Validated by agreement with the Q14 path over a residual sweep,
+  grid-point recovery from each grid cell's exact f32 correction, and
+  the `b_bits == 0` / out-of-range clamp corners. +1 test. Provenance:
+  RFC 6716 §4.3.2.2 (the closed-form correction map); elementary f32→Q14
+  bridge. No external library source consulted.
+
 * **Round-382 (2026-07-02) — energy encode→decode pipeline (integration
   test):** `tests/energy_encode_pipeline.rs` drives the whole encoder
   energy front-end into the decoder energy back-end end-to-end —

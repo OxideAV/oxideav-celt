@@ -416,6 +416,30 @@ pub fn quantize_fine_energy_band(correction_q14: i32, b_bits: u32) -> u32 {
     f.clamp(0, max_f) as u32
 }
 
+/// Q14 unit on the base-2 log-energy axis (`1.0` = one integer log-2
+/// step = `1 << 14`). The fine-energy correction is carried in this
+/// scale; [`quantize_fine_energy_f32`] bridges an f32 residual onto it.
+pub const FINE_Q14_ONE: f32 = (1u32 << 14) as f32;
+
+/// Quantize a fine-energy correction expressed as an **f32 base-2
+/// log-energy residual** to the §4.3.2.2 integer `f`.
+///
+/// This is the encoder-natural entry point: after the §4.3.2.1 coarse
+/// step reconstructs `E_coarse`, the residual the fine step must code is
+/// `residual = E_target - E_coarse` in the same f32 log-2 axis
+/// ([`crate::coarse_energy::CoarseEnergyState`], `1.0` = 6 dB). This
+/// bridges that residual onto the Q14 grid
+/// (`round(residual * 2^14)`) and defers to
+/// [`quantize_fine_energy_band`], so `f = clamp(floor((residual + 1/2) *
+/// 2^B), 0, 2^B - 1)`. A residual outside `[-1/2, +1/2)` clamps to the
+/// grid edges (the coarse step is round-to-nearest, so a legitimate
+/// residual already lies inside that band). `b_bits == 0` yields
+/// `f = 0`.
+pub fn quantize_fine_energy_f32(residual: f32, b_bits: u32) -> u32 {
+    let correction_q14 = (residual * FINE_Q14_ONE).round() as i32;
+    quantize_fine_energy_band(correction_q14, b_bits)
+}
+
 /// Encode the §4.3.2.2 fine-energy refinement `f` for one band into the
 /// range encoder's raw-bit channel (the exact inverse of
 /// [`decode_fine_energy_band`]).
@@ -886,6 +910,40 @@ mod tests {
                 assert_eq!(f2, f, "b={b} f={f} correction={correction}");
             }
         }
+    }
+
+    /// `quantize_fine_energy_f32` matches `quantize_fine_energy_band`
+    /// after the f32→Q14 bridge, and recovers every grid point when the
+    /// residual is the exact centre of a grid cell.
+    #[test]
+    fn quantize_f32_matches_q14_and_recovers_grid() {
+        // Agreement with the Q14 path over a residual sweep.
+        for b in 1..=MAX_FINE_BITS {
+            let mut residual = -0.75f32;
+            while residual < 0.75 {
+                let via_f32 = quantize_fine_energy_f32(residual, b);
+                let via_q14 =
+                    quantize_fine_energy_band((residual * FINE_Q14_ONE).round() as i32, b);
+                assert_eq!(via_f32, via_q14, "b={b} residual={residual}");
+                residual += 0.031;
+            }
+        }
+        // Feeding back each grid point's exact f32 correction recovers
+        // that grid point.
+        for b in 1..=MAX_FINE_BITS {
+            for f in 0..(1u32 << b) {
+                let correction_f32 = fine_correction_q14(f, b) as f32 / FINE_Q14_ONE;
+                assert_eq!(
+                    quantize_fine_energy_f32(correction_f32, b),
+                    f,
+                    "b={b} f={f}"
+                );
+            }
+        }
+        // b = 0 is always 0; out-of-range residuals clamp to the edges.
+        assert_eq!(quantize_fine_energy_f32(0.3, 0), 0);
+        assert_eq!(quantize_fine_energy_f32(-5.0, 3), 0);
+        assert_eq!(quantize_fine_energy_f32(5.0, 3), (1u32 << 3) - 1);
     }
 
     /// `quantize_fine_energy_band` clamps out-of-range targets to the

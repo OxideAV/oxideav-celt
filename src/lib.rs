@@ -356,7 +356,7 @@ pub use e_prob_model::{
 pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, encode_fine_energy, encode_fine_energy_band,
     finalize_extra_bits, fine_correction_q14, fine_correction_qn, quantize_fine_energy_band,
-    FinalizePriority, FinalizeResult, MAX_FINE_BITS,
+    quantize_fine_energy_f32, FinalizePriority, FinalizeResult, FINE_Q14_ONE, MAX_FINE_BITS,
 };
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_header::{
