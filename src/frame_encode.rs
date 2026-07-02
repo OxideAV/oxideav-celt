@@ -338,6 +338,77 @@ pub fn encode_celt_frame(
     fine_bits: &[u32; NUM_BANDS],
     band_k: &[u32],
 ) -> Result<EncodedFrame, Error> {
+    encode_celt_frame_impl(
+        coarse_state,
+        spectrum,
+        header,
+        lm,
+        frame_bytes,
+        start,
+        end,
+        fine_bits,
+        Some(band_k),
+    )
+}
+
+/// Encode one mono, non-transient CELT frame **deriving the per-band
+/// pulse counts** from the documented §4.3.3 / §4.3.4.1 allocation
+/// arithmetic rather than taking them as a caller input — the encode
+/// counterpart of [`crate::derive_pulses::decode_celt_frame_auto`].
+///
+/// After the Table-56 prefix is encoded, the pulse counts are derived
+/// from the *returned* [`FramePrefix`] via
+/// [`crate::derive_pulses::derive_band_pulses`] — the identical
+/// function the auto-decoder runs over the *decoded* prefix. The two
+/// prefixes are bit-identical (proven by the `encode_frame_prefix`
+/// round-trips), so both sides land on the same `band_k` with **no
+/// allocation exchanged out of band**: `encode_celt_frame_auto` →
+/// [`decode_celt_frame_auto`](crate::derive_pulses::decode_celt_frame_auto)
+/// is a fully self-contained codec loop. Like the auto-decoder, no
+/// fine-energy refinement is spent (`fine_bits = 0`, the RFC-deferred
+/// fine/shape split approximated by treating the whole combined
+/// allocation as shape).
+///
+/// Parameters and error behaviour match [`encode_celt_frame`], minus
+/// the two allocation inputs.
+pub fn encode_celt_frame_auto(
+    coarse_state: &mut CoarseEnergyState,
+    spectrum: &[f32],
+    header: &CeltFrameHeader,
+    lm: u32,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+) -> Result<EncodedFrame, Error> {
+    let fine_bits = [0u32; NUM_BANDS];
+    encode_celt_frame_impl(
+        coarse_state,
+        spectrum,
+        header,
+        lm,
+        frame_bytes,
+        start,
+        end,
+        &fine_bits,
+        None,
+    )
+}
+
+/// Shared engine for [`encode_celt_frame`] (caller-supplied `band_k`)
+/// and [`encode_celt_frame_auto`] (`band_k` derived from the encoded
+/// prefix via the documented §4.3.3 → §4.3.4.1 seam).
+#[allow(clippy::too_many_arguments)]
+fn encode_celt_frame_impl(
+    coarse_state: &mut CoarseEnergyState,
+    spectrum: &[f32],
+    header: &CeltFrameHeader,
+    lm: u32,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+    fine_bits: &[u32; NUM_BANDS],
+    band_k: Option<&[u32]>,
+) -> Result<EncodedFrame, Error> {
     if lm > 3 || start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
     }
@@ -345,8 +416,10 @@ pub fn encode_celt_frame(
         return Err(Error::NotImplemented);
     }
     let coded_bands = end - start;
-    if band_k.len() != coded_bands {
-        return Err(Error::InvalidParameter);
+    if let Some(k) = band_k {
+        if k.len() != coded_bands {
+            return Err(Error::InvalidParameter);
+        }
     }
     let total_bins = coded_total_bins(start, end, lm).ok_or(Error::InvalidParameter)? as usize;
     if spectrum.len() != total_bins {
@@ -402,6 +475,20 @@ pub fn encode_celt_frame(
         start,
         end,
     )?;
+
+    // Resolve the per-band pulse counts: caller-supplied, or derived
+    // from the just-encoded prefix via the documented §4.3.3 →
+    // §4.3.4.1 seam (the identical derivation the auto-decoder runs
+    // over the decoded prefix).
+    let derived_k;
+    let band_k: &[u32] = match band_k {
+        Some(k) => k,
+        None => {
+            derived_k = crate::derive_pulses::derive_band_pulses(&prefix, lm, 1, false)
+                .ok_or(Error::InvalidParameter)?;
+            &derived_k
+        }
+    };
 
     // §4.3.2.2 fine energy: quantize the residual left by the coarse
     // step and write each band's B_i raw bits, walking all 21 bands in

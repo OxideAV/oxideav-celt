@@ -16,9 +16,10 @@
 //! against `EncodedFrame::reconstructed_spectrum`.
 
 use oxideav_celt::{
-    band_bins, coded_total_bins, decode_celt_frame, decode_fine_energy, decode_frame_prefix,
-    decode_residual_bands, encode_celt_frame, v_count, CeltDecodeState, CeltFrameHeader,
-    CoarseEnergyState, PostFilter, RangeDecoder, NUM_BANDS,
+    band_bins, coded_total_bins, decode_celt_frame, decode_celt_frame_auto, decode_fine_energy,
+    decode_frame_prefix, decode_residual_bands, derive_band_pulses, encode_celt_frame,
+    encode_celt_frame_auto, v_count, CeltDecodeState, CeltFrameHeader, CoarseEnergyState,
+    PostFilter, RangeDecoder, NUM_BANDS,
 };
 
 const FRAME_BYTES: u32 = 160;
@@ -340,4 +341,125 @@ fn encoder_rejects_out_of_scope_frames() {
         &band_k[1..]
     )
     .is_err());
+}
+
+/// The fully self-contained codec loop: `encode_celt_frame_auto` →
+/// `decode_celt_frame_auto` exchanges NO allocation out of band — both
+/// sides derive `band_k` from the (bit-identical) prefix via the same
+/// documented §4.3.3 → §4.3.4.1 seam.
+#[test]
+fn auto_encode_auto_decode_self_contained_loop() {
+    let lm = 2u32;
+    let (start, end) = (0usize, NUM_BANDS);
+    let spectrum = build_spectrum(lm, start, end);
+
+    let mut enc_state = CoarseEnergyState::new();
+    let encoded = encode_celt_frame_auto(
+        &mut enc_state,
+        &spectrum,
+        &default_header(),
+        lm,
+        FRAME_BYTES,
+        start,
+        end,
+    )
+    .unwrap();
+    assert_eq!(encoded.bytes.len(), FRAME_BYTES as usize);
+
+    // Auto-decode: derives band_k internally from the decoded prefix.
+    let mut state = CeltDecodeState::new(lm).unwrap();
+    let frame = decode_celt_frame_auto(&mut state, &encoded.bytes, start, end).unwrap();
+    assert_eq!(frame.pcm.len(), 120 << lm);
+    assert!(frame.pcm.iter().all(|s| s.is_finite()));
+    assert!(
+        frame.pcm.iter().any(|&s| s != 0.0),
+        "auto loop produced silent PCM"
+    );
+    // Encoder and decoder coarse prediction stay in lockstep.
+    assert_eq!(enc_state.energy[0], state.coarse_energy().energy[0]);
+
+    // Bit-exact spectrum check: derive band_k from the encoder's
+    // returned prefix (the same values the auto-decoder derives from
+    // its decoded copy) and walk the residual manually.
+    let band_k = derive_band_pulses(&encoded.prefix, lm, 1, false).unwrap();
+    let mut dec = RangeDecoder::new(&encoded.bytes);
+    let mut dec_state = CoarseEnergyState::new();
+    let prefix =
+        decode_frame_prefix(&mut dec, &mut dec_state, lm, FRAME_BYTES, false, start, end).unwrap();
+    let fine_bits = [0u32; NUM_BANDS];
+    let fine_q14 = decode_fine_energy(&mut dec, &fine_bits);
+    let env_q8 =
+        oxideav_celt::assemble_band_log_energy_q8(&dec_state, 0, Some(&fine_q14), None).unwrap();
+    assert_eq!(env_q8, encoded.envelope_q8);
+    let window_energy: Vec<i32> = env_q8[start..end].to_vec();
+    let residual = decode_residual_bands(
+        &mut dec,
+        lm,
+        start,
+        end,
+        false,
+        prefix.tf.tf_select,
+        &prefix.tf.tf_changes,
+        &band_k,
+        prefix.spread,
+        &window_energy,
+    )
+    .unwrap();
+    assert_eq!(
+        residual.samples, encoded.reconstructed_spectrum,
+        "auto loop residual != encoder reconstruction"
+    );
+
+    // Determinism: encoding the same spectrum from the same state
+    // yields identical bytes.
+    let mut enc_state2 = CoarseEnergyState::new();
+    let encoded2 = encode_celt_frame_auto(
+        &mut enc_state2,
+        &spectrum,
+        &default_header(),
+        lm,
+        FRAME_BYTES,
+        start,
+        end,
+    )
+    .unwrap();
+    assert_eq!(encoded2.bytes, encoded.bytes);
+}
+
+/// The auto loop stays in lockstep across a multi-frame stream at
+/// every frame size.
+#[test]
+fn auto_loop_multi_frame_all_lm() {
+    for lm in 0..=3u32 {
+        let (start, end) = (0usize, NUM_BANDS);
+        let mut enc_state = CoarseEnergyState::new();
+        let mut dec_state = CeltDecodeState::new(lm).unwrap();
+        for (i, gain) in [1.0f32, 0.5, 1.4].iter().enumerate() {
+            let spectrum: Vec<f32> = build_spectrum(lm, start, end)
+                .iter()
+                .map(|&s| s * gain)
+                .collect();
+            let header = CeltFrameHeader {
+                intra: i == 0,
+                ..default_header()
+            };
+            let encoded = encode_celt_frame_auto(
+                &mut enc_state,
+                &spectrum,
+                &header,
+                lm,
+                FRAME_BYTES,
+                start,
+                end,
+            )
+            .unwrap();
+            let frame = decode_celt_frame_auto(&mut dec_state, &encoded.bytes, start, end).unwrap();
+            assert!(frame.pcm.iter().all(|s| s.is_finite()), "lm={lm} frame {i}");
+            assert_eq!(
+                enc_state.energy[0],
+                dec_state.coarse_energy().energy[0],
+                "lm={lm} frame {i}: prediction diverged"
+            );
+        }
+    }
 }

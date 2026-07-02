@@ -6,6 +6,21 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-382 (2026-07-02) — caller-input-free encode
+  (`encode_celt_frame_auto`) → self-contained codec loop:** the encode
+  counterpart of `decode_celt_frame_auto`. After the Table-56 prefix is
+  encoded, the per-band pulse counts are derived from the *returned*
+  `FramePrefix` via `derive_band_pulses` — the identical §4.3.3 →
+  §4.3.4.1 seam the auto-decoder runs over its *decoded* prefix. The
+  two prefixes are bit-identical, so both sides land on the same
+  `band_k` with **no allocation exchanged out of band**:
+  `encode_celt_frame_auto` → `decode_celt_frame_auto` is a fully
+  self-contained mono codec loop (spectrum → bytes → PCM). Validated by
+  the auto loop round-trip (finite non-silent PCM, coarse prediction
+  lockstep, bit-exact residual against the encoder reconstruction via a
+  manual derive + decode walk, byte-level determinism) and a
+  multi-frame stream at every `LM ∈ 0..=3`. +2 tests (659 total).
+
 * **Round-382 (2026-07-02) — full mono CELT frame *encoder*
   (`encode_celt_frame`) + end-to-end encode→decode PCM round-trip:**
   the top-level encode driver, the bitstream inverse of
