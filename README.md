@@ -144,6 +144,10 @@ identity test at every `LM`:
   (`encode_celt_frame_auto_boosted` overrides it). The §5.3.4.2 trim
   deviation stays a docs gap (direction + bound given, no
   tilt→deviation map).
+* `encoder_decisions::choose_intra_mode` — the §5.3.3 two-pass
+  intra/inter coarse-mode selection: encode the coarse energy both
+  ways on scratch states (each pass paying its own `{7,1}/8` intra
+  flag) and pick the cheaper `tell_frac`, ties to inter.
 * **Silence frames** — a silence header encodes the full Table-56
   prefix (coarse prediction stays in lockstep across the run) but no
   shape symbols; the decoder's silence branch synthesizes the zero

@@ -363,7 +363,9 @@ pub use e_prob_model::{
     prob_decay, ProbDecay, E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER,
     PRED_INTRA,
 };
-pub use encoder_decisions::{boost_quanta_8th, boost_thresholds, choose_band_boosts};
+pub use encoder_decisions::{
+    boost_quanta_8th, boost_thresholds, choose_band_boosts, choose_intra_mode,
+};
 pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, encode_fine_energy, encode_fine_energy_band,
     finalize_extra_bits, fine_correction_q14, fine_correction_qn, quantize_fine_energy_band,

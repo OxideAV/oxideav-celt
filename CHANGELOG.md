@@ -6,6 +6,25 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — §5.3.3 intra/inter coarse-mode decision
+  (`choose_intra_mode`):** the second §5.3 encoder decision with a
+  documented method: "it is best to try encoding the coarse energy
+  both with and without inter-frame prediction such that the best
+  prediction mode can be selected." Runs the §4.3.2.1 coarse encode
+  twice on scratch states — each pass paying its own Table-56 intra
+  flag (`{7,1}/8`, ~3 bits set vs ~0.19 clear) ahead of the walk, so
+  the flag price is part of the comparison — and picks the mode with
+  the lower `tell_frac`; ties go to inter (the time-arm prediction
+  reduces the *next* frame's cost on stationary signals). Loss-aware
+  weighting (§5.3.3 names packet loss as a factor) is transport policy
+  left to the caller. Validated by exact agreement with a manual
+  two-pass cost comparison over a state × target × LM sweep that
+  provably exercises **both** outcomes, the
+  stationary-stream-prefers-inter property, and bad-parameter
+  propagation. +3 tests. Provenance: RFC 6716 §5.3.3 + §4.3.2.1
+  (`docs/audio/opus/rfc6716-opus.txt`). No external library source
+  consulted.
+
 * **Round-385 (2026-07-03) — stereo PCM analysis front end
   (`StereoPcmAnalysis`):** the encode-side mirror of the stereo decode
   back end (`synthesize_stereo_frame`), drawing the identical channel

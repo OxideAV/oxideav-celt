@@ -121,6 +121,63 @@ pub fn choose_band_boosts(
     Some(out)
 }
 
+/// The §5.3.3 coarse-energy prediction-mode decision: "it is best to
+/// try encoding the coarse energy both with and without inter-frame
+/// prediction such that the best prediction mode can be selected."
+///
+/// Runs the §4.3.2.1 coarse encode **twice** on scratch states — once
+/// intra, once inter — against the same targets and budget, and
+/// returns `true` (intra) iff the intra pass spends strictly fewer
+/// `tell_frac` eighth-bits. Both passes quantize each band to the
+/// nearest 6 dB step (the §5.3.3 per-value rule the coarse encoder
+/// already applies), so the coded error is comparable and the rate is
+/// the discriminating lever; ties go to **inter** (the §4.3.2.1
+/// time-arm prediction reduces the next frame's cost for stationary
+/// signals). §5.3.3 notes the optimal mode also depends on the
+/// packet-loss rate — loss-aware weighting is transport policy and
+/// stays with the caller (force `intra = true` for robustness).
+///
+/// `budget_bits` is the frame budget in **bits** (`frame_bytes * 8`),
+/// the same value the frame encoders hand the coarse dispatch.
+/// Returns `None` when the underlying coarse encode rejects the
+/// window/`lm`/`channels`.
+#[allow(clippy::too_many_arguments)]
+pub fn choose_intra_mode(
+    coarse: &crate::coarse_energy::CoarseEnergyState,
+    energy_target: &[[f32; NUM_BANDS]; crate::coarse_energy::MAX_CHANNELS],
+    lm: u32,
+    start: usize,
+    end: usize,
+    channels: usize,
+    budget_bits: u32,
+) -> Option<bool> {
+    let mut cost_8th = [0u32; 2];
+    for (idx, intra) in [(0usize, false), (1usize, true)] {
+        let mut enc = crate::range_encoder::RangeEncoder::new();
+        // The §4.3.2.1 intra flag itself (Table 56, PDF `{7,1}/8`)
+        // is part of the price of the mode — ~3 bits when set vs
+        // ~0.19 when clear — so it is written into the scratch
+        // encoder ahead of the coarse walk, exactly as the real
+        // prefix does.
+        enc.enc_bit_logp(u32::from(intra), 3).ok()?;
+        let mut scratch = *coarse;
+        crate::coarse_energy::encode_coarse_energy(
+            &mut enc,
+            &mut scratch,
+            energy_target,
+            intra,
+            lm,
+            start,
+            end,
+            channels,
+            budget_bits,
+        )
+        .ok()?;
+        cost_8th[idx] = enc.tell_frac();
+    }
+    Some(cost_8th[1] < cost_8th[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +263,100 @@ mod tests {
         let boosts = choose_band_boosts(&window, 3, 17, NUM_BANDS).unwrap();
         let n = BAND_BINS_LM[3][18];
         assert_eq!(boosts, vec![0, 2 * boost_quanta_8th(n), 0, 0]);
+    }
+
+    /// `choose_intra_mode` equals a manual two-pass cost comparison
+    /// (intra-flag bit + §4.3.2.1 coarse walk on scratch states) over
+    /// a spread of states × targets × frame sizes.
+    #[test]
+    fn intra_mode_matches_manual_cost_comparison() {
+        use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS};
+        use crate::range_encoder::RangeEncoder;
+
+        let budget = 96u32 * 8;
+        let mut checked_both = [false, false];
+        for case in 0..6u32 {
+            let lm = case % 4;
+            let mut state = CoarseEnergyState::new();
+            let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+            for (b, slot) in target[0].iter_mut().enumerate() {
+                // A mix of stationary and adversarial cases.
+                let sign = if b % 2 == 0 { 1.0 } else { -1.0 };
+                state.energy[0][b] = sign * (case as f32);
+                *slot = -sign * (case as f32) + 0.3;
+            }
+            let got = choose_intra_mode(&state, &target, lm, 0, NUM_BANDS, 1, budget).unwrap();
+
+            let mut cost = [0u32; 2];
+            for (idx, intra) in [(0usize, false), (1usize, true)] {
+                let mut enc = RangeEncoder::new();
+                enc.enc_bit_logp(u32::from(intra), 3).unwrap();
+                let mut scratch = state;
+                encode_coarse_energy(
+                    &mut enc,
+                    &mut scratch,
+                    &target,
+                    intra,
+                    lm,
+                    0,
+                    NUM_BANDS,
+                    1,
+                    budget,
+                )
+                .unwrap();
+                cost[idx] = enc.tell_frac();
+            }
+            assert_eq!(
+                got,
+                cost[1] < cost[0],
+                "case {case}: decision != cost order"
+            );
+            checked_both[usize::from(got)] = true;
+        }
+        // The sweep must exercise both outcomes, or it proves nothing.
+        assert!(
+            checked_both[0] && checked_both[1],
+            "sweep failed to produce both intra and inter decisions"
+        );
+    }
+
+    /// A stationary stream prefers inter: after the state has locked
+    /// onto the targets, re-coding the same envelope is near-free with
+    /// inter prediction, while intra pays the full envelope (plus the
+    /// 3-bit flag) again.
+    #[test]
+    fn stationary_stream_prefers_inter() {
+        use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS};
+        use crate::range_encoder::RangeEncoder;
+
+        let budget = 96u32 * 8;
+        let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        for (b, slot) in target[0].iter_mut().enumerate() {
+            *slot = 5.0 - 0.2 * b as f32;
+        }
+        // Lock the state onto the targets with one intra pass.
+        let mut state = CoarseEnergyState::new();
+        let mut enc = RangeEncoder::new();
+        encode_coarse_energy(
+            &mut enc, &mut state, &target, true, 2, 0, NUM_BANDS, 1, budget,
+        )
+        .unwrap();
+        // Same envelope again: inter must win.
+        assert_eq!(
+            choose_intra_mode(&state, &target, 2, 0, NUM_BANDS, 1, budget),
+            Some(false)
+        );
+    }
+
+    /// Bad parameters propagate as `None`.
+    #[test]
+    fn intra_mode_rejects_bad_params() {
+        use crate::coarse_energy::{CoarseEnergyState, MAX_CHANNELS};
+        let state = CoarseEnergyState::new();
+        let target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        assert!(choose_intra_mode(&state, &target, 4, 0, NUM_BANDS, 1, 768).is_none());
+        assert!(choose_intra_mode(&state, &target, 0, 5, 3, 1, 768).is_none());
+        assert!(choose_intra_mode(&state, &target, 0, 0, NUM_BANDS, 0, 768).is_none());
     }
 
     /// Input validation: bad lm / window / length are rejected; tiny
