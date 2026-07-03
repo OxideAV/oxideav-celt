@@ -106,9 +106,67 @@ pin the full-loop and per-symbol round-trips. The frame encoder pins
 spread = `None` and all-zero `tf_changes` (legal encoder choices; a
 non-identity spread/TF needs the inverse §4.3.4.3/§4.3.4.5 orthonormal
 transforms before the PVQ search — fully specified, not yet
-implemented). The PCM→MDCT analysis front end (forward windowing +
-pre-emphasis) and the codec-registration entry point are the remaining
-encode-side gaps; `mdct_naive_f32` (the forward MDCT) already exists.
+implemented).
+
+**PCM→MDCT analysis front end + PCM codec loop, r385.** The encoder
+now consumes real time-domain PCM: `encode_celt_frame_pcm_auto` →
+`decode_celt_frame_auto` is a fully self-contained **PCM → bytes →
+PCM** mono codec loop (one frame — `120 << lm` samples — of
+algorithmic delay). Each encode front-end stage is the documented
+inverse of its decode back-end mirror, pinned by an *unquantized*
+identity test at every `LM`:
+
+* `Preemphasis` — the §4.3.7.2 FIR `A(z) = 1 - alpha_p*z^-1`, the
+  exact inverse of the `Deemphasis` pole (pre→de and de→pre are both
+  the identity across frame splits with state carry).
+* `MdctAnalysis` — the streaming windowed forward MDCT, mirror of
+  `MdctSynthesis`: `[history | input]` sliding block at hop `N`, the
+  same power-complementary §4.3.7 window, one-frame-delay perfect
+  reconstruction through the synthesis side ([PRINCEN86] TDAC).
+* `LongMdctAnalysis` + `extract_coded_spectrum` (module `analysis`) —
+  the fixed-`lm` spine, mirror of `LongMdctSynthesis`:
+  `120 << lm`-sample frames → coded-window spectrum in the
+  band-contiguous residual layout (`extract_coded_spectrum` is the
+  exact inverse of `place_residual_spectrum`; the `20 << lm` bins
+  above the Table-55 coding top are dropped — the bins the decoder
+  reconstructs as zero).
+* `CeltEncodeState` + `encode_celt_frame_pcm[_auto]` (module
+  `pcm_encode`) — the top-level PCM driver, the encode-side mirror of
+  `CeltDecodeState`: carries the pre-emphasis FIR tap, the MDCT
+  analysis history, and the §4.3.2.1 coarse prediction across frames;
+  any error leaves the streaming state untouched. A signalled
+  post-filter is rejected (the §5.3.1 pitch pre-filter *search* is
+  described only as optimization criteria).
+* `encoder_decisions::choose_band_boosts` — the §5.3.4.1 band-boost
+  rule (`D_j = 2E_j - E_{j-1} - E_{j+1}` vs `(t1, t2) = (2, 4)` for
+  `LM >= 1` / `(3, 5)` below, one §4.3.3 dynalloc quantum per boost),
+  applied automatically by `encode_celt_frame_auto`
+  (`encode_celt_frame_auto_boosted` overrides it). The §5.3.4.2 trim
+  deviation stays a docs gap (direction + bound given, no
+  tilt→deviation map).
+* **Silence frames** — a silence header encodes the full Table-56
+  prefix (coarse prediction stays in lockstep across the run) but no
+  shape symbols; the decoder's silence branch synthesizes the zero
+  spectrum and plays out its overlap tail toward true silence.
+  Whether the reference wire format truncates the walk after the
+  silence bit is not pinned by RFC prose (interop caveat; the in-crate
+  loop is self-consistent).
+* `StereoPcmAnalysis` — the per-channel stereo front end (independent
+  pre-emphasis + analysis memory per channel), emitting the two
+  coded-window spectra `synthesize_stereo_frame` consumes — the same
+  §4.3.4.4 `itheta` boundary the stereo decode draws, approached from
+  the encode side.
+
+`tests/pcm_codec_loop.rs` pins the story end-to-end: the unquantized
+front↔back identity at every `LM`, decoder PCM ≡ synthesis of the
+encoder's bit-exact reconstruction, waveform fidelity on a tonal
+signal (steady-state relative L2 error < 0.8, correlation > 0.6 with
+no fine bits spent), and spectral closure (re-analyzing the decoded
+PCM recovers the encoder's reconstructed spectra one frame delayed).
+Remaining encode-side gaps: the codec-registration entry point, the
+§5.3.1 pitch pre-filter (period search unspecified), transient
+(short-block) analysis (§4.3.1 geometry docs gap), and the §5.3.4.2
+trim map.
 
 **Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
 the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps
