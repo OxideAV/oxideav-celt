@@ -6,6 +6,26 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — §4.3.7.2 encoder-side *pre-emphasis*
+  (`Preemphasis`, the exact FIR inverse of `Deemphasis`):** the first
+  stage of the PCM→MDCT analysis front end. §4.3.7.2 writes the decoder
+  filter as `1/A(z)` with `A(z) = 1 - alpha_p*z^-1` ("the inverse of
+  the pre-emphasis filter used in the encoder"), so the encoder-side
+  pre-emphasis is the first-order FIR `y(n) = x(n) - alpha_p * x(n-1)`
+  with the same `alpha_p = 0.8500061035` (§5.3 confirms the direction:
+  the encoder's filters are the inverse of the decoder's operations).
+  `Preemphasis` carries the `x(n-1)` FIR memory across frames (the
+  mirror of `Deemphasis::last_y`), with the same `step` / `apply` /
+  `apply_in_place` / `reset` surface and a `preemphasize_in_place_f32`
+  one-shot. Validated by both composition identities (pre→de and
+  de→pre reproduce the input exactly across uneven frame splits with
+  independent state carry), the literal FIR impulse response
+  `[1, -alpha_p, 0, ...]`, the `(1 - alpha_p)` DC gain, frame-continuity
+  state carry, entry-point agreement, and the mismatch/reset guards.
+  +8 tests. Provenance: RFC 6716 §4.3.7.2 (the `A(z)` closed form) +
+  §5.3 (encoder-is-inverse prose), `docs/audio/opus/rfc6716-opus.txt`.
+  No external library source consulted.
+
 * **Round-382 (2026-07-02) — caller-input-free encode
   (`encode_celt_frame_auto`) → self-contained codec loop:** the encode
   counterpart of `decode_celt_frame_auto`. After the Table-56 prefix is

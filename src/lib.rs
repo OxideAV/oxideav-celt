@@ -345,7 +345,10 @@ pub use coarse_energy::{
     decode_coarse_energy, encode_coarse_energy, CoarseEnergyState, BETA_COEF_Q15, INTRA_ALPHA_Q15,
     INTRA_BETA_Q15, MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, SMALL_ENERGY_ICDF,
 };
-pub use deemphasis::{deemphasize_in_place_f32, Deemphasis, ALPHA_P_F32, ALPHA_P_Q15};
+pub use deemphasis::{
+    deemphasize_in_place_f32, preemphasize_in_place_f32, Deemphasis, Preemphasis, ALPHA_P_F32,
+    ALPHA_P_Q15,
+};
 pub use denormalization::{
     denormalize_band_f32, denormalize_band_in_place_f32, denormalize_bands_f32,
     denormalize_bands_in_place_f32, log_energy_q8_to_amplitude_f32, scale_band_f32,
