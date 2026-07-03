@@ -52,10 +52,13 @@
 //! [`encode_celt_frame`](crate::frame_encode::encode_celt_frame)).
 //! No external library source was consulted.
 
-use crate::analysis::LongMdctAnalysis;
+use crate::analysis::{LongMdctAnalysis, StereoPcmAnalysis};
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::deemphasis::Preemphasis;
-use crate::frame_encode::{encode_celt_frame, encode_celt_frame_auto, EncodedFrame};
+use crate::frame_encode::{
+    encode_celt_frame, encode_celt_frame_auto, encode_stereo_celt_frame,
+    encode_stereo_celt_frame_auto, EncodedFrame, StereoEncodedFrame,
+};
 use crate::frame_header::CeltFrameHeader;
 use crate::synthesis::mdct_size;
 use crate::Error;
@@ -275,6 +278,201 @@ pub fn encode_celt_frame_pcm(
     encode_pcm_impl(
         state,
         pcm,
+        header,
+        frame_bytes,
+        start,
+        end,
+        Some(fine_bits),
+        Some(band_k),
+    )
+}
+
+/// Streaming **stereo** CELT encoder state carried across frames — the
+/// encode-side mirror of
+/// [`StereoCeltDecodeState`](crate::frame_synthesis::StereoCeltDecodeState).
+///
+/// Holds the per-channel encode front-end memory
+/// ([`StereoPcmAnalysis`]: pre-emphasis FIR tap + MDCT analysis
+/// history per channel) and the shared §4.3.2.1 coarse-energy
+/// prediction state (both channels live in the one
+/// [`CoarseEnergyState`], exactly as on the decode side).
+#[derive(Debug, Clone)]
+pub struct StereoCeltEncodeState {
+    analysis: StereoPcmAnalysis,
+    coarse: CoarseEnergyState,
+}
+
+impl StereoCeltEncodeState {
+    /// Create a stereo encoder state for frame-size shift `lm`
+    /// (`0..=3`). Returns `None` if `lm > 3`.
+    pub fn new(lm: u32) -> Option<Self> {
+        Some(Self {
+            analysis: StereoPcmAnalysis::new(lm)?,
+            coarse: CoarseEnergyState::new(),
+        })
+    }
+
+    /// The frame-size shift this state was created for.
+    #[inline]
+    pub fn lm(&self) -> u32 {
+        self.analysis.lm()
+    }
+
+    /// The per-channel frame size (`120 << lm`); each encode call
+    /// consumes twice this many interleaved samples.
+    #[inline]
+    pub fn frame_size(&self) -> usize {
+        self.analysis.frame_size()
+    }
+
+    /// The encoder's §4.3.2.1 coarse-energy prediction state (both
+    /// channels, in lockstep with the decoder's after each
+    /// successfully encoded frame).
+    #[inline]
+    pub fn coarse_energy(&self) -> &CoarseEnergyState {
+        &self.coarse
+    }
+
+    /// Zero every piece of cross-frame memory (both channels'
+    /// pre-emphasis taps + analysis histories, the shared coarse
+    /// prediction) — the encoder-side mirror of the §4.5.2 reset.
+    pub fn reset(&mut self) {
+        self.analysis.reset();
+        self.coarse.reset();
+    }
+}
+
+/// Shared engine for the two stereo PCM encoders.
+#[allow(clippy::too_many_arguments)]
+fn encode_stereo_pcm_impl(
+    state: &mut StereoCeltEncodeState,
+    interleaved: &[f32],
+    header: &CeltFrameHeader,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+    fine_bits: Option<&[u32; NUM_BANDS]>,
+    band_k: Option<&[u32]>,
+) -> Result<StereoEncodedFrame, Error> {
+    let n = state.frame_size();
+    if interleaved.len() != 2 * n || start > end || end > NUM_BANDS {
+        return Err(Error::InvalidParameter);
+    }
+    // Same driver-level constraints as the mono PCM encoders: no
+    // transients, no silence+explicit-allocation contradiction, and no
+    // signalled post-filter (the §5.3.1 pre-filter search is the
+    // documented gap).
+    if header.transient || (header.silence && fine_bits.is_some()) {
+        return Err(Error::NotImplemented);
+    }
+    if header.post_filter.is_some() {
+        return Err(Error::NotImplemented);
+    }
+
+    // Snapshot the front end so any failure leaves the stream intact.
+    let analysis_snapshot = state.analysis.clone();
+    let lm = state.lm();
+
+    // Per-channel §4.3.7.2 pre-emphasis + §4.3.7 forward MDCT (both
+    // channels validated up front inside the stereo front end).
+    let (left, right) = state.analysis.analyze(interleaved, start, end)?;
+
+    let result = match (fine_bits, band_k) {
+        (Some(fb), Some(k)) => encode_stereo_celt_frame(
+            &mut state.coarse,
+            &left,
+            &right,
+            header,
+            lm,
+            frame_bytes,
+            start,
+            end,
+            fb,
+            k,
+        ),
+        _ => encode_stereo_celt_frame_auto(
+            &mut state.coarse,
+            &left,
+            &right,
+            header,
+            lm,
+            frame_bytes,
+            start,
+            end,
+        ),
+    };
+    match result {
+        Ok(frame) => Ok(frame),
+        Err(e) => {
+            state.analysis = analysis_snapshot;
+            Err(e)
+        }
+    }
+}
+
+/// Encode one **dual-stereo**, non-transient CELT frame from
+/// interleaved L/R/L/R PCM, deriving the shared per-band pulse counts
+/// from the encoded prefix — the stereo counterpart of
+/// [`encode_celt_frame_pcm_auto`], and the full encode-side mirror of
+/// [`decode_stereo_frame_auto`](crate::frame_synthesis::StereoCeltDecodeState::decode_stereo_frame_auto).
+///
+/// `encode_stereo_celt_frame_pcm_auto` → `decode_stereo_frame_auto`
+/// is a fully self-contained **stereo PCM → bytes → PCM** codec loop
+/// (one frame of algorithmic delay per channel, no out-of-band data).
+///
+/// * `interleaved` — exactly `2 * (120 << lm)` samples, L/R/L/R.
+/// * `header` — must be non-transient with `post_filter: None`; a
+///   silence header is accepted in this auto mode (prefix-only frame,
+///   front end still advances so a silence run keeps the stream
+///   continuous).
+///
+/// A frame whose byte budget cannot carry the Table-56 dual-stereo
+/// selectors is rejected with [`Error::NotImplemented`] (see
+/// [`encode_stereo_celt_frame`]); on any error the streaming
+/// front-end state is left untouched so the caller may retry with a
+/// larger `frame_bytes`.
+pub fn encode_stereo_celt_frame_pcm_auto(
+    state: &mut StereoCeltEncodeState,
+    interleaved: &[f32],
+    header: &CeltFrameHeader,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+) -> Result<StereoEncodedFrame, Error> {
+    encode_stereo_pcm_impl(
+        state,
+        interleaved,
+        header,
+        frame_bytes,
+        start,
+        end,
+        None,
+        None,
+    )
+}
+
+/// Encode one dual-stereo, non-transient CELT frame from interleaved
+/// PCM with **caller-supplied** `fine_bits` / `band_k` allocations —
+/// the stereo counterpart of [`encode_celt_frame_pcm`] (identical
+/// values must be given to the matching
+/// [`decode_stereo_frame_coded`](crate::frame_synthesis::StereoCeltDecodeState::decode_stereo_frame_coded)).
+///
+/// Front end, constraints, and error behaviour match
+/// [`encode_stereo_celt_frame_pcm_auto`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_stereo_celt_frame_pcm(
+    state: &mut StereoCeltEncodeState,
+    interleaved: &[f32],
+    header: &CeltFrameHeader,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+    fine_bits: &[u32; NUM_BANDS],
+    band_k: &[u32],
+) -> Result<StereoEncodedFrame, Error> {
+    encode_stereo_pcm_impl(
+        state,
+        interleaved,
         header,
         frame_bytes,
         start,
