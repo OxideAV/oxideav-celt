@@ -311,7 +311,7 @@ pub use alloc_combine::{
 pub use allocation_budget::{
     compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
 };
-pub use analysis::{extract_coded_spectrum, LongMdctAnalysis};
+pub use analysis::{extract_coded_spectrum, LongMdctAnalysis, StereoPcmAnalysis};
 pub use band_analysis::{
     analyze_band_f32, analyze_bands_f32, band_energy_f32, band_log_energy_f32, BandAnalysis,
     SILENCE_LOG_ENERGY,

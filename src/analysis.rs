@@ -182,6 +182,97 @@ impl LongMdctAnalysis {
     }
 }
 
+/// Streaming **stereo** PCM analysis front end — the encode-side
+/// mirror of
+/// [`StereoCeltDecodeState::synthesize_stereo_frame`](crate::frame_synthesis::StereoCeltDecodeState::synthesize_stereo_frame)'s
+/// per-channel back end (§4.3.7.2 de-emphasis + §4.3.7 IMDCT/WOLA),
+/// drawing the identical channel boundary from the other side.
+///
+/// The §4.3.7.2 pre-emphasis and the §4.3.7 windowed forward MDCT run
+/// **per channel** with independent cross-frame memory (FIR tap +
+/// analysis history per channel), exactly as the decode back end runs
+/// its de-emphasis and IMDCT per channel. Each
+/// [`analyze`](Self::analyze) call consumes one interleaved L/R/L/R
+/// frame (`2 * (120 << lm)` samples) and returns the two channels'
+/// coded-window MDCT spectra — the per-channel inputs the stereo
+/// synthesis takes, and the boundary at which the §4.3.4.4 `itheta`
+/// mid/side coupling docs gap begins on the bitstream side.
+#[derive(Debug, Clone)]
+pub struct StereoPcmAnalysis {
+    preemph: [crate::deemphasis::Preemphasis; 2],
+    channels: [LongMdctAnalysis; 2],
+}
+
+impl StereoPcmAnalysis {
+    /// Create a stereo analysis state for frame-size shift `lm`
+    /// (`0..=3`), with zero memory in both channels.
+    pub fn new(lm: u32) -> Option<Self> {
+        Some(Self {
+            preemph: [crate::deemphasis::Preemphasis::new(); 2],
+            channels: [LongMdctAnalysis::new(lm)?, LongMdctAnalysis::new(lm)?],
+        })
+    }
+
+    /// The frame-size shift this state was created for.
+    #[inline]
+    pub fn lm(&self) -> u32 {
+        self.channels[0].lm()
+    }
+
+    /// The per-channel frame size (`120 << lm`); each
+    /// [`analyze`](Self::analyze) call consumes twice this many
+    /// interleaved samples.
+    #[inline]
+    pub fn frame_size(&self) -> usize {
+        self.channels[0].frame_size()
+    }
+
+    /// Zero both channels' pre-emphasis taps and analysis histories.
+    pub fn reset(&mut self) {
+        for p in &mut self.preemph {
+            p.reset();
+        }
+        for c in &mut self.channels {
+            c.reset();
+        }
+    }
+
+    /// Analyze one interleaved stereo frame: de-interleave, run each
+    /// channel's §4.3.7.2 pre-emphasis and §4.3.7 windowed forward
+    /// MDCT, and return `(left, right)` coded-window spectra for the
+    /// band window `[start, end)`.
+    ///
+    /// `interleaved` must hold exactly `2 * (120 << lm)` samples
+    /// (L/R/L/R). Returns [`Error::InvalidParameter`] on a length
+    /// mismatch or an out-of-range window; the carried state advances
+    /// only on success (both channels are validated up front, so the
+    /// two never desynchronize).
+    pub fn analyze(
+        &mut self,
+        interleaved: &[f32],
+        start: usize,
+        end: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        let n = self.frame_size();
+        if interleaved.len() != 2 * n || start > end || end > NUM_BANDS {
+            return Err(Error::InvalidParameter);
+        }
+        let mut left = vec![0.0f32; n];
+        let mut right = vec![0.0f32; n];
+        for i in 0..n {
+            left[i] = interleaved[2 * i];
+            right[i] = interleaved[2 * i + 1];
+        }
+        self.preemph[0].apply_in_place(&mut left);
+        self.preemph[1].apply_in_place(&mut right);
+        // All shape conditions were validated above, so neither
+        // channel's analyze can fail after the other advanced.
+        let left_spec = self.channels[0].analyze(&left, start, end)?;
+        let right_spec = self.channels[1].analyze(&right, start, end)?;
+        Ok((left_spec, right_spec))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +444,105 @@ mod tests {
         ana.reset();
         let after_reset = ana.analyze(&pcm, 0, NUM_BANDS).unwrap();
         assert_eq!(first, after_reset);
+    }
+
+    /// The stereo front end against the public stereo decode back end
+    /// (`synthesize_stereo_frame`, post-filter off): an interleaved
+    /// band-limited de-emphasized stereo stream analyzed per channel
+    /// and re-synthesized reproduces the input exactly with one frame
+    /// of delay, both channels carrying distinct content.
+    #[test]
+    fn stereo_front_end_back_end_identity() {
+        use crate::deemphasis::Deemphasis;
+        use crate::frame_synthesis::StereoCeltDecodeState;
+
+        let lm = 1u32;
+        let n = 120usize << lm;
+        let frames = 5usize;
+        let coded = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+
+        // Per-channel band-limited generators with distinct seeds.
+        let mut gen = [
+            LongMdctSynthesis::new(lm).unwrap(),
+            LongMdctSynthesis::new(lm).unwrap(),
+        ];
+        let mut gen_deemph = [Deemphasis::new(), Deemphasis::new()];
+        let mut input = Vec::with_capacity(frames * 2 * n);
+        for t in 0..frames {
+            let mut chans: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+            for (ch, chan_buf) in chans.iter_mut().enumerate() {
+                let spec = test_signal(coded, 0x57E0 + 977 * ch as u32 + t as u32);
+                let mut pcm = gen[ch].synthesize(&spec, 0, NUM_BANDS).unwrap();
+                gen_deemph[ch].apply_in_place(&mut pcm);
+                *chan_buf = pcm;
+            }
+            for (l, r) in chans[0].iter().zip(chans[1].iter()) {
+                input.push(*l);
+                input.push(*r);
+            }
+        }
+
+        // Front end → (identity) → public stereo back end.
+        let mut ana = StereoPcmAnalysis::new(lm).unwrap();
+        assert_eq!(ana.lm(), lm);
+        assert_eq!(ana.frame_size(), n);
+        let mut dec = StereoCeltDecodeState::new(lm).unwrap();
+        let mut output = Vec::with_capacity(frames * 2 * n);
+        for t in 0..frames {
+            let frame = &input[t * 2 * n..(t + 1) * 2 * n];
+            let (l, r) = ana.analyze(frame, 0, NUM_BANDS).unwrap();
+            let out = dec
+                .synthesize_stereo_frame(&l, &r, 0, NUM_BANDS, None)
+                .unwrap();
+            output.extend_from_slice(&out);
+        }
+
+        // One frame (2n interleaved samples) of delay; steady state
+        // from the second recovered frame.
+        let scale = input
+            .iter()
+            .fold(0.0f32, |m, &v| if v.abs() > m { v.abs() } else { m })
+            .max(1.0);
+        for i in 2 * n..(frames - 1) * 2 * n {
+            let got = output[2 * n + i];
+            let want = input[i];
+            assert!(
+                (got - want).abs() <= 3e-4 * scale,
+                "stereo identity broken at interleaved sample {i}: {got} vs {want}"
+            );
+        }
+        // The two channels really carry different content.
+        let mut diff = 0.0f64;
+        for i in (2 * n..4 * n).step_by(2) {
+            diff += (input[i] - input[i + 1]).abs() as f64;
+        }
+        assert!(diff > 1.0, "test premise: channels must differ");
+    }
+
+    /// Stereo rejection + reset: length/window mismatches leave both
+    /// channels' state untouched, and `reset()` restores fresh-state
+    /// output.
+    #[test]
+    fn stereo_rejects_and_resets() {
+        let lm = 0u32;
+        let mut ana = StereoPcmAnalysis::new(lm).unwrap();
+        let n = ana.frame_size();
+        let frame = test_signal(2 * n, 0xD0A1);
+        assert!(ana.analyze(&frame[..2 * n - 1], 0, NUM_BANDS).is_err());
+        assert!(ana.analyze(&frame, 5, 3).is_err());
+        assert!(ana.analyze(&frame, 0, NUM_BANDS + 1).is_err());
+        let (l1, r1) = ana.analyze(&frame, 0, NUM_BANDS).unwrap();
+        let mut fresh = StereoPcmAnalysis::new(lm).unwrap();
+        let (l2, r2) = fresh.analyze(&frame, 0, NUM_BANDS).unwrap();
+        assert_eq!(l1, l2);
+        assert_eq!(r1, r2);
+        // Advance then reset: fresh-state output returns.
+        let _ = ana.analyze(&frame, 0, NUM_BANDS).unwrap();
+        ana.reset();
+        let (l3, r3) = ana.analyze(&frame, 0, NUM_BANDS).unwrap();
+        assert_eq!(l1, l3);
+        assert_eq!(r1, r3);
+        // lm out of range.
+        assert!(StereoPcmAnalysis::new(4).is_none());
     }
 }

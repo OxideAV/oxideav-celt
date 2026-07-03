@@ -6,6 +6,27 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — stereo PCM analysis front end
+  (`StereoPcmAnalysis`):** the encode-side mirror of the stereo decode
+  back end (`synthesize_stereo_frame`), drawing the identical channel
+  boundary from the other side. The §4.3.7.2 pre-emphasis and §4.3.7
+  windowed forward MDCT run **per channel** with independent
+  cross-frame memory (FIR tap + analysis history per channel), exactly
+  as the decode back end runs its de-emphasis and IMDCT per channel;
+  each `analyze` call consumes one interleaved L/R/L/R frame and
+  returns the two channels' coded-window spectra — the per-channel
+  inputs the stereo synthesis takes, and the boundary at which the
+  §4.3.4.4 `itheta` mid/side coupling docs gap begins on the bitstream
+  side. Validated by a full stereo front-end → public back-end
+  identity (an interleaved band-limited de-emphasized stereo stream
+  analyzed per channel and re-synthesized through
+  `StereoCeltDecodeState::synthesize_stereo_frame` reproduces the
+  input exactly with one frame of delay, channels carrying distinct
+  content) plus the rejection/reset/state-atomicity guards. +2 tests.
+  Provenance: per-channel composition of existing RFC-grounded
+  modules; RFC 6716 §4.3.7/§4.3.7.2/§5.3. No external library source
+  consulted.
+
 * **Round-385 (2026-07-03) — silence-frame encode/decode through the
   self-contained loop:** the §4.3 Table-56 `silence` flag is now a
   usable coding mode on both sides. A silence frame carries the full
