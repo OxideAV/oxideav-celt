@@ -145,11 +145,15 @@ fn encode_pcm_impl(
     if pcm.len() != n || start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
     }
-    // The spectrum encoder itself rejects transient/silent headers;
-    // reject them (and a signalled post-filter, whose §5.3.1 pre-filter
-    // is not applied — see the module docs) before the streaming
-    // front-end state is touched.
-    if header.transient || header.silence {
+    // The spectrum encoder itself rejects transient headers; reject
+    // them (and a signalled post-filter, whose §5.3.1 pre-filter is
+    // not applied — see the module docs) before the streaming
+    // front-end state is touched. A silence header is allowed in auto
+    // mode only (a caller-supplied allocation contradicts the flag —
+    // the same rule the spectrum encoder applies); the front end still
+    // runs so the analysis history and coarse targets keep tracking
+    // the real (silent) input across the silence run.
+    if header.transient || (header.silence && fine_bits.is_some()) {
         return Err(Error::NotImplemented);
     }
     if header.post_filter.is_some() {
@@ -226,8 +230,13 @@ fn encode_pcm_impl(
 ///
 /// * `pcm` — exactly `120 << lm` time-domain samples (the next input
 ///   frame; see the module docs for the one-frame latency contract).
-/// * `header` — must be non-silent, non-transient, and have
-///   `post_filter: None` ([`Error::NotImplemented`] otherwise).
+/// * `header` — must be non-transient and have `post_filter: None`
+///   ([`Error::NotImplemented`] otherwise). A **silence** header is
+///   accepted: the frame carries the Table-56 prefix (keeping the
+///   §4.3.2.1 coarse prediction in lockstep with the analyzed input)
+///   but no shape symbols, and the decoder's silence branch plays out
+///   its overlap tail toward true silence. The front end still
+///   advances, so a silence run keeps the stream continuous.
 ///
 /// On any error the streaming front-end state is left untouched, so
 /// the caller may retry (e.g. with a larger `frame_bytes`) without
@@ -421,13 +430,25 @@ mod tests {
             encode_celt_frame_pcm_auto(&mut state, &pcm, &transient, FRAME_BYTES, 0, 21),
             Err(Error::NotImplemented)
         ));
-        // Silence header.
+        // Silence header with an explicit allocation contradicts the
+        // flag (the auto path accepts silence — see the silence test).
         let silence = CeltFrameHeader {
             silence: true,
             ..good
         };
+        let fine_bits = [0u32; NUM_BANDS];
+        let band_k = vec![0u32; 21];
         assert!(matches!(
-            encode_celt_frame_pcm_auto(&mut state, &pcm, &silence, FRAME_BYTES, 0, 21),
+            encode_celt_frame_pcm(
+                &mut state,
+                &pcm,
+                &silence,
+                FRAME_BYTES,
+                0,
+                21,
+                &fine_bits,
+                &band_k
+            ),
             Err(Error::NotImplemented)
         ));
         // Post-filter signalled (no §5.3.1 pre-filter is applied).
@@ -454,6 +475,66 @@ mod tests {
         let expected =
             encode_celt_frame_pcm_auto(&mut fresh, &pcm, &good, FRAME_BYTES, 0, 21).unwrap();
         assert_eq!(after.bytes, expected.bytes);
+    }
+
+    /// A silence run after a loud frame: the silence frames carry only
+    /// the prefix, the decoder plays out its overlap tail, and the
+    /// decoded output decays to (numerical) silence while the coarse
+    /// prediction stays in lockstep throughout.
+    #[test]
+    fn silence_run_decays_and_stays_in_lockstep() {
+        use crate::derive_pulses::decode_celt_frame_auto;
+        use crate::frame_synthesis::CeltDecodeState;
+
+        let lm = 1u32;
+        let mut enc = CeltEncodeState::new(lm).unwrap();
+        let mut dec = CeltDecodeState::new(lm).unwrap();
+        let n = enc.frame_size();
+
+        // One loud frame to charge the overlap tail / filter memories.
+        let loud = test_pcm(n, 0x10AD);
+        let frame =
+            encode_celt_frame_pcm_auto(&mut enc, &loud, &plain_header(), FRAME_BYTES, 0, 21)
+                .unwrap();
+        let decoded = decode_celt_frame_auto(&mut dec, &frame.bytes, 0, 21).unwrap();
+        assert!(decoded.pcm.iter().any(|&s| s != 0.0));
+
+        // A run of silence frames over silent input.
+        let silent_header = CeltFrameHeader {
+            silence: true,
+            intra: false,
+            ..plain_header()
+        };
+        let zeros = vec![0.0f32; n];
+        let mut peak = f32::MAX;
+        for t in 0..4 {
+            let frame =
+                encode_celt_frame_pcm_auto(&mut enc, &zeros, &silent_header, FRAME_BYTES, 0, 21)
+                    .unwrap();
+            assert!(frame.prefix.header.silence);
+            assert!(
+                frame.reconstructed_spectrum.iter().all(|&s| s == 0.0),
+                "a silence frame must carry the zero residual"
+            );
+            let decoded = decode_celt_frame_auto(&mut dec, &frame.bytes, 0, 21).unwrap();
+            assert_eq!(
+                enc.coarse_energy().energy,
+                dec.coarse_energy().energy,
+                "silence frame {t}: coarse lockstep broken"
+            );
+            let frame_peak = decoded
+                .pcm
+                .iter()
+                .fold(0.0f32, |m, &v| if v.abs() > m { v.abs() } else { m });
+            assert!(
+                frame_peak < peak,
+                "silence frame {t}: output must keep decaying ({frame_peak} vs {peak})"
+            );
+            peak = frame_peak;
+        }
+        // After several silence frames the playout has decayed to
+        // numerical quiet.
+        assert!(peak < 1e-2, "silence run did not decay: peak {peak}");
     }
 
     /// `reset()` restores fresh-stream behaviour across all three

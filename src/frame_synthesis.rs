@@ -283,9 +283,13 @@ pub struct StereoDecodedFrame {
 ///   or when a band's codebook saturates (the §4.3.4.4 split gap
 ///   surfaced by [`decode_residual_bands`]).
 ///
-/// A `silence`-flagged frame (§4.3 silence bit) decodes to all-zero
-/// PCM: the residual is the zero spectrum, so synthesis emits the WOLA
-/// of silence and de-emphasis carries the previous memory through.
+/// A `silence`-flagged frame (§4.3 silence bit) carries no shape
+/// symbols: the caller supplies the matching silence allocation
+/// (all-zero `band_k` / `fine_bits`, exactly what
+/// [`decode_celt_frame_auto`](crate::derive_pulses::decode_celt_frame_auto)
+/// does automatically on the flag), the residual is the zero
+/// spectrum, and synthesis plays out the overlap tail toward silence
+/// with the de-emphasis memory carried through.
 pub fn decode_celt_frame(
     state: &mut CeltDecodeState,
     frame_bytes: &[u8],

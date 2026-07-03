@@ -227,7 +227,17 @@ pub fn decode_celt_frame_auto(
         return Err(Error::NotImplemented);
     }
 
-    let band_k = derive_band_pulses(&prefix, lm, 1, false).ok_or(Error::InvalidParameter)?;
+    // A silence-flagged frame (§4.3 Table 56 `silence`) carries no
+    // shape symbols: the residual is the zero spectrum, so the
+    // synthesis plays out the overlap tail and the output decays to
+    // silence. The Table-56 walk (including coarse energy) still ran
+    // above, keeping the §4.3.2.1 prediction in encoder/decoder
+    // lockstep — the wire contract `encode_celt_frame_auto` writes.
+    let band_k = if prefix.header.silence {
+        vec![0u32; end - start]
+    } else {
+        derive_band_pulses(&prefix, lm, 1, false).ok_or(Error::InvalidParameter)?
+    };
 
     let fine_bits = [0u32; NUM_BANDS];
     decode_celt_frame(state, frame_bytes, start, end, &fine_bits, &band_k)

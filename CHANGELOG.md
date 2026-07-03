@@ -6,6 +6,36 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — silence-frame encode/decode through the
+  self-contained loop:** the §4.3 Table-56 `silence` flag is now a
+  usable coding mode on both sides. A silence frame carries the full
+  Table-56 prefix — including the §4.3.2.1 coarse energy, so the
+  encoder/decoder prediction stays in lockstep across a silence run —
+  but **no shape symbols**: `encode_celt_frame_auto` (and the PCM
+  driver `encode_celt_frame_pcm_auto`) accept a silence header and
+  encode the zero residual (zero boosts, no PVQ), and
+  `decode_celt_frame_auto` skips the pulse derivation on the decoded
+  flag, synthesizing the zero spectrum so the decoder plays out its
+  overlap tail toward true silence (a fresh decoder emits exactly-zero
+  PCM). The PCM front end still advances on silence frames, keeping
+  the analysis history and coarse targets tracking the real input
+  through the run. Combining the silence flag with an explicit
+  caller-supplied allocation is rejected (`Error::NotImplemented`) as
+  contradictory; `decode_celt_frame`'s silence contract is documented
+  as "caller supplies the all-zero allocation" (what the auto path
+  does). Whether the reference wire format additionally *truncates*
+  the Table-56 walk after the silence bit — and how the prediction
+  state behaves across reference silence frames — is not pinned by the
+  RFC prose (documented interop caveat; the in-crate loop is
+  self-consistent). Validated by a fresh-decoder exactly-zero
+  round-trip with coarse lockstep, a loud→silence-run decay test
+  (monotone peak decay to numerical quiet, lockstep at every frame,
+  zero reconstructed residual), and the contradiction rejections on
+  both drivers. +2 tests. Provenance: RFC 6716 §4.3 Table 56 (the
+  silence PDF) + §4.5 (the silence-frame overlap-playout prose:
+  "decoding a 2.5 ms silence frame ... as extracted by decoding a
+  silence frame"). No external library source consulted.
+
 * **Round-385 (2026-07-03) — §5.3.4.1 encoder band-boost decision
   (`encoder_decisions` module), wired through the auto encoders:** the
   first §5.3.4 encoder control decision the RFC spells out in closed

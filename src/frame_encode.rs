@@ -465,7 +465,14 @@ fn encode_celt_frame_impl(
     if lm > 3 || start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
     }
-    if header.transient || header.silence {
+    if header.transient {
+        return Err(Error::NotImplemented);
+    }
+    // A silence frame carries no shape symbols (the residual is the
+    // zero spectrum) — meaningful only in auto mode, where the decoder
+    // skips its own derivation on the silence flag. A caller-supplied
+    // `band_k` contradicts the flag.
+    if header.silence && band_k.is_some() {
         return Err(Error::NotImplemented);
     }
     let coded_bands = end - start;
@@ -511,7 +518,7 @@ fn encode_celt_frame_impl(
             }
             tb
         }
-        None if band_k.is_none() => {
+        None if band_k.is_none() && !header.silence => {
             derived_boost = crate::encoder_decisions::choose_band_boosts(
                 &energy_target[0][start..end],
                 lm,
@@ -557,13 +564,19 @@ fn encode_celt_frame_impl(
         end,
     )?;
 
-    // Resolve the per-band pulse counts: caller-supplied, or derived
-    // from the just-encoded prefix via the documented §4.3.3 →
-    // §4.3.4.1 seam (the identical derivation the auto-decoder runs
-    // over the decoded prefix).
+    // Resolve the per-band pulse counts: caller-supplied, zero for a
+    // silence frame (no shape symbols — the decoder's silence branch
+    // skips its own derivation identically), or derived from the
+    // just-encoded prefix via the documented §4.3.3 → §4.3.4.1 seam
+    // (the identical derivation the auto-decoder runs over the decoded
+    // prefix).
     let derived_k;
     let band_k: &[u32] = match band_k {
         Some(k) => k,
+        None if header.silence => {
+            derived_k = vec![0u32; coded_bands];
+            &derived_k
+        }
         None => {
             derived_k = crate::derive_pulses::derive_band_pulses(&prefix, lm, 1, false)
                 .ok_or(Error::InvalidParameter)?;
@@ -933,6 +946,67 @@ mod tests {
         assert_eq!(frame.prefix.boosts, decoded.prefix.boosts);
         assert_eq!(enc_state.energy, dec_state.coarse_energy().energy);
         assert!(decoded.pcm.iter().all(|s| s.is_finite()));
+    }
+
+    /// A silence-flagged auto frame carries only the Table-56 prefix
+    /// (zero residual), decodes on a fresh decoder to exactly zero
+    /// PCM, and keeps the coarse prediction in lockstep; combining the
+    /// silence flag with an explicit allocation is rejected.
+    #[test]
+    fn silence_frame_auto_round_trip() {
+        use crate::derive_pulses::decode_celt_frame_auto;
+        use crate::frame_synthesis::CeltDecodeState;
+
+        let lm = 2u32;
+        let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+        let spectrum = vec![0.0f32; total];
+        let header = CeltFrameHeader {
+            silence: true,
+            post_filter: None,
+            transient: false,
+            intra: true,
+            anti_collapse_on: None,
+        };
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_celt_frame_auto(
+            &mut enc_state,
+            &spectrum,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        assert!(frame.prefix.header.silence);
+        assert!(frame.reconstructed_spectrum.iter().all(|&s| s == 0.0));
+
+        // Fresh decoder: zero overlap tail + zero residual + zero
+        // de-emphasis memory → exactly zero PCM.
+        let mut dec_state = CeltDecodeState::new(lm).unwrap();
+        let decoded = decode_celt_frame_auto(&mut dec_state, &frame.bytes, 0, NUM_BANDS).unwrap();
+        assert!(decoded.prefix.header.silence);
+        assert!(decoded.pcm.iter().all(|&s| s == 0.0));
+        assert_eq!(enc_state.energy, dec_state.coarse_energy().energy);
+
+        // Silence + explicit allocation contradicts the flag.
+        let fine_bits = [0u32; NUM_BANDS];
+        let band_k = vec![0u32; NUM_BANDS];
+        let mut fresh = CoarseEnergyState::new();
+        assert!(matches!(
+            encode_celt_frame(
+                &mut fresh,
+                &spectrum,
+                &header,
+                lm,
+                FRAME_BYTES,
+                0,
+                NUM_BANDS,
+                &fine_bits,
+                &band_k,
+            ),
+            Err(Error::NotImplemented)
+        ));
     }
 
     /// The explicit-boost variant honours a caller-chosen target (on
