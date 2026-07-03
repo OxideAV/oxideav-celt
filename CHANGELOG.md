@@ -6,6 +6,15 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-389 (2026-07-04) — stereo-loop depth coverage:** the
+  narrowed coded-band window (`end = 17`, reduced audio bandwidth)
+  closes the same self-contained stereo loop (dual on the wire,
+  intensity offset tracking the window, coarse lockstep), and a
+  9-frame mixed sound → silence-run → sound stream stays in lockstep
+  end to end and re-acquires non-silent output after the run (the
+  §4.3.2.1 prediction survives silence frames on both sides).
+  +2 integration tests.
+
 * **Round-389 (2026-07-04) — §5.3.5 stereo decisions
   (`choose_mid_side_stereo`, `intensity_start_band`,
   `mid_side_extra_dof`):** the two RFC-pinned stereo encoder rules.
