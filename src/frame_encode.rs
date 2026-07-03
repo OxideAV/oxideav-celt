@@ -251,6 +251,8 @@ pub fn encode_frame_prefix(
         allocation,
         start,
         end,
+        tell_frac_after_prefix: enc.tell_frac(),
+        frame_bytes,
     })
 }
 
@@ -642,6 +644,321 @@ fn encode_celt_frame_impl(
     })
 }
 
+/// The result of encoding one **dual-stereo** CELT frame from two
+/// per-channel MDCT-domain spectra.
+#[derive(Debug, Clone)]
+pub struct StereoEncodedFrame {
+    /// The complete range-coded frame, exactly `frame_bytes` long.
+    pub bytes: Vec<u8>,
+    /// The control prefix as the decoder will reconstruct it (its
+    /// `allocation.dual_stereo` is `true` on every non-silent success —
+    /// the encoder rejects a frame whose budget gates cannot carry the
+    /// dual selector).
+    pub prefix: FramePrefix,
+    /// The two channels' final §4.3.2 Q8 log-energy envelopes
+    /// (coarse + fine), absolute band axis (`[0]` left, `[1]` right).
+    pub envelope_q8: [[i32; NUM_BANDS]; 2],
+    /// The encoder's bit-exact reconstruction of channel 0's coded
+    /// denormalized spectrum (same contract as
+    /// [`EncodedFrame::reconstructed_spectrum`]).
+    pub reconstructed_left: Vec<f32>,
+    /// Channel 1's reconstruction.
+    pub reconstructed_right: Vec<f32>,
+}
+
+/// Encode one **dual-stereo, non-transient** CELT frame from two
+/// per-channel MDCT-domain spectra — the encode side of the uncoupled
+/// stereo path (RFC 6716 Table 56 `dual` = 1: "encodes the left and
+/// right channels separately").
+///
+/// The wire layout is Table 56 with the stereo channel count: prefix
+/// (header → **both channels' §4.3.2.1 coarse energy**, whose
+/// within-band channel interleave *is* specified → TF → spread →
+/// boosts → trim/skip/**intensity**/**dual**) → §4.3.2.2 fine energy
+/// (band-major, channel 0 then channel 1 within each band — the same
+/// in-crate within-band interleave the dual residual walk uses; the
+/// RFC does not pin the main fine-energy channel order, interop
+/// caveat) → the dual residual (one PVQ index per channel per band,
+/// via the
+/// [`decode_stereo_residual_bands`](crate::residual::decode_stereo_residual_bands)
+/// convention) → §5.1.5 fixed-size assembly.
+///
+/// The encoder always requests `dual_stereo = true` and
+/// `intensity_band_offset = end - start` ("intensity never applies");
+/// if the §4.3.3 budget gates cannot carry those fields (the decoder
+/// would land on the joint-coding defaults, whose §4.3.4.4 `itheta`
+/// walk is the documented docs gap), the frame is rejected with
+/// [`Error::NotImplemented`] rather than mis-encoded — retry with a
+/// larger `frame_bytes`. A silence frame is exempt (it carries no
+/// shape symbols, so the stereo selectors are moot).
+///
+/// `fine_bits` applies per band **per channel** (each channel spends
+/// `B_i` raw bits in band `i`, matching the §4.3.2.2 finalize prose
+/// "one extra fine energy bit per band per channel"); `band_k` is the
+/// shared per-band pulse count (one `K`, two PVQ indices per band).
+/// Identical values must reach the matching
+/// [`decode_stereo_frame_coded`](crate::frame_synthesis::StereoCeltDecodeState::decode_stereo_frame_coded).
+/// Other parameters and error behaviour match [`encode_celt_frame`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_stereo_celt_frame(
+    coarse_state: &mut CoarseEnergyState,
+    left_spectrum: &[f32],
+    right_spectrum: &[f32],
+    header: &CeltFrameHeader,
+    lm: u32,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+    fine_bits: &[u32; NUM_BANDS],
+    band_k: &[u32],
+) -> Result<StereoEncodedFrame, Error> {
+    encode_stereo_celt_frame_impl(
+        coarse_state,
+        left_spectrum,
+        right_spectrum,
+        header,
+        lm,
+        frame_bytes,
+        start,
+        end,
+        fine_bits,
+        Some(band_k),
+    )
+}
+
+/// Encode one dual-stereo, non-transient CELT frame **deriving the
+/// shared per-band pulse counts** from the encoded prefix via
+/// [`derive_band_pulses_dual`](crate::derive_pulses::derive_band_pulses_dual)
+/// — the stereo counterpart of [`encode_celt_frame_auto`], and the
+/// encode side of
+/// [`decode_stereo_frame_auto`](crate::frame_synthesis::StereoCeltDecodeState::decode_stereo_frame_auto).
+///
+/// Both sides derive the identical `band_k` from the bit-identical
+/// prefix, so `encode_stereo_celt_frame_auto` →
+/// `decode_stereo_frame_auto` is a fully self-contained stereo codec
+/// loop with no out-of-band data. No fine-energy bits are spent
+/// (`fine_bits = 0`, the RFC-deferred fine/shape split). The §4.3.3
+/// band boosts are chosen by the §5.3.4.1 contrast rule over the
+/// per-band **maximum** of the two channels' log-energies (a band
+/// poking out in either channel earns the boost — an in-crate encoder
+/// freedom, like every §5.3.4 decision).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_stereo_celt_frame_auto(
+    coarse_state: &mut CoarseEnergyState,
+    left_spectrum: &[f32],
+    right_spectrum: &[f32],
+    header: &CeltFrameHeader,
+    lm: u32,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+) -> Result<StereoEncodedFrame, Error> {
+    let fine_bits = [0u32; NUM_BANDS];
+    encode_stereo_celt_frame_impl(
+        coarse_state,
+        left_spectrum,
+        right_spectrum,
+        header,
+        lm,
+        frame_bytes,
+        start,
+        end,
+        &fine_bits,
+        None,
+    )
+}
+
+/// Shared engine for the two stereo spectrum encoders.
+#[allow(clippy::too_many_arguments)]
+fn encode_stereo_celt_frame_impl(
+    coarse_state: &mut CoarseEnergyState,
+    left_spectrum: &[f32],
+    right_spectrum: &[f32],
+    header: &CeltFrameHeader,
+    lm: u32,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+    fine_bits: &[u32; NUM_BANDS],
+    band_k: Option<&[u32]>,
+) -> Result<StereoEncodedFrame, Error> {
+    if lm > 3 || start > end || end > NUM_BANDS {
+        return Err(Error::InvalidParameter);
+    }
+    if header.transient {
+        return Err(Error::NotImplemented);
+    }
+    if header.silence && band_k.is_some() {
+        return Err(Error::NotImplemented);
+    }
+    let coded_bands = end - start;
+    if let Some(k) = band_k {
+        if k.len() != coded_bands {
+            return Err(Error::InvalidParameter);
+        }
+    }
+    let total_bins = coded_total_bins(start, end, lm).ok_or(Error::InvalidParameter)? as usize;
+    if left_spectrum.len() != total_bins || right_spectrum.len() != total_bins {
+        return Err(Error::InvalidParameter);
+    }
+
+    // §4.3.6 analysis per channel: log-2 energy targets + unit shapes.
+    let mut energy_target: [[f32; NUM_BANDS]; MAX_CHANNELS] = coarse_state.energy;
+    let mut shapes: [Vec<Vec<f32>>; 2] = [
+        Vec::with_capacity(coded_bands),
+        Vec::with_capacity(coded_bands),
+    ];
+    for (ch, spectrum) in [left_spectrum, right_spectrum].into_iter().enumerate() {
+        let mut offset = 0usize;
+        for (band, slot) in energy_target[ch]
+            .iter_mut()
+            .enumerate()
+            .take(end)
+            .skip(start)
+        {
+            let n = band_bins(band, lm).ok_or(Error::InvalidParameter)? as usize;
+            let analysis = analyze_band_f32(&spectrum[offset..offset + n]);
+            *slot = analysis.log_energy;
+            shapes[ch].push(analysis.shape);
+            offset += n;
+        }
+    }
+
+    // §5.3.4.1 boosts (auto mode) over the per-band channel maximum: a
+    // band poking out in either channel earns the boost.
+    let target_boost: Vec<i32> = if band_k.is_none() && !header.silence {
+        let max_energy: Vec<f32> = (start..end)
+            .map(|b| energy_target[0][b].max(energy_target[1][b]))
+            .collect();
+        crate::encoder_decisions::choose_band_boosts(&max_energy, lm, start, end)
+            .ok_or(Error::InvalidParameter)?
+    } else {
+        vec![0i32; coded_bands]
+    };
+
+    // Table-56 prefix with the stereo channel count. The dual selector
+    // is requested on; intensity is requested "never applies"
+    // (offset = coded_bands — see the type's field docs).
+    let mut enc = RangeEncoder::new();
+    let spec = FramePrefixSpec {
+        header: CeltFrameHeader {
+            anti_collapse_on: None,
+            ..*header
+        },
+        energy_target: &energy_target,
+        tf: TfParameters {
+            tf_changes: vec![false; coded_bands],
+            tf_select: 0,
+            tf_select_decoded: false,
+        },
+        spread: Spread::None,
+        target_boost: &target_boost,
+        allocation: BandAllocation {
+            intensity_band_offset: coded_bands as u32,
+            dual_stereo: true,
+            ..BandAllocation::defaults()
+        },
+    };
+    let prefix = encode_frame_prefix(
+        &mut enc,
+        coarse_state,
+        &spec,
+        lm,
+        frame_bytes,
+        true,
+        start,
+        end,
+    )?;
+
+    // The budget gates must have carried the dual selector (and the
+    // intensity "never applies" offset): a gated-off field lands the
+    // decoder on the joint-coding defaults, whose §4.3.4.4 walk is the
+    // documented docs gap. A silence frame carries no shape symbols,
+    // so the selectors are moot there.
+    if !header.silence
+        && (!prefix.allocation.dual_stereo
+            || prefix.allocation.intensity_band_offset != coded_bands as u32)
+    {
+        return Err(Error::NotImplemented);
+    }
+
+    // Shared per-band pulse counts: caller-supplied, silence-zero, or
+    // derived from the just-encoded prefix (the identical derivation
+    // the auto-decoder runs over the decoded prefix).
+    let derived_k;
+    let band_k: &[u32] = match band_k {
+        Some(k) => k,
+        None if header.silence => {
+            derived_k = vec![0u32; coded_bands];
+            &derived_k
+        }
+        None => {
+            derived_k = crate::derive_pulses::derive_band_pulses_dual(&prefix, lm)
+                .ok_or(Error::InvalidParameter)?;
+            &derived_k
+        }
+    };
+
+    // §4.3.2.2 fine energy: band-major, channel 0 then channel 1
+    // within each band (the in-crate within-band interleave — the RFC
+    // does not pin the main fine-energy channel order).
+    let mut fine_q14 = [[0i32; NUM_BANDS]; 2];
+    for band in 0..NUM_BANDS {
+        let b_bits = fine_bits[band];
+        for ch in 0..2usize {
+            let residual = if (start..end).contains(&band) {
+                energy_target[ch][band] - coarse_state.energy[ch][band]
+            } else {
+                0.0
+            };
+            let f = quantize_fine_energy_f32(residual, b_bits);
+            encode_fine_energy_band(&mut enc, f, b_bits)?;
+            fine_q14[ch][band] = fine_correction_q14(f, b_bits);
+        }
+    }
+
+    // §4.3.2 final per-channel envelopes (coarse + fine).
+    let env_l = assemble_band_log_energy_q8(coarse_state, 0, Some(&fine_q14[0]), None)
+        .ok_or(Error::InvalidParameter)?;
+    let env_r = assemble_band_log_energy_q8(coarse_state, 1, Some(&fine_q14[1]), None)
+        .ok_or(Error::InvalidParameter)?;
+
+    // Dual residual: per band, channel 0's PVQ index then channel 1's,
+    // at the shared K, reconstructing the decoder's view per channel.
+    let mut rec_l = Vec::with_capacity(total_bins);
+    let mut rec_r = Vec::with_capacity(total_bins);
+    for (i, band) in (start..end).enumerate() {
+        let n = band_bins(band, lm).ok_or(Error::InvalidParameter)?;
+        let k = band_k[i];
+        if band_needs_split(n, k) {
+            return Err(Error::NotImplemented);
+        }
+        if k == 0 || n == 0 {
+            rec_l.resize(rec_l.len() + n as usize, 0.0f32);
+            rec_r.resize(rec_r.len() + n as usize, 0.0f32);
+            continue;
+        }
+        for (ch, rec) in [&mut rec_l, &mut rec_r].into_iter().enumerate() {
+            let pulses = pvq_search(&shapes[ch][i], n, k).ok_or(Error::InvalidParameter)?;
+            encode_pulses(&mut enc, &pulses, n, k)?;
+            let mut band_samples = normalize_to_unit_l2(&pulses);
+            let env = if ch == 0 { &env_l } else { &env_r };
+            denormalize_band_in_place_f32(&mut band_samples, env[band]);
+            rec.extend_from_slice(&band_samples);
+        }
+    }
+
+    let bytes = enc.finish_to_size(frame_bytes as usize)?;
+
+    Ok(StereoEncodedFrame {
+        bytes,
+        prefix,
+        envelope_q8: [env_l, env_r],
+        reconstructed_left: rec_l,
+        reconstructed_right: rec_r,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1005,6 +1322,285 @@ mod tests {
                 &fine_bits,
                 &band_k,
             ),
+            Err(Error::NotImplemented)
+        ));
+    }
+
+    // --- Dual-stereo frame encode/decode round trips ---
+
+    /// Deterministic pseudo-random spectrum in [-0.5, 0.5).
+    fn test_spectrum(len: usize, mut seed: u32) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// The self-contained stereo codec loop closes at every LM over a
+    /// multi-frame stream: `encode_stereo_celt_frame_auto` →
+    /// `decode_stereo_frame_auto` keeps both channels' coarse
+    /// prediction in exact lockstep, selects dual stereo on the wire,
+    /// and the decoded PCM equals the decode-side synthesis of the
+    /// encoder's bit-exact per-channel reconstructions.
+    #[test]
+    fn stereo_auto_codec_loop_all_lm() {
+        use crate::frame_synthesis::StereoCeltDecodeState;
+
+        for lm in 0..=3u32 {
+            let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+            let mut enc_state = CoarseEnergyState::new();
+            let mut dec_state = StereoCeltDecodeState::new(lm).unwrap();
+            // Parallel reference back end fed the encoder's own
+            // reconstructions.
+            let mut ref_state = StereoCeltDecodeState::new(lm).unwrap();
+            let mut header = CeltFrameHeader {
+                silence: false,
+                post_filter: None,
+                transient: false,
+                intra: true,
+                anti_collapse_on: None,
+            };
+            for t in 0..3u32 {
+                let left = test_spectrum(total, 0x57E0 + 31 * t + lm);
+                let right = test_spectrum(total, 0xB0CA + 17 * t + lm);
+                let frame = encode_stereo_celt_frame_auto(
+                    &mut enc_state,
+                    &left,
+                    &right,
+                    &header,
+                    lm,
+                    FRAME_BYTES,
+                    0,
+                    NUM_BANDS,
+                )
+                .unwrap();
+                assert_eq!(frame.bytes.len(), FRAME_BYTES as usize);
+                assert!(frame.prefix.allocation.dual_stereo, "lm={lm} frame {t}");
+                assert_eq!(
+                    frame.prefix.allocation.intensity_band_offset,
+                    NUM_BANDS as u32
+                );
+
+                let decoded = dec_state
+                    .decode_stereo_frame_auto(&frame.bytes, 0, NUM_BANDS)
+                    .unwrap();
+                assert_eq!(decoded.pcm.len(), 2 * (120usize << lm));
+                assert!(decoded.pcm.iter().all(|s| s.is_finite()));
+                assert_eq!(
+                    enc_state.energy,
+                    dec_state.coarse_energy().energy,
+                    "lm={lm} frame {t}: stereo coarse lockstep broken"
+                );
+                assert_eq!(frame.envelope_q8, decoded.envelope_q8);
+                assert_eq!(frame.prefix.boosts, decoded.prefix.boosts);
+
+                // Decoded PCM == synthesis of the encoder's bit-exact
+                // reconstruction (post-filter off, fresh parallel
+                // state).
+                let expected = ref_state
+                    .synthesize_stereo_frame(
+                        &frame.reconstructed_left,
+                        &frame.reconstructed_right,
+                        0,
+                        NUM_BANDS,
+                        None,
+                    )
+                    .unwrap();
+                for (i, (e, d)) in expected.iter().zip(&decoded.pcm).enumerate() {
+                    assert!(
+                        (e - d).abs() <= 1e-5,
+                        "lm={lm} frame {t} sample {i}: {d} vs reconstruction chain {e}"
+                    );
+                }
+                header.intra = false;
+            }
+        }
+    }
+
+    /// A stereo silence frame carries only the prefix, decodes to
+    /// exactly zero PCM on a fresh decoder, and keeps both channels'
+    /// coarse prediction in lockstep.
+    #[test]
+    fn stereo_silence_frame_round_trip() {
+        use crate::frame_synthesis::StereoCeltDecodeState;
+
+        let lm = 1u32;
+        let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+        let zeros = vec![0.0f32; total];
+        let header = CeltFrameHeader {
+            silence: true,
+            post_filter: None,
+            transient: false,
+            intra: true,
+            anti_collapse_on: None,
+        };
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_stereo_celt_frame_auto(
+            &mut enc_state,
+            &zeros,
+            &zeros,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        assert!(frame.prefix.header.silence);
+        assert!(frame.reconstructed_left.iter().all(|&s| s == 0.0));
+        assert!(frame.reconstructed_right.iter().all(|&s| s == 0.0));
+
+        let mut dec_state = StereoCeltDecodeState::new(lm).unwrap();
+        let decoded = dec_state
+            .decode_stereo_frame_auto(&frame.bytes, 0, NUM_BANDS)
+            .unwrap();
+        assert!(decoded.prefix.header.silence);
+        assert!(decoded.pcm.iter().all(|&s| s == 0.0));
+        assert_eq!(enc_state.energy, dec_state.coarse_energy().energy);
+
+        // Silence + explicit allocation contradicts the flag.
+        let fine_bits = [0u32; NUM_BANDS];
+        let band_k = vec![0u32; NUM_BANDS];
+        let mut fresh = CoarseEnergyState::new();
+        assert!(matches!(
+            encode_stereo_celt_frame(
+                &mut fresh,
+                &zeros,
+                &zeros,
+                &header,
+                lm,
+                FRAME_BYTES,
+                0,
+                NUM_BANDS,
+                &fine_bits,
+                &band_k,
+            ),
+            Err(Error::NotImplemented)
+        ));
+    }
+
+    /// The explicit-allocation stereo variant round-trips through
+    /// `decode_stereo_frame_coded` with the same `fine_bits` /
+    /// `band_k`, fine bits included (per band per channel).
+    #[test]
+    fn stereo_explicit_allocation_round_trips() {
+        use crate::frame_synthesis::StereoCeltDecodeState;
+
+        let lm = 2u32;
+        let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+        let left = test_spectrum(total, 0xAB1E);
+        let right = test_spectrum(total, 0x1DEA);
+        let header = CeltFrameHeader {
+            silence: false,
+            post_filter: None,
+            transient: false,
+            intra: true,
+            anti_collapse_on: None,
+        };
+        let mut fine_bits = [0u32; NUM_BANDS];
+        fine_bits[..4].fill(2);
+        let mut band_k = vec![0u32; NUM_BANDS];
+        band_k[..10].fill(2);
+
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_stereo_celt_frame(
+            &mut enc_state,
+            &left,
+            &right,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+            &fine_bits,
+            &band_k,
+        )
+        .unwrap();
+
+        let mut dec_state = StereoCeltDecodeState::new(lm).unwrap();
+        let decoded = dec_state
+            .decode_stereo_frame_coded(&frame.bytes, 0, NUM_BANDS, &fine_bits, &band_k)
+            .unwrap();
+        assert!(decoded.pcm.iter().all(|s| s.is_finite()));
+        assert_eq!(enc_state.energy, dec_state.coarse_energy().energy);
+        // The bitstream fine corrections land the decoder on the
+        // encoder's exact per-channel envelopes.
+        assert_eq!(frame.envelope_q8, decoded.envelope_q8);
+    }
+
+    /// Stereo-specific rejections: transient header, spectrum length
+    /// mismatch, band_k length mismatch, and a budget too small to
+    /// carry the dual selector (`NotImplemented` — the joint-coding
+    /// fallback is the §4.3.4.4 docs gap).
+    #[test]
+    fn stereo_encode_rejections() {
+        let lm = 1u32;
+        let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+        let spec = test_spectrum(total, 0x0DD);
+        let good = CeltFrameHeader {
+            silence: false,
+            post_filter: None,
+            transient: false,
+            intra: true,
+            anti_collapse_on: None,
+        };
+        let mut state = CoarseEnergyState::new();
+
+        // Transient header.
+        let transient = CeltFrameHeader {
+            transient: true,
+            ..good
+        };
+        assert!(matches!(
+            encode_stereo_celt_frame_auto(
+                &mut state,
+                &spec,
+                &spec,
+                &transient,
+                lm,
+                FRAME_BYTES,
+                0,
+                NUM_BANDS
+            ),
+            Err(Error::NotImplemented)
+        ));
+        // Right spectrum length mismatch.
+        assert!(matches!(
+            encode_stereo_celt_frame_auto(
+                &mut state,
+                &spec,
+                &spec[..total - 1],
+                &good,
+                lm,
+                FRAME_BYTES,
+                0,
+                NUM_BANDS
+            ),
+            Err(Error::InvalidParameter)
+        ));
+        // band_k length mismatch.
+        let fine_bits = [0u32; NUM_BANDS];
+        assert!(matches!(
+            encode_stereo_celt_frame(
+                &mut state,
+                &spec,
+                &spec,
+                &good,
+                lm,
+                FRAME_BYTES,
+                0,
+                NUM_BANDS,
+                &fine_bits,
+                &[1u32; 5],
+            ),
+            Err(Error::InvalidParameter)
+        ));
+        // A 3-byte budget cannot carry the stereo selectors: the dual
+        // gate closes and the encoder refuses the joint-coding layout.
+        assert!(matches!(
+            encode_stereo_celt_frame_auto(&mut state, &spec, &spec, &good, lm, 3, 0, NUM_BANDS),
             Err(Error::NotImplemented)
         ));
     }

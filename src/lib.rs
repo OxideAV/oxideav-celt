@@ -374,7 +374,8 @@ pub use fine_energy::{
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_encode::{
     encode_celt_frame, encode_celt_frame_auto, encode_celt_frame_auto_boosted, encode_frame_prefix,
-    EncodedFrame, FramePrefixSpec,
+    encode_stereo_celt_frame, encode_stereo_celt_frame_auto, EncodedFrame, FramePrefixSpec,
+    StereoEncodedFrame,
 };
 pub use frame_header::{
     decode_anti_collapse_flag, encode_anti_collapse_flag, CeltFrameHeader, PostFilter,

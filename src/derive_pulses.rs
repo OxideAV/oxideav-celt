@@ -12,12 +12,40 @@
 //!   interpolated static allocation, the boost/trim/cap combination
 //!   (the column search [`crate::alloc_combine::find_combined_alloc`]),
 //!   and the §4.3.4.1 bits-to-pulses search with its balance accumulator
-//!   ([`crate::bits_to_pulses::bits_to_pulses_band_loop_cached`]) — are
+//!   ([`crate::bits_to_pulses::bits_to_pulses_band_loop`]) — are
 //!   implemented in this crate.
 //! * The parts RFC 6716 §4.3.3 defers to the reference implementation —
 //!   the `interp_bits2pulses` per-band reallocation bisection with
 //!   concurrent skip decoding and the fine-energy-vs-shape split — are a
 //!   documented docs gap.
+//!
+//! ## Cost model: worst-case estimator, not the staged cache
+//!
+//! The bits-to-pulses search here runs on the **§4.1.5 worst-case
+//! `dec_uint` cost estimator**
+//! ([`cost_log2_v_count_8th`](crate::bits_to_pulses::cost_log2_v_count_8th)),
+//! not the staged `cache_bits50` curve. Two reasons:
+//!
+//! * **Budget safety.** The estimator never under-prices a symbol
+//!   (`ceil(log2 V(N, K))` is an upper bound on the range coder's
+//!   actual `tell_frac` delta for the §4.1.5 split decode), and the
+//!   band loop's search rounds *down* ("does not exceed"), so the sum
+//!   of true wire costs telescopes under the sum of targets — the
+//!   encoded frame provably fits its byte budget. A stereo frame
+//!   writes two PVQ indices per band, doubling any per-symbol
+//!   mis-pricing, so this bound is load-bearing there.
+//! * **The staged cache mapping is inconsistent.** Driving the same
+//!   loop from `cache_bits50` (via the
+//!   `docs/audio/opus/pulse-cache-format-trace.md` §2 `band*5 + LM`
+//!   index mapping) prices some symbols far below their measured wire
+//!   cost — e.g. a 2-bin band's `K = 40` index (`V(2,40) = 160`,
+//!   ~7.3 bits on the wire) at 7 *eighth*-bits — which over-inflates
+//!   the derived `K` until the frame overruns its byte budget. The
+//!   trace's run-sharing table also assigns (band, LM) tuples of
+//!   *different* `N` to a single cost curve, which no per-`(N, K)`
+//!   cost cache can satisfy; the mapping (or the trace's reading of
+//!   it) is a documented docs question. Until it is resolved, the
+//!   worst-case estimator is the honest documented cost model.
 //!
 //! [`derive_band_pulses`] composes the **documented** parts into the
 //! single derivation the residual loop's `band_k` input wants: from a
@@ -59,7 +87,7 @@
 
 use crate::alloc_combine::find_combined_alloc;
 use crate::band_minimums::BAND_BINS_LM;
-use crate::bits_to_pulses::bits_to_pulses_band_loop_cached;
+use crate::bits_to_pulses::{bits_to_pulses_band_loop, cost_log2_v_count_8th};
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::frame_decode::{decode_frame_prefix, FramePrefix};
 use crate::frame_synthesis::{decode_celt_frame, CeltDecodeState, DecodedFrame};
@@ -78,6 +106,23 @@ fn clamp_k_to_decodable(n: u32, k: u32) -> u32 {
         k -= 1;
     }
     k
+}
+
+/// The shape budget the §4.3.3 column search drives toward, in 1/8
+/// bits: the band-boost loop's arithmetic `total_bits` at exit,
+/// **capped by the re-measured wire remainder**
+/// (`frame_bytes * 64 - tell_frac_after_prefix - 1`, the §4.3.3
+/// "remaining available 8th bits" form re-read at the post-prefix
+/// coder position). The arithmetic budget never pays for the
+/// boost-flag / trim / skip / intensity / dual symbols themselves, so
+/// without the cap a stereo frame (two PVQ indices per band, twice
+/// the per-symbol overhead) can overrun its byte budget. Both sides
+/// compute the identical value from the bit-identical prefix, so the
+/// encoder/decoder lockstep is preserved.
+fn shape_budget_1_8th(prefix: &FramePrefix) -> i64 {
+    let arithmetic = i64::from(prefix.boosts.total_bits_remaining.max(0));
+    let wire = i64::from(prefix.frame_bytes) * 64 - i64::from(prefix.tell_frac_after_prefix) - 1;
+    arithmetic.min(wire.max(0))
 }
 
 /// Derive the per-band PVQ pulse counts `band_k` from a decoded
@@ -134,7 +179,7 @@ pub fn derive_band_pulses(
     // the §4.3.3 prose says the downstream allocation steps inherit after
     // every accepted boost has been subtracted. The combined column
     // search compares its per-band window total against this.
-    let budget_1_8th = i64::from(prefix.boosts.total_bits_remaining.max(0));
+    let budget_1_8th = shape_budget_1_8th(prefix);
 
     let search = find_combined_alloc(
         start,
@@ -152,8 +197,7 @@ pub fn derive_band_pulses(
     // construction (the combine step floors at zero).
     let targets: Vec<u32> = search.alloc.bits.iter().map(|&b| b.max(0) as u32).collect();
 
-    let (per_band, _balance) =
-        bits_to_pulses_band_loop_cached(lm as usize, start, &bins, &targets)?;
+    let (per_band, _balance) = bits_to_pulses_band_loop(&bins, &targets, cost_log2_v_count_8th)?;
 
     Some(
         per_band
@@ -202,7 +246,7 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
     }
 
     let bins: Vec<u32> = BAND_BINS_LM[lm as usize][start..end].to_vec();
-    let budget_1_8th = i64::from(prefix.boosts.total_bits_remaining.max(0));
+    let budget_1_8th = shape_budget_1_8th(prefix);
 
     let search = find_combined_alloc(
         start,
@@ -224,8 +268,7 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
         .map(|&b| (b.max(0) as u32) / 2)
         .collect();
 
-    let (per_band, _balance) =
-        bits_to_pulses_band_loop_cached(lm as usize, start, &bins, &targets)?;
+    let (per_band, _balance) = bits_to_pulses_band_loop(&bins, &targets, cost_log2_v_count_8th)?;
 
     Some(
         per_band

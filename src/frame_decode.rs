@@ -140,6 +140,21 @@ pub struct FramePrefix {
     /// One-past-last coded band (`<= 21`, depends on signaled
     /// bandwidth).
     pub end: usize,
+    /// The §4.1.6/§5.1.6 `tell_frac()` coder position just after the
+    /// last prefix symbol (the Table-56 `dual` entry) — identical on
+    /// the encode and decode side by the range-coder budget lockstep.
+    /// Together with [`frame_bytes`](Self::frame_bytes) this
+    /// re-measures the *true* remaining wire budget for the
+    /// fine-energy + shape sections
+    /// (`frame_bytes * 64 - tell_frac_after_prefix - 1` 1/8 bits): the
+    /// arithmetic [`boosts.total_bits_remaining`](crate::band_cap::BoostResult)
+    /// budget never pays for the boost-flag / trim / skip / intensity /
+    /// dual symbols themselves, so the allocation derivations cap
+    /// against this measured value to keep the encoded frame inside
+    /// its byte budget.
+    pub tell_frac_after_prefix: u32,
+    /// The coded frame size in bytes (the §4.3.3 budget baseline).
+    pub frame_bytes: u32,
 }
 
 /// Decode the CELT frame prefix in RFC 6716 Table 56 order.
@@ -261,6 +276,8 @@ pub fn decode_frame_prefix(
         allocation,
         start,
         end,
+        tell_frac_after_prefix: dec.tell_frac(),
+        frame_bytes,
     })
 }
 

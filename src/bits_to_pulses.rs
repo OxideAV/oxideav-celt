@@ -378,12 +378,17 @@ where
         // Inner search with the supplied cost function.
         let result = bits_to_pulses_search(n, adjusted_target, &mut cost_fn);
 
-        // Update the running balance using the *adjusted* target so
-        // the share is repaid into the residue. (See `update`'s
-        // contract: the residue carried forward is the difference
-        // between the target the band was actually given and the
-        // bits it actually used.)
-        balance.update(adjusted_target, result.bits_used_8th);
+        // Update the running balance with the *raw* (unadjusted)
+        // target, per `update`'s contract: the granted share must not
+        // double-count. Updating with the adjusted target would leave
+        // a granted-and-spent share sitting in the balance — the
+        // surplus would never deplete, and the aggregate spend could
+        // run past the sum of the raw targets (i.e. past the §4.3.3
+        // budget the targets were drawn from). With the raw target,
+        // `sum(bits_used) <= sum(raw_target)` holds by induction
+        // (each band spends at most its raw target plus a share the
+        // balance is then debited for).
+        balance.update(raw_target, result.bits_used_8th);
 
         out.push(result);
     }
@@ -461,7 +466,11 @@ pub fn bits_to_pulses_band_loop_cached(
             }
         };
 
-        balance.update(adjusted_target, result.bits_used_8th);
+        // Raw-target update per `BalanceAccumulator::update`'s
+        // contract (see the estimator loop above): the granted share
+        // must not double-count, or the aggregate spend can run past
+        // the budget the targets were drawn from.
+        balance.update(raw_target, result.bits_used_8th);
         out.push(result);
     }
 
@@ -777,10 +786,12 @@ mod tests {
         // the largest K within budget.
         //
         // Band 0 (divisor 2): raw target 30, balance 0 ⇒ adjusted
-        // 30. Largest K with cost ≤ 30 is K=2 (cost 24). Residue
-        // +6 ⇒ balance 6.
-        // Band 1 (divisor 1): raw 30 + 6 = 36. Largest K with cost
-        // ≤ 36 is K=4 (cost 32). Residue +4 ⇒ balance 10.
+        // 30. Largest K with cost ≤ 30 is K=2 (cost 24). Raw-target
+        // residue 30 - 24 = +6 ⇒ balance 6.
+        // Band 1 (divisor 1): adjusted 30 + 6 = 36. Largest K with
+        // cost ≤ 36 is K=4 (cost 32). Raw-target residue 30 - 32 =
+        // -2 ⇒ balance 6 - 2 = 4 (the granted share is debited, per
+        // `BalanceAccumulator::update`'s no-double-count contract).
         let (out, bal) =
             bits_to_pulses_band_loop(&[2, 2], &[30, 30], cost_log2_v_count_8th).unwrap();
         assert_eq!(out.len(), 2);
@@ -788,7 +799,7 @@ mod tests {
         assert_eq!(out[0].bits_used_8th, 24);
         assert_eq!(out[1].k, 4);
         assert_eq!(out[1].bits_used_8th, 32);
-        assert_eq!(bal.balance_8th, 10);
+        assert_eq!(bal.balance_8th, 4);
     }
 
     /// Three bands: divisors are 3, 2, 1 in order. The default
@@ -799,13 +810,16 @@ mod tests {
         // 136, 144, 152, 160, ...
         //
         // Band 0 (divisor 3): raw 40, balance 0 ⇒ adjusted 40.
-        //   Largest K with cost ≤ 40: K=1 (cost 32). Residue +8.
-        // Band 1 (divisor 2): raw 40 + 8/2 = 44 ⇒ adjusted 44.
-        //   Largest K with cost ≤ 44: K=1 (cost 32). Residue +12.
-        //   Balance 8 + 12 = 20.
-        // Band 2 (divisor 1): raw 40 + 20/1 = 60 ⇒ adjusted 60.
-        //   Largest K with cost ≤ 60: K=2 (cost 56). Residue +4.
-        //   Final balance 20 + 4 = 24.
+        //   Largest K with cost ≤ 40: K=1 (cost 32). Raw residue
+        //   40 - 32 = +8 ⇒ balance 8.
+        // Band 1 (divisor 2): adjusted 40 + 8/2 = 44.
+        //   Largest K with cost ≤ 44: K=1 (cost 32). Raw residue +8
+        //   ⇒ balance 16.
+        // Band 2 (divisor 1): adjusted 40 + 16/1 = 56.
+        //   Largest K with cost ≤ 56: K=2 (cost 56). Raw residue
+        //   40 - 56 = -16 ⇒ final balance 0 — the whole surplus was
+        //   granted and spent, and the raw-target update debits it
+        //   exactly (aggregate spend 120 == aggregate raw target).
         let (out, bal) =
             bits_to_pulses_band_loop(&[8, 8, 8], &[40, 40, 40], cost_log2_v_count_8th).unwrap();
         assert_eq!(out.len(), 3);
@@ -815,7 +829,7 @@ mod tests {
         assert_eq!(out[1].bits_used_8th, 32);
         assert_eq!(out[2].k, 2);
         assert_eq!(out[2].bits_used_8th, 56);
-        assert_eq!(bal.balance_8th, 24);
+        assert_eq!(bal.balance_8th, 0);
     }
 
     /// The band loop never overshoots any band's *adjusted* target.
@@ -843,7 +857,34 @@ mod tests {
                 adjusted,
                 out[i].bits_used_8th
             );
-            balance.update(adjusted, out[i].bits_used_8th);
+            balance.update(ti, out[i].bits_used_8th);
+        }
+    }
+
+    /// Aggregate conservation: the loop's total spend never exceeds
+    /// the sum of the *raw* targets (the §4.3.3 budget the targets
+    /// were drawn from), across a grid of shapes and budgets — the
+    /// property the raw-target balance update exists to guarantee.
+    #[test]
+    fn band_loop_total_spend_within_raw_budget() {
+        for scale in [10u32, 40, 90, 160, 300] {
+            let n = [1u32, 2, 4, 8, 12, 16, 24, 36, 44];
+            let t: Vec<u32> = (0..n.len() as u32).map(|i| scale + 7 * i).collect();
+            let (out, _) = bits_to_pulses_band_loop(&n, &t, cost_log2_v_count_8th).unwrap();
+            let spent: u64 = out.iter().map(|r| u64::from(r.bits_used_8th)).sum();
+            let budget: u64 = t.iter().map(|&v| u64::from(v)).sum();
+            assert!(
+                spent <= budget,
+                "scale {scale}: spend {spent} exceeds raw budget {budget}"
+            );
+
+            // Same property on the cached walk.
+            let (out, _) = bits_to_pulses_band_loop_cached(2, 0, &n, &t).unwrap();
+            let spent: u64 = out.iter().map(|r| u64::from(r.bits_used_8th)).sum();
+            assert!(
+                spent <= budget,
+                "cached scale {scale}: spend {spent} exceeds raw budget {budget}"
+            );
         }
     }
 

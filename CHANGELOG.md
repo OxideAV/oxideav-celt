@@ -88,6 +88,59 @@ All notable changes to `oxideav-celt` are recorded here.
   §4.3.4.1, §4.3.4.4 (`docs/audio/opus/rfc6716-opus.txt`). No external
   library source consulted.
 
+* **Round-389 (2026-07-04) — dual-stereo frame codec
+  (`encode_stereo_celt_frame[_auto]`,
+  `StereoCeltDecodeState::decode_stereo_frame_coded` /
+  `decode_stereo_frame_auto`):** the full self-contained **stereo**
+  bitstream loop over the uncoupled path. The encoder analyzes both
+  channels (§4.3.6 energy + unit shape per band), writes the Table-56
+  stereo prefix (both channels' §4.3.2.1 coarse energy — the
+  *specified* interleave — plus the `dual` = 1 / intensity =
+  "never applies" selectors, rejecting a frame whose budget gates
+  cannot carry them), the per-band-per-channel §4.3.2.2 fine energy,
+  and one PVQ index per channel per band at the shared derived `K`;
+  the decoder walks the identical layout and runs the per-channel
+  §4.3.6 → §4.3.7 → §4.3.7.1 → §4.3.7.2 synthesis. Both sides derive
+  `band_k` from the bit-identical prefix — no out-of-band data.
+  Pinned by round trips at every `LM`: coarse lockstep, dual on the
+  wire, decoded PCM ≡ synthesis of the encoder's bit-exact
+  per-channel reconstructions, silence frames, explicit fine-bits
+  variant, and rejection edges. +4 tests.
+
+* **Round-389 (2026-07-04, fix) — §4.3.4.1 balance accumulator no longer
+  double-counts the granted share:** both bits-to-pulses band loops
+  updated the running balance with the *adjusted* target, leaving a
+  granted-and-spent share sitting in the balance — the surplus never
+  depleted, and the aggregate spend could run past the sum of the raw
+  targets (i.e. past the §4.3.3 budget). This was latent on the mono
+  loop (one PVQ index per band left enough margin at tested rates)
+  and surfaced as a hard byte-budget overrun on stereo frames (two
+  indices per band). The loops now update with the raw target, per
+  `BalanceAccumulator::update`'s own documented no-double-count
+  contract; `sum(bits_used) <= sum(raw_target)` now holds by
+  induction (new conservation property test over both loop variants).
+  Two loop tests that pinned the double-counting arithmetic were
+  recomputed to the conserving walk.
+
+* **Round-389 (2026-07-04, fix) — pulse-count derivation budget re-measured
+  at the wire (`FramePrefix::{tell_frac_after_prefix, frame_bytes}`)
+  and moved to the worst-case cost estimator:** the arithmetic §4.3.3
+  budget (`total_bits_remaining`) never pays for the boost-flag /
+  trim / skip / intensity / dual symbols themselves, so the
+  derivations now cap it by `frame_bytes * 64 - tell_frac_after_prefix
+  - 1` (identical on both sides by the range-coder lockstep). The
+  bits-to-pulses search behind `derive_band_pulses[_dual]` now runs on
+  the §4.1.5 worst-case `dec_uint` estimator instead of the staged
+  `cache_bits50` curve: the staged cache's `band*5 + LM` mapping
+  prices some symbols far below their measured wire cost (e.g. a
+  2-bin band's `K = 40` index — ~7.3 bits on the wire — at 7
+  eighth-bits) and its run-sharing table assigns (band, LM) tuples of
+  different `N` to a single cost curve, which no `(N, K)` cost cache
+  can satisfy — flagged as a docs question on
+  `docs/audio/opus/pulse-cache-format-trace.md` §2. The estimator
+  never under-prices, so the encoded frame provably fits its byte
+  budget at every `LM`, mono and stereo.
+
 * **Round-385 (2026-07-03) — §5.3.3 intra/inter coarse-mode decision
   (`choose_intra_mode`):** the second §5.3 encoder decision with a
   documented method: "it is best to try encoding the coarse energy

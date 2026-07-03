@@ -631,6 +631,196 @@ impl StereoCeltDecodeState {
         })
     }
 
+    /// Decode one **dual-stereo, non-transient** CELT frame to
+    /// interleaved PCM, decoding **everything** — prefix, both
+    /// channels' coarse energy, per-channel fine energy, and both
+    /// channels' band shapes — from the range-coded bitstream.
+    ///
+    /// This is the stereo counterpart of
+    /// [`decode_celt_frame`](crate::frame_synthesis::decode_celt_frame)
+    /// (where [`decode_stereo_frame`](Self::decode_stereo_frame) still
+    /// takes the residual spectra as inputs, this decodes them). The
+    /// wire layout is the one
+    /// [`encode_stereo_celt_frame`](crate::frame_encode::encode_stereo_celt_frame)
+    /// writes: Table-56 stereo prefix → fine energy (band-major,
+    /// channel 0 then channel 1 within each band — the in-crate
+    /// within-band interleave; the RFC does not pin the main
+    /// fine-energy channel order) → the dual residual walk
+    /// ([`decode_stereo_residual_bands`](crate::residual::decode_stereo_residual_bands):
+    /// one PVQ index per channel per band at the shared `K`).
+    ///
+    /// A non-silent frame whose decoded prefix does **not** select
+    /// dual stereo (or whose intensity offset says some bands are
+    /// intensity-coded) is rejected with [`Error::NotImplemented`]:
+    /// the §4.3.4.4 joint (`itheta`) and intensity walks are the
+    /// documented docs gaps, and mis-parsing them would desynchronize
+    /// the stream.
+    ///
+    /// * `fine_bits` — per-band fine-bit counts `B_i`, applied per
+    ///   band **per channel** (matching the encoder). All-zero when
+    ///   fine energy is unfunded.
+    /// * `band_k` — the shared per-band pulse counts, one per coded
+    ///   band (identical values must have been given to the encoder).
+    ///
+    /// The §4.3.7.1 post-filter parameters come from the decoded
+    /// prefix, applied per channel (CELT codes one post-filter per
+    /// frame). Error behaviour otherwise matches
+    /// [`decode_stereo_frame`](Self::decode_stereo_frame).
+    pub fn decode_stereo_frame_coded(
+        &mut self,
+        frame_bytes: &[u8],
+        start: usize,
+        end: usize,
+        fine_bits: &[u32; NUM_BANDS],
+        band_k: &[u32],
+    ) -> Result<StereoDecodedFrame, Error> {
+        if start > end || end > NUM_BANDS {
+            return Err(Error::InvalidParameter);
+        }
+        let coded_bands = end - start;
+        if band_k.len() != coded_bands {
+            return Err(Error::InvalidParameter);
+        }
+        let lm = self.lm;
+
+        let mut dec = RangeDecoder::new(frame_bytes);
+
+        // Table 56 stereo prefix: decodes BOTH channels' §4.3.2.1
+        // coarse energy into `self.coarse`.
+        let prefix = decode_frame_prefix(
+            &mut dec,
+            &mut self.coarse,
+            lm,
+            frame_bytes.len() as u32,
+            true,
+            start,
+            end,
+        )?;
+
+        if prefix.header.transient {
+            return Err(Error::NotImplemented);
+        }
+        // Only the dual (uncoupled) residual layout is documented; a
+        // joint-coded or intensity-coded frame cannot be parsed past
+        // this point (§4.3.4.4 docs gap). Silence frames carry no
+        // shape symbols, so the selectors are moot there.
+        if !prefix.header.silence
+            && (!prefix.allocation.dual_stereo
+                || prefix.allocation.intensity_band_offset != coded_bands as u32)
+        {
+            return Err(Error::NotImplemented);
+        }
+
+        // §4.3.2.2 fine energy: band-major, channel 0 then channel 1
+        // within each band — the encoder's exact walk.
+        let mut fine_q14 = [[0i32; NUM_BANDS]; 2];
+        for band in 0..NUM_BANDS {
+            let b_bits = fine_bits[band];
+            for ch_fine in fine_q14.iter_mut() {
+                ch_fine[band] = crate::fine_energy::decode_fine_energy_band(&mut dec, b_bits);
+            }
+        }
+
+        // §4.3.2 final per-channel envelopes (bitstream coarse +
+        // bitstream fine).
+        let env_l = assemble_band_log_energy_q8(&self.coarse, 0, Some(&fine_q14[0]), None)
+            .ok_or(Error::InvalidParameter)?;
+        let env_r = assemble_band_log_energy_q8(&self.coarse, 1, Some(&fine_q14[1]), None)
+            .ok_or(Error::InvalidParameter)?;
+
+        // §4.3.4 dual residual walk → both channels' denormalized
+        // spectra. A silence frame synthesizes the zero spectra.
+        let (left, right) = if prefix.header.silence {
+            let total = crate::band_layout::coded_total_bins(start, end, lm)
+                .ok_or(Error::InvalidParameter)? as usize;
+            (vec![0.0f32; total], vec![0.0f32; total])
+        } else {
+            let window_l: Vec<i32> = env_l[start..end].to_vec();
+            let window_r: Vec<i32> = env_r[start..end].to_vec();
+            let residual = crate::residual::decode_stereo_residual_bands(
+                &mut dec,
+                lm,
+                start,
+                end,
+                false,
+                prefix.tf.tf_select,
+                &prefix.tf.tf_changes,
+                band_k,
+                prefix.spread,
+                &window_l,
+                &window_r,
+            )?;
+            (residual.left, residual.right)
+        };
+
+        // Per-channel §4.3.6 → §4.3.7 synthesis + §4.3.7.1 post-filter
+        // (from the decoded prefix) + §4.3.7.2 de-emphasis.
+        let post_filter = prefix.header.post_filter.map(|pf| PostFilterParams {
+            period: pf.period,
+            gain: pf.gain,
+            tapset: pf.tapset,
+        });
+        let pcm = self.synthesize_stereo_frame(&left, &right, start, end, post_filter)?;
+
+        Ok(StereoDecodedFrame {
+            pcm,
+            prefix,
+            envelope_q8: [env_l, env_r],
+        })
+    }
+
+    /// Decode one dual-stereo, non-transient CELT frame to interleaved
+    /// PCM with **no caller-supplied allocation**, deriving the shared
+    /// per-band pulse counts from the decoded prefix via
+    /// [`derive_band_pulses_dual`](crate::derive_pulses::derive_band_pulses_dual)
+    /// — the stereo counterpart of
+    /// [`decode_celt_frame_auto`](crate::derive_pulses::decode_celt_frame_auto),
+    /// and the decode side of the self-contained stereo codec loop
+    /// ([`encode_stereo_celt_frame_auto`](crate::frame_encode::encode_stereo_celt_frame_auto)
+    /// writes the matching frames). No fine refinement is spent
+    /// (`fine_bits = 0`, the RFC-deferred fine/shape split).
+    pub fn decode_stereo_frame_auto(
+        &mut self,
+        frame_bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<StereoDecodedFrame, Error> {
+        if start > end || end > NUM_BANDS {
+            return Err(Error::InvalidParameter);
+        }
+        let lm = self.lm;
+
+        // Probe the prefix on a throwaway coarse state so the real
+        // streaming state is mutated exactly once, by the coded decode
+        // below (which re-walks the prefix) — the same pattern the mono
+        // auto-decoder uses.
+        let mut probe_coarse = CoarseEnergyState::new();
+        let mut probe_dec = RangeDecoder::new(frame_bytes);
+        let prefix = decode_frame_prefix(
+            &mut probe_dec,
+            &mut probe_coarse,
+            lm,
+            frame_bytes.len() as u32,
+            true,
+            start,
+            end,
+        )?;
+
+        if prefix.header.transient {
+            return Err(Error::NotImplemented);
+        }
+
+        let band_k = if prefix.header.silence {
+            vec![0u32; end - start]
+        } else {
+            crate::derive_pulses::derive_band_pulses_dual(&prefix, lm)
+                .ok_or(Error::InvalidParameter)?
+        };
+
+        let fine_bits = [0u32; NUM_BANDS];
+        self.decode_stereo_frame_coded(frame_bytes, start, end, &fine_bits, &band_k)
+    }
+
     /// Synthesize one stereo frame from the two channels' **denormalized**
     /// residual spectra, running the full §4.3.6 → §4.3.7 chain per
     /// channel and returning interleaved L/R/L/R PCM.
