@@ -6,6 +6,29 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — long-MDCT analysis spine
+  (`analysis` module: `LongMdctAnalysis` + `extract_coded_spectrum`):**
+  the encode-direction mirror of the `synthesis` module.
+  `LongMdctAnalysis` wraps `MdctAnalysis` with the fixed-overlap
+  §4.3.7 window for a fixed `lm`: each `analyze` call consumes
+  `120 << lm` PCM samples and emits the coded-window MDCT spectrum in
+  the band-contiguous residual layout `encode_celt_frame` consumes;
+  `extract_coded_spectrum` is the exact inverse of
+  `place_residual_spectrum` (the bins above the `100 << lm` Table-55
+  coding top, and below a Hybrid `start`, are dropped — the same bins
+  the decode side reconstructs as zero). Validated by the
+  place/extract inverse identity over every `lm` × window, the full
+  analysis→synthesis spectral round-trip at every `lm` (synthesize PCM
+  from known band-limited spectra, analyze it back — exact from the
+  first steady-state frame), the same round-trip over the Hybrid
+  (17..21) window, near-zero recovered energy in the uncoded top bins,
+  and the no-state-advance rejection + reset guards. Transient
+  (short-block) analysis stays behind the §4.3.1 short-MDCT geometry
+  docs gap, the same boundary the synthesis spine keeps. +7 tests.
+  Provenance: RFC 6716 §4.3 Table 55 + §4.3.7 + §5.3
+  (`docs/audio/opus/rfc6716-opus.txt`). No external library source
+  consulted.
+
 * **Round-385 (2026-07-03) — streaming windowed forward-MDCT analysis
   (`MdctAnalysis`, the exact mirror of `MdctSynthesis`):** the second
   stage of the PCM→MDCT front end. Each call consumes `N` new input
