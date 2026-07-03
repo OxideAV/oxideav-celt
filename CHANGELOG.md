@@ -6,6 +6,27 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — end-to-end PCM codec-loop integration
+  tests (`tests/pcm_codec_loop.rs`):** four cross-module tests pinning
+  the whole PCM story through the public API. (1) **Unquantized
+  inverse-pair identity**: a band-limited de-emphasized stream through
+  pre-emphasis → windowed forward MDCT → inverse MDCT + WOLA →
+  de-emphasis reproduces the input exactly (one frame of delay) at
+  every `LM` — every encode front-end stage is the exact inverse of
+  its decode back-end mirror. (2) The quantized
+  `encode_celt_frame_pcm_auto` → `decode_celt_frame_auto` loop:
+  decoded PCM equals the decode-side synthesis chain run on the
+  encoder's bit-exact `reconstructed_spectrum`, with coarse lockstep,
+  frame after frame. (3) **Waveform fidelity**: for a low-band tonal
+  signal the steady-state decoded output tracks the delayed input
+  (relative L2 error < 0.8, normalized correlation > 0.6 — loose but
+  sufficient to pin that the loop transports the waveform). (4)
+  **Spectral closure**: re-running the encode front end over the
+  decoded PCM recovers the encoder's reconstructed residual spectra
+  (one frame delayed, steady state) — tying the PCM loop to the
+  quantized envelope + shape for every funded band with no per-band
+  tolerance tuning. +4 tests.
+
 * **Round-385 (2026-07-03) — PCM-consuming CELT frame encoder
   (`pcm_encode` module: `CeltEncodeState` +
   `encode_celt_frame_pcm[_auto]`):** the top of the encode stack — the
