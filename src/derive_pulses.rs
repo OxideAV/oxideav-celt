@@ -164,6 +164,78 @@ pub fn derive_band_pulses(
     )
 }
 
+/// Derive the shared per-band pulse counts for a **dual-stereo**
+/// frame from a decoded [`FramePrefix`] — the two-channel counterpart
+/// of [`derive_band_pulses`].
+///
+/// Runs the §4.3.3 combined column search with the stereo scaling
+/// (`channels = 2`, the stereo `cap[]` row, the stereo reservations
+/// already folded into the prefix's budget), then splits each band's
+/// combined allocation evenly between the two channels (each channel's
+/// shape budget is `bits[band] / 2`, flooring the odd 1/8 bit), and
+/// runs the §4.3.4.1 bits-to-pulses loop **once** over the per-channel
+/// targets — so both channels share one `K` per band, matching the
+/// dual-coded walk
+/// ([`decode_stereo_residual_bands`](crate::residual::decode_stereo_residual_bands)),
+/// which codes one PVQ index per channel at that `K`.
+///
+/// The even split is an in-crate decision inside the documented
+/// §4.3.3 gap: the RFC specifies the *combined* per-band allocation
+/// (static + boost + trim, clamped by `cap[]`) but defers the stereo
+/// per-channel division to the reference's `interp_bits2pulses`. An
+/// even split is the natural uncoupled-path reading (dual stereo
+/// "encodes the left and right channels separately" with no coded
+/// imbalance parameter on the uncoupled path), and both sides of the
+/// in-crate loop derive it from the bit-identical prefix, so lockstep
+/// holds by construction.
+///
+/// Returns `Some(band_k)` with one shared `K` per coded band, or
+/// `None` on the same failure paths as [`derive_band_pulses`].
+pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>> {
+    let start = prefix.start;
+    let end = prefix.end;
+    if lm > 3 || start > end || end > NUM_BANDS {
+        return None;
+    }
+    if prefix.boosts.boost.len() != end - start {
+        return None;
+    }
+
+    let bins: Vec<u32> = BAND_BINS_LM[lm as usize][start..end].to_vec();
+    let budget_1_8th = i64::from(prefix.boosts.total_bits_remaining.max(0));
+
+    let search = find_combined_alloc(
+        start,
+        &bins,
+        &prefix.boosts.boost,
+        i32::from(prefix.allocation.alloc_trim),
+        2,
+        true,
+        lm,
+        budget_1_8th,
+    )?;
+
+    // Per-channel share: half the band's combined allocation (the odd
+    // 1/8 bit floors away — conservative on both sides).
+    let targets: Vec<u32> = search
+        .alloc
+        .bits
+        .iter()
+        .map(|&b| (b.max(0) as u32) / 2)
+        .collect();
+
+    let (per_band, _balance) =
+        bits_to_pulses_band_loop_cached(lm as usize, start, &bins, &targets)?;
+
+    Some(
+        per_band
+            .iter()
+            .zip(bins.iter())
+            .map(|(r, &n)| clamp_k_to_decodable(n, r.k))
+            .collect(),
+    )
+}
+
 /// Decode one mono, non-transient CELT frame to time-domain PCM,
 /// deriving the per-band pulse counts from the documented §4.3.3 /
 /// §4.3.4.1 allocation arithmetic rather than taking them as a caller
@@ -453,6 +525,75 @@ mod tests {
             saw_transient,
             "no transient seed found to exercise the gate"
         );
+    }
+
+    /// Decode a stereo prefix of `buf` for the dual-derivation tests.
+    fn stereo_prefix_of(buf: &[u8], lm: u32, start: usize, end: usize) -> FramePrefix {
+        let mut coarse = CoarseEnergyState::new();
+        let mut dec = RangeDecoder::new(buf);
+        decode_frame_prefix(
+            &mut dec,
+            &mut coarse,
+            lm,
+            buf.len() as u32,
+            true,
+            start,
+            end,
+        )
+        .expect("stereo prefix decode")
+    }
+
+    /// `derive_band_pulses_dual` returns one shared K per coded band,
+    /// each within the decodable-codebook cap, deterministically.
+    #[test]
+    fn dual_derivation_one_shared_k_per_band() {
+        let lm = 2u32;
+        // Any seed works for the derivation (it only reads the decoded
+        // prefix); use a couple to cover different boost/trim mixes.
+        for seed in [3u8, 57, 190] {
+            let buf = payload(72, seed);
+            let pfx = stereo_prefix_of(&buf, lm, 0, NUM_BANDS);
+            let a = derive_band_pulses_dual(&pfx, lm).expect("derive dual");
+            assert_eq!(a.len(), NUM_BANDS);
+            for (b, &k) in a.iter().enumerate() {
+                let n = BAND_BINS_LM[lm as usize][b];
+                assert_ne!(
+                    v_count(n, k),
+                    V_COUNT_SATURATION,
+                    "band {b} K={k} overflows the codebook"
+                );
+            }
+            let b = derive_band_pulses_dual(&pfx, lm).expect("derive dual again");
+            assert_eq!(a, b, "dual derivation is non-deterministic");
+        }
+    }
+
+    /// The per-channel share is half the combined stereo allocation:
+    /// the dual K never exceeds the K a single channel would get from
+    /// the *whole* stereo-scaled allocation.
+    #[test]
+    fn dual_k_never_exceeds_full_stereo_alloc_k() {
+        let lm = 3u32;
+        let buf = payload(96, 41);
+        let pfx = stereo_prefix_of(&buf, lm, 0, NUM_BANDS);
+        let dual = derive_band_pulses_dual(&pfx, lm).expect("dual");
+        // Full stereo-scaled allocation driven through the same loop
+        // (what a channel would get if it kept every 1/8 bit).
+        let full = derive_band_pulses(&pfx, lm, 2, true).expect("full");
+        for (b, (&d, &f)) in dual.iter().zip(&full).enumerate() {
+            assert!(d <= f, "band {b}: dual K {d} > full-alloc K {f}");
+        }
+    }
+
+    /// Bad windows / mismatched boosts propagate as `None`.
+    #[test]
+    fn dual_derivation_rejects_bad_inputs() {
+        let lm = 2u32;
+        let buf = payload(64, 9);
+        let mut pfx = stereo_prefix_of(&buf, lm, 0, NUM_BANDS);
+        assert!(derive_band_pulses_dual(&pfx, 4).is_none());
+        pfx.boosts.boost.pop();
+        assert!(derive_band_pulses_dual(&pfx, lm).is_none());
     }
 
     /// An out-of-range band window is rejected without panicking.

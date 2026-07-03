@@ -64,6 +64,30 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-389 (2026-07-04) — dual-stereo residual walk + shared pulse
+  derivation (`decode_stereo_residual_bands`,
+  `derive_band_pulses_dual`):** the two documented sides of the
+  uncoupled ("dual", RFC 6716 Table 56) stereo shape seam. The
+  residual walk decodes one PVQ index per channel per band — bands in
+  Table-56 order, channel 0 then channel 1 within each band (an
+  in-crate wire convention mirroring the *specified* §4.3.2.1 coarse
+  within-band channel interleave; the §4.3.4.4 joint stereo walk is
+  deferred to the reference, so the exact reference interleave is an
+  interop caveat) — with a shared `K`, shared spread/TF (Table 56
+  codes one of each per frame), and per-channel §4.3.6
+  denormalization. The pulse derivation runs the §4.3.3 combined
+  column search with the stereo scaling (`channels = 2`, stereo
+  `cap[]` row), splits each band's combined allocation evenly per
+  channel (flooring the odd 1/8 bit), and runs the §4.3.4.1
+  bits-to-pulses loop once — one shared `K` per band, derived
+  identically on both sides from the bit-identical prefix. Validated
+  by exact agreement with a manual per-band double `decode_band_shape`
+  interleave, zero-pulse / saturated-codebook / bad-length edges,
+  dual-K ≤ full-stereo-alloc-K dominance, and determinism. +7 tests.
+  Provenance: RFC 6716 §4.3 (lines 5896–5902), Table 56, §4.3.3,
+  §4.3.4.1, §4.3.4.4 (`docs/audio/opus/rfc6716-opus.txt`). No external
+  library source consulted.
+
 * **Round-385 (2026-07-03) — §5.3.3 intra/inter coarse-mode decision
   (`choose_intra_mode`):** the second §5.3 encoder decision with a
   documented method: "it is best to try encoding the coarse energy

@@ -236,6 +236,124 @@ pub fn decode_residual_bands(
     })
 }
 
+/// The decoded **dual-stereo** residual spectra for the coded-band
+/// window: one denormalized spectrum per channel, plus the shared
+/// per-band pulse counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StereoResidualSpectrum {
+    /// Channel 0 (left): the denormalized MDCT-domain samples for the
+    /// coded-band window `[start, end)`, band-contiguous — the same
+    /// layout as [`ResidualSpectrum::samples`].
+    pub left: Vec<f32>,
+    /// Channel 1 (right), same layout.
+    pub right: Vec<f32>,
+    /// The pulse count `K` consumed per coded band (shared by both
+    /// channels in the dual-coded walk — see
+    /// [`decode_stereo_residual_bands`]).
+    pub band_k: Vec<u32>,
+}
+
+/// Decode the §4.3.4 residual section of a **dual-stereo** frame
+/// (RFC 6716 Table 56 `dual` = 1: "encodes the left and right channels
+/// separately") and assemble both channels' denormalized MDCT-domain
+/// spectra.
+///
+/// ## The dual-coded walk and its wire convention
+///
+/// RFC 6716 §4.3 names dual stereo as the uncoupled stereo method
+/// ("encodes the left and right channels separately", lines
+/// 5896–5902) and Table 56 carries its selector, but §4.3.4.4 defers
+/// the *joint* stereo band walk — including the exact per-channel
+/// symbol order — to the reference implementation ("The same
+/// recursive mechanism is applied for the joint coding of stereo
+/// audio", with no further detail). Within that documented gap this
+/// walk fixes an **in-crate wire convention** for the uncoupled path:
+///
+/// * bands walk `start..end` in Table-56 order, exactly as in mono;
+/// * within each band, channel 0's PVQ index is decoded first, then
+///   channel 1's — mirroring the §4.3.2.1 coarse-energy walk, whose
+///   within-band channel interleave *is* specified (`channels = 2`);
+/// * both channels use the same pulse count `K`, spread rotation, and
+///   TF adjustment (one `spread` / `tf_change` set is coded per frame,
+///   not per channel — Table 56 has a single entry for each);
+/// * each channel denormalizes against its **own** §4.3.2 envelope.
+///
+/// The convention is self-consistent with the encode side in this
+/// crate ([`crate::frame_encode::encode_stereo_celt_frame`]); whether
+/// the reference wire format interleaves the two channels the same way
+/// is **not** pinned by RFC prose (interop caveat, same shape as the
+/// silence-frame caveat documented in [`crate::pcm_encode`]).
+///
+/// Parameters match [`decode_residual_bands`] except the energy input:
+/// `left_energy_q8` / `right_energy_q8` are the two channels' §4.3.2
+/// Q8 envelopes over the coded window (window-relative, `end - start`
+/// entries each). Error behaviour matches [`decode_residual_bands`].
+#[allow(clippy::too_many_arguments)]
+pub fn decode_stereo_residual_bands(
+    dec: &mut RangeDecoder<'_>,
+    lm: u32,
+    start: usize,
+    end: usize,
+    is_transient: bool,
+    tf_select: u8,
+    tf_changes: &[bool],
+    band_k: &[u32],
+    spread: Spread,
+    left_energy_q8: &[i32],
+    right_energy_q8: &[i32],
+) -> Result<StereoResidualSpectrum, Error> {
+    if lm > 3 || start > end || end > NUM_BANDS {
+        return Err(Error::InvalidParameter);
+    }
+    let coded_bands = end - start;
+    if tf_changes.len() != coded_bands
+        || band_k.len() != coded_bands
+        || left_energy_q8.len() != coded_bands
+        || right_energy_q8.len() != coded_bands
+    {
+        return Err(Error::InvalidParameter);
+    }
+
+    let nb_blocks: u32 = if is_transient { 1u32 << lm } else { 1 };
+    let total_bins = coded_total_bins(start, end, lm).ok_or(Error::InvalidParameter)? as usize;
+    let mut left = vec![0f32; total_bins];
+    let mut right = vec![0f32; total_bins];
+
+    let window_origin = band_bin_range(start.min(NUM_BANDS - 1), lm)
+        .map(|(s, _)| s)
+        .unwrap_or(0);
+
+    let mut out_k = Vec::with_capacity(coded_bands);
+
+    for (i, band) in (start..end).enumerate() {
+        let n = band_bins(band, lm).ok_or(Error::InvalidParameter)?;
+        let (abs_start, abs_end) = band_bin_range(band, lm).ok_or(Error::InvalidParameter)?;
+        let k = band_k[i];
+        let tf_adj = tf_adjustment(is_transient, tf_select, lm as u8, tf_changes[i]);
+
+        let lo = (abs_start - window_origin) as usize;
+        let hi = (abs_end - window_origin) as usize;
+
+        // Channel 0 first, then channel 1 — the in-crate dual-stereo
+        // within-band interleave (see the function docs).
+        let shape_l = decode_band_shape(dec, n, k, spread, nb_blocks, tf_adj, left_energy_q8[i])
+            .ok_or(Error::NotImplemented)?;
+        let shape_r = decode_band_shape(dec, n, k, spread, nb_blocks, tf_adj, right_energy_q8[i])
+            .ok_or(Error::NotImplemented)?;
+
+        debug_assert_eq!(hi - lo, shape_l.samples.len());
+        left[lo..hi].copy_from_slice(&shape_l.samples);
+        right[lo..hi].copy_from_slice(&shape_r.samples);
+        out_k.push(shape_l.k);
+    }
+
+    Ok(StereoResidualSpectrum {
+        left,
+        right,
+        band_k: out_k,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,5 +652,180 @@ mod tests {
         assert!(res.samples.is_empty());
         assert!(res.band_k.is_empty());
         assert_eq!(dec.tell(), tell);
+    }
+
+    // --- Dual-stereo residual walk ---
+
+    /// The stereo walk equals a manual per-band double
+    /// `decode_band_shape` pass over the same bytes (channel 0 first
+    /// within each band), each channel denormalized against its own
+    /// envelope.
+    #[test]
+    fn stereo_walk_matches_manual_interleave() {
+        use crate::band_decode::decode_band_shape;
+        use crate::tf_change::tf_adjustment;
+
+        let buf: Vec<u8> = (0..256u32).map(|i| (i * 89 + 7) as u8).collect();
+        let lm = 2u32;
+        let (start, end) = (0usize, 21usize);
+        let n_bands = end - start;
+        let band_k = vec![2u32; n_bands];
+        let tf_changes = vec![false; n_bands];
+        let env_l: Vec<i32> = (0..n_bands as i32).map(|b| 256 - 8 * b).collect();
+        let env_r: Vec<i32> = (0..n_bands as i32).map(|b| 128 + 4 * b).collect();
+
+        let mut dec = RangeDecoder::new(&buf);
+        let got = decode_stereo_residual_bands(
+            &mut dec,
+            lm,
+            start,
+            end,
+            false,
+            0,
+            &tf_changes,
+            &band_k,
+            Spread::Normal,
+            &env_l,
+            &env_r,
+        )
+        .unwrap();
+
+        // Manual walk: per band, channel 0 then channel 1.
+        let mut dec2 = RangeDecoder::new(&buf);
+        let total = coded_total_bins(start, end, lm).unwrap() as usize;
+        let mut left = vec![0f32; total];
+        let mut right = vec![0f32; total];
+        let mut offset = 0usize;
+        for (i, band) in (start..end).enumerate() {
+            let n = crate::band_layout::band_bins(band, lm).unwrap();
+            let adj = tf_adjustment(false, 0, lm as u8, tf_changes[i]);
+            let l = decode_band_shape(&mut dec2, n, band_k[i], Spread::Normal, 1, adj, env_l[i])
+                .unwrap();
+            let r = decode_band_shape(&mut dec2, n, band_k[i], Spread::Normal, 1, adj, env_r[i])
+                .unwrap();
+            left[offset..offset + n as usize].copy_from_slice(&l.samples);
+            right[offset..offset + n as usize].copy_from_slice(&r.samples);
+            offset += n as usize;
+        }
+        assert_eq!(got.left, left);
+        assert_eq!(got.right, right);
+        assert_eq!(got.band_k, band_k);
+        assert_eq!(dec.tell(), dec2.tell());
+    }
+
+    /// Length and range validation on every stereo-specific input.
+    #[test]
+    fn stereo_walk_rejects_bad_inputs() {
+        let buf = [0x5au8; 64];
+        let env = vec![0i32; 21];
+        // lm out of range.
+        let mut dec = RangeDecoder::new(&buf);
+        assert!(matches!(
+            decode_stereo_residual_bands(
+                &mut dec,
+                4,
+                0,
+                21,
+                false,
+                0,
+                &[false; 21],
+                &[1u32; 21],
+                Spread::None,
+                &env,
+                &env,
+            ),
+            Err(Error::InvalidParameter)
+        ));
+        // Right envelope length mismatch.
+        let mut dec = RangeDecoder::new(&buf);
+        assert!(matches!(
+            decode_stereo_residual_bands(
+                &mut dec,
+                2,
+                0,
+                21,
+                false,
+                0,
+                &[false; 21],
+                &[1u32; 21],
+                Spread::None,
+                &env,
+                &env[..20],
+            ),
+            Err(Error::InvalidParameter)
+        ));
+        // band_k length mismatch.
+        let mut dec = RangeDecoder::new(&buf);
+        assert!(matches!(
+            decode_stereo_residual_bands(
+                &mut dec,
+                2,
+                0,
+                21,
+                false,
+                0,
+                &[false; 21],
+                &[1u32; 20],
+                Spread::None,
+                &env,
+                &env,
+            ),
+            Err(Error::InvalidParameter)
+        ));
+    }
+
+    /// Zero pulses in every band yield two zero spectra of the window
+    /// size (the §4.3.4.2 all-zero normalization edge, per channel).
+    #[test]
+    fn stereo_zero_pulses_are_zero_spectra() {
+        let buf = [0x80u8; 32];
+        let mut dec = RangeDecoder::new(&buf);
+        let lm = 1u32;
+        let env = vec![0i32; 21];
+        let res = decode_stereo_residual_bands(
+            &mut dec,
+            lm,
+            0,
+            21,
+            false,
+            0,
+            &[false; 21],
+            &[0u32; 21],
+            Spread::None,
+            &env,
+            &env,
+        )
+        .unwrap();
+        let total = coded_total_bins(0, 21, lm).unwrap() as usize;
+        assert_eq!(res.left.len(), total);
+        assert_eq!(res.right.len(), total);
+        assert!(res.left.iter().all(|&s| s == 0.0));
+        assert!(res.right.iter().all(|&s| s == 0.0));
+    }
+
+    /// A saturated codebook surfaces as `NotImplemented` from the
+    /// stereo walk exactly as from the mono walk (the §4.3.4.4 split
+    /// gap).
+    #[test]
+    fn stereo_saturated_band_is_not_implemented() {
+        let buf = [0xFFu8; 128];
+        let mut dec = RangeDecoder::new(&buf);
+        let mut band_k = vec![2u32; 21];
+        band_k[20] = 176;
+        let env = vec![0i32; 21];
+        let r = decode_stereo_residual_bands(
+            &mut dec,
+            3,
+            0,
+            21,
+            false,
+            0,
+            &[false; 21],
+            &band_k,
+            Spread::None,
+            &env,
+            &env,
+        );
+        assert!(matches!(r, Err(Error::NotImplemented)));
     }
 }
