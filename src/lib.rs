@@ -283,6 +283,7 @@ pub mod deemphasis;
 pub mod denormalization;
 pub mod derive_pulses;
 pub mod e_prob_model;
+pub mod encoder_decisions;
 pub mod fine_energy;
 pub mod frame_decode;
 pub mod frame_encode;
@@ -362,6 +363,7 @@ pub use e_prob_model::{
     prob_decay, ProbDecay, E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER,
     PRED_INTRA,
 };
+pub use encoder_decisions::{boost_quanta_8th, boost_thresholds, choose_band_boosts};
 pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, encode_fine_energy, encode_fine_energy_band,
     finalize_extra_bits, fine_correction_q14, fine_correction_qn, quantize_fine_energy_band,
@@ -369,7 +371,8 @@ pub use fine_energy::{
 };
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_encode::{
-    encode_celt_frame, encode_celt_frame_auto, encode_frame_prefix, EncodedFrame, FramePrefixSpec,
+    encode_celt_frame, encode_celt_frame_auto, encode_celt_frame_auto_boosted, encode_frame_prefix,
+    EncodedFrame, FramePrefixSpec,
 };
 pub use frame_header::{
     decode_anti_collapse_flag, encode_anti_collapse_flag, CeltFrameHeader, PostFilter,

@@ -348,6 +348,7 @@ pub fn encode_celt_frame(
         end,
         fine_bits,
         Some(band_k),
+        None,
     )
 }
 
@@ -368,6 +369,16 @@ pub fn encode_celt_frame(
 /// fine-energy refinement is spent (`fine_bits = 0`, the RFC-deferred
 /// fine/shape split approximated by treating the whole combined
 /// allocation as shape).
+///
+/// The §4.3.3 dynalloc band boosts are chosen by the §5.3.4.1
+/// contrast rule
+/// ([`choose_band_boosts`](crate::encoder_decisions::choose_band_boosts))
+/// over the analyzed band energies — a band poking far enough above
+/// its neighbors requests one or two boost quanta, gate-truncated
+/// against the live budget by the boost encoder. The decoder reads
+/// the boosts back from the prefix, so the derived `band_k` stays in
+/// lockstep automatically. Use [`encode_celt_frame_auto_boosted`] to
+/// override the decision.
 ///
 /// Parameters and error behaviour match [`encode_celt_frame`], minus
 /// the two allocation inputs.
@@ -391,12 +402,53 @@ pub fn encode_celt_frame_auto(
         end,
         &fine_bits,
         None,
+        None,
     )
 }
 
-/// Shared engine for [`encode_celt_frame`] (caller-supplied `band_k`)
-/// and [`encode_celt_frame_auto`] (`band_k` derived from the encoded
-/// prefix via the documented §4.3.3 → §4.3.4.1 seam).
+/// [`encode_celt_frame_auto`] with **caller-chosen §4.3.3 band-boost
+/// targets** instead of the automatic §5.3.4.1 decision.
+///
+/// `target_boost` holds one 1/8-bit boost target per coded band
+/// (`end - start` entries — the
+/// [`choose_band_boosts`](crate::encoder_decisions::choose_band_boosts)
+/// output shape). Targets floor to the band's dynalloc quanta grid
+/// and truncate at the budget/cap gates, exactly like the underlying
+/// [`encode_band_boosts`] — boosts are encoder freedom (§5.3.4), so
+/// any choice keeps the decoder in lockstep. Everything else matches
+/// [`encode_celt_frame_auto`].
+#[allow(clippy::too_many_arguments)]
+pub fn encode_celt_frame_auto_boosted(
+    coarse_state: &mut CoarseEnergyState,
+    spectrum: &[f32],
+    header: &CeltFrameHeader,
+    lm: u32,
+    frame_bytes: u32,
+    start: usize,
+    end: usize,
+    target_boost: &[i32],
+) -> Result<EncodedFrame, Error> {
+    let fine_bits = [0u32; NUM_BANDS];
+    encode_celt_frame_impl(
+        coarse_state,
+        spectrum,
+        header,
+        lm,
+        frame_bytes,
+        start,
+        end,
+        &fine_bits,
+        None,
+        Some(target_boost),
+    )
+}
+
+/// Shared engine for [`encode_celt_frame`] (caller-supplied `band_k`,
+/// zero boosts), [`encode_celt_frame_auto`] (`band_k` derived from
+/// the encoded prefix via the documented §4.3.3 → §4.3.4.1 seam,
+/// §5.3.4.1 automatic boosts), and
+/// [`encode_celt_frame_auto_boosted`] (derived `band_k`,
+/// caller-chosen boosts).
 #[allow(clippy::too_many_arguments)]
 fn encode_celt_frame_impl(
     coarse_state: &mut CoarseEnergyState,
@@ -408,6 +460,7 @@ fn encode_celt_frame_impl(
     end: usize,
     fine_bits: &[u32; NUM_BANDS],
     band_k: Option<&[u32]>,
+    target_boost: Option<&[i32]>,
 ) -> Result<EncodedFrame, Error> {
     if lm > 3 || start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
@@ -446,10 +499,38 @@ fn encode_celt_frame_impl(
         }
     }
 
+    // Resolve the §4.3.3 boost targets: caller-chosen, the §5.3.4.1
+    // contrast rule over the analyzed energies (auto mode), or zero
+    // (explicit-allocation mode, where the caller's fixed `band_k`
+    // ignores the prefix-derived allocation anyway).
+    let derived_boost: Vec<i32>;
+    let target_boost: &[i32] = match target_boost {
+        Some(tb) => {
+            if tb.len() != coded_bands {
+                return Err(Error::InvalidParameter);
+            }
+            tb
+        }
+        None if band_k.is_none() => {
+            derived_boost = crate::encoder_decisions::choose_band_boosts(
+                &energy_target[0][start..end],
+                lm,
+                start,
+                end,
+            )
+            .ok_or(Error::InvalidParameter)?;
+            &derived_boost
+        }
+        None => {
+            derived_boost = vec![0i32; coded_bands];
+            &derived_boost
+        }
+    };
+
     // Table-56 prefix: header → coarse energy → TF (identity) → spread
-    // (None) → boosts (none) → allocation (defaults).
+    // (None) → boosts (§5.3.4.1 / caller-chosen, gate-truncated) →
+    // allocation (defaults).
     let mut enc = RangeEncoder::new();
-    let target_boost = vec![0i32; coded_bands];
     let spec = FramePrefixSpec {
         header: CeltFrameHeader {
             anti_collapse_on: None,
@@ -462,7 +543,7 @@ fn encode_celt_frame_impl(
             tf_select_decoded: false,
         },
         spread: Spread::None,
-        target_boost: &target_boost,
+        target_boost,
         allocation: BandAllocation::defaults(),
     };
     let prefix = encode_frame_prefix(
@@ -788,5 +869,121 @@ mod tests {
             encode_frame_prefix(&mut enc, &mut state, &base, 2, FRAME_BYTES, false, 17, 21)
                 .is_err()
         );
+    }
+
+    /// A spectrum with one band poking far above its neighbors earns a
+    /// §5.3.4.1 boost in the auto encoder, and the boosted frame still
+    /// closes the self-contained auto codec loop (bit-identical
+    /// prefix, coarse lockstep).
+    #[test]
+    fn auto_boost_lands_and_round_trips() {
+        use crate::band_layout::band_bin_range;
+        use crate::derive_pulses::decode_celt_frame_auto;
+        use crate::frame_synthesis::CeltDecodeState;
+
+        let lm = 2u32;
+        let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+        // Baseline amplitude everywhere, one band 8x louder:
+        // E_peak - E_neighbor = log2(64) = 6, so D = 12 > t2 = 4 —
+        // boosted twice.
+        let peak_band = 10usize;
+        let (lo, hi) = band_bin_range(peak_band, lm).unwrap();
+        let mut spectrum = vec![0.05f32; total];
+        for s in &mut spectrum[lo as usize..hi as usize] {
+            *s = 0.4;
+        }
+
+        let header = CeltFrameHeader {
+            silence: false,
+            post_filter: None,
+            transient: false,
+            intra: true,
+            anti_collapse_on: None,
+        };
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_celt_frame_auto(
+            &mut enc_state,
+            &spectrum,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        // Two quanta for band 10 (N = 8 at LM=2 → quanta = 48).
+        let n = crate::band_minimums::BAND_BINS_LM[lm as usize][peak_band];
+        assert_eq!(
+            frame.prefix.boosts.boost[peak_band],
+            2 * crate::encoder_decisions::boost_quanta_8th(n),
+            "the §5.3.4.1 double boost must land on the wire"
+        );
+        assert!(frame
+            .prefix
+            .boosts
+            .boost
+            .iter()
+            .enumerate()
+            .all(|(b, &v)| b == peak_band || v == 0));
+
+        // The boosted frame still decodes caller-input-free with the
+        // identical prefix and coarse state.
+        let mut dec_state = CeltDecodeState::new(lm).unwrap();
+        let decoded = decode_celt_frame_auto(&mut dec_state, &frame.bytes, 0, NUM_BANDS).unwrap();
+        assert_eq!(frame.prefix.boosts, decoded.prefix.boosts);
+        assert_eq!(enc_state.energy, dec_state.coarse_energy().energy);
+        assert!(decoded.pcm.iter().all(|s| s.is_finite()));
+    }
+
+    /// The explicit-boost variant honours a caller-chosen target (on
+    /// the quanta grid, within budget) and rejects a length mismatch.
+    #[test]
+    fn explicit_boost_variant() {
+        use crate::derive_pulses::decode_celt_frame_auto;
+        use crate::frame_synthesis::CeltDecodeState;
+
+        let lm = 2u32;
+        let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+        let spectrum = vec![0.1f32; total];
+        let header = CeltFrameHeader {
+            silence: false,
+            post_filter: None,
+            transient: false,
+            intra: true,
+            anti_collapse_on: None,
+        };
+        // One quantum on band 3 (N = 4 → quanta = 32).
+        let mut target = vec![0i32; NUM_BANDS];
+        target[3] = 32;
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_celt_frame_auto_boosted(
+            &mut enc_state,
+            &spectrum,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+            &target,
+        )
+        .unwrap();
+        assert_eq!(frame.prefix.boosts.boost[3], 32);
+        let mut dec_state = CeltDecodeState::new(lm).unwrap();
+        let decoded = decode_celt_frame_auto(&mut dec_state, &frame.bytes, 0, NUM_BANDS).unwrap();
+        assert_eq!(frame.prefix.boosts, decoded.prefix.boosts);
+
+        // Length mismatch is rejected.
+        let mut fresh = CoarseEnergyState::new();
+        assert!(encode_celt_frame_auto_boosted(
+            &mut fresh,
+            &spectrum,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+            &target[..5],
+        )
+        .is_err());
     }
 }

@@ -6,6 +6,37 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — §5.3.4.1 encoder band-boost decision
+  (`encoder_decisions` module), wired through the auto encoders:** the
+  first §5.3.4 encoder control decision the RFC spells out in closed
+  form. `choose_band_boosts` computes the per-band contrast
+  `D_j = 2*E_j - E_{j-1} - E_{j+1}` on the base-2 log-energy axis and
+  boosts a band once if `D_j > t1`, twice if `D_j > t2`
+  (`(t1, t2) = (2, 4)` for `LM >= 1`, `(3, 5)` for `LM < 1` — the
+  literal §5.3.4.1 constants), each boost worth one §4.3.3 dynalloc
+  quantum `min(8*N, max(48, N))` so the decision lands exactly on the
+  wire grid (`boost_thresholds` / `boost_quanta_8th` expose the
+  pieces). Edge bands are never boosted (the formula needs both
+  neighbors — a documented encoder decision; boosts are §5.3.4 encoder
+  freedom). `encode_celt_frame_auto` now applies the rule
+  automatically over its analyzed band energies (the decoder reads the
+  boosts back from the prefix, so the derived `band_k` stays in
+  lockstep with no API change); the new
+  `encode_celt_frame_auto_boosted` overrides the decision with
+  caller-chosen targets; the explicit-allocation `encode_celt_frame`
+  keeps zero boosts. The §5.3.4.2 trim deviation ("+/- 2 depending on
+  the spectral tilt") is **not** implemented — the RFC gives direction
+  and bound but no tilt→deviation map (documented docs gap; the
+  default 5 stands). Validated by the threshold/quanta constants, the
+  flat-envelope no-op, the once/twice/strict-threshold peak sweep on
+  both sides of the LM split, edge + Hybrid-window behaviour, the
+  input-validation matrix, a boosted-frame auto codec-loop round-trip
+  (the double boost lands on the wire and decodes back identically),
+  and the explicit-variant honour/rejection paths. +8 tests.
+  Provenance: RFC 6716 §5.3.4/§5.3.4.1 + §4.3.3
+  (`docs/audio/opus/rfc6716-opus.txt`). No external library source
+  consulted.
+
 * **Round-385 (2026-07-03) — end-to-end PCM codec-loop integration
   tests (`tests/pcm_codec_loop.rs`):** four cross-module tests pinning
   the whole PCM story through the public API. (1) **Unquantized
