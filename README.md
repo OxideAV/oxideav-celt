@@ -1,5 +1,7 @@
 # oxideav-celt
 
+[![CI](https://github.com/OxideAV/oxideav-celt/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-celt/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-celt.svg)](https://crates.io/crates/oxideav-celt) [![docs.rs](https://docs.rs/oxideav-celt/badge.svg)](https://docs.rs/oxideav-celt) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
