@@ -6,6 +6,26 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-389 (2026-07-04) — §5.3.5 stereo decisions
+  (`choose_mid_side_stereo`, `intensity_start_band`,
+  `mid_side_extra_dof`):** the two RFC-pinned stereo encoder rules.
+  The mid/side-vs-dual verdict transcribes the §5.3.5 L1 comparison
+  literally — `L1_ms / (bins + E) < L1_lr / bins` over the first 13
+  bands, `E = 13` for `LM > 1` else `5` — with the orthonormal
+  `m,s = (l ± r)/sqrt(2)` rotation (the RFC does not pin the scaling;
+  the norm-preserving reading is documented since it shifts the
+  boundary). `intensity_start_band` is Table 66 with the
+  coarse-energy 80-bit/frame subtraction and the `400 >> lm`
+  frames-per-second rate scaling; the RFC's printed "84-84" row is
+  read as the 68–84 gap it leaves (apparent erratum, noted). Both are
+  *decision* helpers: the current encoders can only honour the dual
+  verdict (mid-side/intensity coding is inside the §4.3.4.4 `itheta`
+  gap, and §5.3.5 sanctions either choice on any frame), so they are
+  exposed for the coupled path to adopt when the gap closes. Pinned
+  by dual-mono → mid-side / hard-panned-at-LM1 → dual / manual-L1
+  agreement, the `E` split, every Table-66 row + boundary + the
+  80-bit subtraction + duration scaling. +3 tests.
+
 * **Round-389 (2026-07-04) — §5.3.4.2 allocation-trim decision
   (`choose_alloc_trim` + `spectral_tilt_slope` +
   `low_band_stereo_correlation`), wired through the auto encoders:**

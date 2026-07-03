@@ -365,7 +365,8 @@ pub use e_prob_model::{
 };
 pub use encoder_decisions::{
     boost_quanta_8th, boost_thresholds, choose_alloc_trim, choose_band_boosts, choose_intra_mode,
-    low_band_stereo_correlation, spectral_tilt_slope, TRIM_TILT_GAIN,
+    choose_mid_side_stereo, intensity_start_band, low_band_stereo_correlation, mid_side_extra_dof,
+    spectral_tilt_slope, MID_SIDE_DECISION_BANDS, TRIM_TILT_GAIN,
 };
 pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, encode_fine_energy, encode_fine_energy_band,

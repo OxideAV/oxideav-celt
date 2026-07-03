@@ -266,6 +266,133 @@ pub fn choose_alloc_trim(
     (5 + tilt_dev - stereo_dev).clamp(0, 10) as u8
 }
 
+/// The number of bands the §5.3.5 mid/side-vs-dual comparison runs
+/// over: "comparing the estimated entropy with and without coupling
+/// over the first 13 bands".
+pub const MID_SIDE_DECISION_BANDS: usize = 13;
+
+/// The §5.3.5 "extra degrees of freedom" term `E` for mid-side
+/// coding: "For LM>1, E=13, otherwise E=5" (every band with more than
+/// two MDCT bins needs one extra degree of freedom when coded in
+/// mid-side).
+#[inline]
+pub fn mid_side_extra_dof(lm: u32) -> u32 {
+    if lm > 1 {
+        13
+    } else {
+        5
+    }
+}
+
+/// The §5.3.5 mid/side-vs-dual stereo decision.
+///
+/// > "This decision is made by comparing the estimated entropy with
+/// > and without coupling over the first 13 bands ... Let L1_ms and
+/// > L1_lr be the L1-norm of the mid-side vector and the L1-norm of
+/// > the left-right vector, respectively. The decision to use
+/// > mid-side is made if and only if
+/// > L1_ms / (bins + E) < L1_lr / bins"
+///
+/// `left` / `right` are the two channels' coded-window spectra
+/// (band-contiguous, window starting at absolute band `start`); the
+/// norms run over the bins of the first
+/// [`MID_SIDE_DECISION_BANDS`] absolute bands, `bins` is that span,
+/// and `E` is [`mid_side_extra_dof`]. The mid/side vector uses the
+/// orthonormal rotation `m = (l + r)/sqrt(2)`, `s = (l - r)/sqrt(2)`
+/// — the RFC does not pin the scaling convention, and the
+/// norm-preserving rotation is the natural reading given §5.3.5's
+/// framing ("CELT applies mid-side stereo coupling in the normalized
+/// domain"); the convention is documented because it shifts the
+/// decision boundary.
+///
+/// Returns `Some(true)` for mid-side, `Some(false)` for dual, `None`
+/// when the decision is undefined (`start != 0` — the first 13 bands
+/// are not coded — `lm > 3`, either spectrum shorter than the span,
+/// or a zero `L1_lr`).
+///
+/// **Note:** the current frame encoders can only *honour* the dual
+/// verdict — the §4.3.4.4 `itheta` mid-side coupling is the
+/// documented docs gap — and always encode the uncoupled path, which
+/// §5.3.5 explicitly sanctions ("it is always safe to use ... any
+/// audio frame" either way; dual is a legal choice for every frame).
+/// The decision is exposed so the coupled path can adopt it when the
+/// gap closes, and so callers can measure the efficiency the gap
+/// costs.
+pub fn choose_mid_side_stereo(left: &[f32], right: &[f32], lm: u32, start: usize) -> Option<bool> {
+    if start != 0 || lm > 3 {
+        return None;
+    }
+    let span: u32 = BAND_BINS_LM[lm as usize][..MID_SIDE_DECISION_BANDS]
+        .iter()
+        .sum();
+    let span = span as usize;
+    if left.len() < span || right.len() < span {
+        return None;
+    }
+    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+    let mut l1_ms = 0.0f64;
+    let mut l1_lr = 0.0f64;
+    for (l, r) in left[..span].iter().zip(&right[..span]) {
+        let l = f64::from(*l);
+        let r = f64::from(*r);
+        l1_ms += ((l + r) * inv_sqrt2).abs() + ((l - r) * inv_sqrt2).abs();
+        l1_lr += l.abs() + r.abs();
+    }
+    if l1_lr <= 0.0 {
+        return None;
+    }
+    let bins = span as f64;
+    let e = f64::from(mid_side_extra_dof(lm));
+    Some(l1_ms / (bins + e) < l1_lr / bins)
+}
+
+/// The §5.3.5 Table 66 intensity-stereo threshold: the first band
+/// using intensity coding, decided "based on the bitrate alone.
+/// After taking into account the frame size by subtracting 80 bits
+/// per frame for coarse energy".
+///
+/// `frame_bits` is the coded frame size in bits (`frame_bytes * 8`);
+/// `lm` gives the frame duration (`2.5 ms << lm`, i.e. `400 >> lm`
+/// frames per second), so the compared rate is
+/// `(frame_bits - 80) * (400 >> lm)` bits per second. Table 66 maps
+/// it to the start band:
+///
+/// | rate (kbit/s) | start band |
+/// |---------------|------------|
+/// | < 35          | 8          |
+/// | 35–50         | 12         |
+/// | 50–68         | 16         |
+/// | 68–84         | 18         |
+/// | 84–102        | 19         |
+/// | 102–130       | 20         |
+/// | > 130         | disabled   |
+///
+/// (The RFC's printed table labels the fourth row "84-84"; the
+/// monotone reading — it covers the 68–84 gap the printed rows leave —
+/// is used here and noted as an apparent erratum in the RFC text.)
+///
+/// Returns `None` for "disabled" (rate above 130 kbit/s, and `lm > 3`
+/// defensively). Like the mid/side verdict, intensity coding itself
+/// is not yet encodable (its band walk is inside the §4.3.4.4 gap);
+/// the current encoders pin "intensity never applies", which the
+/// returned threshold would replace once the gap closes.
+pub fn intensity_start_band(frame_bits: u32, lm: u32) -> Option<usize> {
+    if lm > 3 {
+        return None;
+    }
+    let frames_per_second = 400u64 >> lm;
+    let rate_bps = u64::from(frame_bits.saturating_sub(80)) * frames_per_second;
+    match rate_bps {
+        r if r < 35_000 => Some(8),
+        r if r < 50_000 => Some(12),
+        r if r < 68_000 => Some(16),
+        r if r < 84_000 => Some(18),
+        r if r < 102_000 => Some(19),
+        r if r <= 130_000 => Some(20),
+        _ => None,
+    }
+}
+
 /// The §5.3.3 coarse-energy prediction-mode decision: "it is best to
 /// try encoding the coarse energy both with and without inter-frame
 /// prediction such that the best prediction mode can be selected."
@@ -493,6 +620,91 @@ mod tests {
         assert!(low_band_stereo_correlation(&l, &vec![0.0; coded], lm, 0).is_none());
         assert!(low_band_stereo_correlation(&l[..span - 1], &r, lm, 0).is_none());
         assert!(low_band_stereo_correlation(&l, &r, 4, 0).is_none());
+    }
+
+    /// The §5.3.5 mid/side decision: correlated (dual-mono) content
+    /// picks mid-side (the side vector vanishes); hard-panned content
+    /// at LM=1 picks dual (`sqrt(2)*bins > bins + 5` at 40 bins); and
+    /// the decision is undefined off the full-band window.
+    #[test]
+    fn mid_side_decision_follows_l1_rule() {
+        let lm = 1u32;
+        let span: usize = BAND_BINS_LM[lm as usize][..MID_SIDE_DECISION_BANDS]
+            .iter()
+            .sum::<u32>() as usize;
+        let coded = 200usize;
+        let l: Vec<f32> = (0..coded)
+            .map(|i| ((i * 5 + 3) % 11) as f32 - 5.0)
+            .collect();
+
+        // Dual-mono: side = 0 ⇒ L1_ms = L1_lr / sqrt(2) ⇒ mid-side.
+        assert_eq!(choose_mid_side_stereo(&l, &l, lm, 0), Some(true));
+
+        // Hard-panned (right silent in the decision span): at LM=1,
+        // bins = 40 and E = 5, so sqrt(2)/45 > 1/40 ⇒ dual.
+        assert_eq!(span, 40);
+        let mut r = l.clone();
+        for v in r[..span].iter_mut() {
+            *v = 0.0;
+        }
+        assert_eq!(choose_mid_side_stereo(&l, &r, lm, 0), Some(false));
+
+        // Manual L1 evaluation agrees with the verdict on a mixed
+        // signal.
+        let r2: Vec<f32> = (0..coded).map(|i| ((i * 3 + 7) % 9) as f32 - 4.0).collect();
+        let mut l1_ms = 0.0f64;
+        let mut l1_lr = 0.0f64;
+        for i in 0..span {
+            let (a, b) = (f64::from(l[i]), f64::from(r2[i]));
+            l1_ms += ((a + b) / 2f64.sqrt()).abs() + ((a - b) / 2f64.sqrt()).abs();
+            l1_lr += a.abs() + b.abs();
+        }
+        let expected = l1_ms / (span as f64 + 5.0) < l1_lr / span as f64;
+        assert_eq!(choose_mid_side_stereo(&l, &r2, lm, 0), Some(expected));
+
+        // Undefined cases.
+        assert_eq!(choose_mid_side_stereo(&l, &r2, lm, 17), None);
+        assert_eq!(choose_mid_side_stereo(&l, &r2, 4, 0), None);
+        assert_eq!(choose_mid_side_stereo(&l[..span - 1], &r2, lm, 0), None);
+        let zeros = vec![0.0f32; coded];
+        assert_eq!(choose_mid_side_stereo(&zeros, &zeros, lm, 0), None);
+    }
+
+    /// The `E` term splits at LM=1/LM=2 per the §5.3.5 prose.
+    #[test]
+    fn mid_side_extra_dof_splits_at_lm_two() {
+        assert_eq!(mid_side_extra_dof(0), 5);
+        assert_eq!(mid_side_extra_dof(1), 5);
+        assert_eq!(mid_side_extra_dof(2), 13);
+        assert_eq!(mid_side_extra_dof(3), 13);
+    }
+
+    /// Table 66 rows, including the coarse-energy 80-bit subtraction,
+    /// the frame-duration scaling, and the 68–84 gap reading of the
+    /// RFC's "84-84" row.
+    #[test]
+    fn intensity_start_band_table_66() {
+        // lm=2 → 10 ms → 100 frames/s: kbps = (bits - 80) / 10.
+        let bits = |kbps: u32| 80 + kbps * 10;
+        assert_eq!(intensity_start_band(bits(30), 2), Some(8));
+        assert_eq!(intensity_start_band(bits(45), 2), Some(12));
+        assert_eq!(intensity_start_band(bits(60), 2), Some(16));
+        assert_eq!(intensity_start_band(bits(75), 2), Some(18));
+        assert_eq!(intensity_start_band(bits(90), 2), Some(19));
+        assert_eq!(intensity_start_band(bits(120), 2), Some(20));
+        assert_eq!(intensity_start_band(bits(200), 2), None);
+        // Exact boundaries: 35/50/68/84/102 land in the upper row,
+        // 130 is the last enabled rate.
+        assert_eq!(intensity_start_band(bits(35), 2), Some(12));
+        assert_eq!(intensity_start_band(bits(50), 2), Some(16));
+        assert_eq!(intensity_start_band(bits(130), 2), Some(20));
+        // The 80-bit coarse subtraction: an 80-bit frame rates 0.
+        assert_eq!(intensity_start_band(80, 2), Some(8));
+        // Frame-duration scaling: the same byte size rates twice as
+        // fast at half the frame duration.
+        assert_eq!(intensity_start_band(bits(30), 2), Some(8));
+        assert_eq!(intensity_start_band(bits(30), 1), Some(16)); // 60 kbps
+        assert_eq!(intensity_start_band(400, 4), None);
     }
 
     /// `choose_intra_mode` equals a manual two-pass cost comparison
