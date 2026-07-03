@@ -6,6 +6,36 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — PCM-consuming CELT frame encoder
+  (`pcm_encode` module: `CeltEncodeState` +
+  `encode_celt_frame_pcm[_auto]`):** the top of the encode stack — the
+  encoder now consumes real time-domain PCM instead of spectra,
+  closing the front-end gap the r382 encoder left. Chains §4.3.7.2
+  pre-emphasis (`Preemphasis`) → the §4.3.7 windowed forward MDCT +
+  coded-window extraction (`LongMdctAnalysis`) → the existing
+  spectrum-domain frame encoders, each stage the documented inverse of
+  the matching decode-stack stage. `CeltEncodeState` is the encode-side
+  mirror of `CeltDecodeState`: it carries the pre-emphasis FIR tap, the
+  MDCT analysis history, and the §4.3.2.1 coarse prediction across
+  frames (`reset()` zeroes all three); on **any** error the streaming
+  front-end state is left untouched so a failed frame cannot
+  desynchronize the stream. `encode_celt_frame_pcm_auto` →
+  `decode_celt_frame_auto` is now a fully self-contained **PCM → bytes
+  → PCM** codec loop (one frame of algorithmic delay, see the
+  `MdctAnalysis` latency contract). A signalled post-filter is
+  rejected: the §5.3.1 pitch pre-filter's period *search* is described
+  only as optimization criteria, so encoding the flag without applying
+  the pre-filter would mis-shape the decoded output. Validated by the
+  PCM encode → auto-decode loop at every `LM` (finite PCM, coarse
+  lockstep, prefix equality, multi-frame), byte-level determinism,
+  exact agreement with the manual stage-by-stage composition, the
+  reject-without-state-advance matrix (length / transient / silence /
+  post-filter / window), reset-restores-fresh-stream, and the
+  explicit-allocation variant round-tripping through
+  `decode_celt_frame`. +6 tests. Provenance: composition of existing
+  RFC-grounded modules; RFC 6716 §4.3.7.2 / §4.3.7 / §5.3 / §5.3.1.
+  No external library source consulted.
+
 * **Round-385 (2026-07-03) — long-MDCT analysis spine
   (`analysis` module: `LongMdctAnalysis` + `extract_coded_spectrum`):**
   the encode-direction mirror of the `synthesis` module.

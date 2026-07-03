@@ -291,6 +291,7 @@ pub mod frame_synthesis;
 pub mod hadamard;
 pub mod laplace;
 pub mod mdct;
+pub mod pcm_encode;
 pub mod post_filter;
 pub mod pulse_cache;
 pub mod pvq;
@@ -388,6 +389,7 @@ pub use mdct::{
     build_low_overlap_window_f32, build_window_half_f32, celt_window_f32, imdct_naive_f32,
     mdct_naive_f32, MdctAnalysis, MdctSynthesis, BASIC_WINDOW_HALF, BASIC_WINDOW_LEN,
 };
+pub use pcm_encode::{encode_celt_frame_pcm, encode_celt_frame_pcm_auto, CeltEncodeState};
 pub use post_filter::{
     apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,
     tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN,
