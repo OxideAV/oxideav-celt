@@ -384,7 +384,7 @@ pub use laplace::{
 };
 pub use mdct::{
     build_low_overlap_window_f32, build_window_half_f32, celt_window_f32, imdct_naive_f32,
-    mdct_naive_f32, MdctSynthesis, BASIC_WINDOW_HALF, BASIC_WINDOW_LEN,
+    mdct_naive_f32, MdctAnalysis, MdctSynthesis, BASIC_WINDOW_HALF, BASIC_WINDOW_LEN,
 };
 pub use post_filter::{
     apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,

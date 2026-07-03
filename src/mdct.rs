@@ -243,6 +243,97 @@ impl MdctSynthesis {
     }
 }
 
+/// Streaming windowed MDCT **analysis** state — the exact mirror of
+/// [`MdctSynthesis`] (RFC 6716 §4.3.7, encoder direction per §5.3:
+/// "the filters and rotations in the encoder are simply the inverse of
+/// the operation performed by the decoder").
+///
+/// Each call to [`MdctAnalysis::frame`] consumes `N` new input
+/// samples, forms the `2*N` transform block `[history | input]` (the
+/// previous call's `N` samples followed by the new ones — the sliding
+/// hop-`N` block layout the synthesis side overlap-adds at), applies
+/// the analysis window (the same power-complementary §4.3.7 window the
+/// synthesis side uses, per [PRINCEN86] weighted overlap-add), and
+/// runs the forward MDCT ([`mdct_naive_f32`]), emitting `N` spectral
+/// bins. The first call folds against a zero history (stream-open
+/// condition, the mirror of [`MdctSynthesis`]'s zero tail).
+///
+/// ## Latency contract
+///
+/// Feeding each emitted spectrum straight into
+/// [`MdctSynthesis::frame`] with the same window reconstructs the
+/// input exactly with **one frame (`N` samples) of algorithmic
+/// delay**: analysis call `t` transforms the block covering input
+/// frames `t-1` and `t`, and synthesis call `t` finishes exactly that
+/// block's first half — input frame `t-1`. §4.3.7 specifies only the
+/// decoder side; the one-frame-history buffering is the alignment
+/// under which the streaming pair realizes the [PRINCEN86]
+/// time-domain aliasing cancellation with no extra buffering on
+/// either side (pinned by the round-trip tests).
+#[derive(Debug, Clone)]
+pub struct MdctAnalysis {
+    /// Saved previous input frame (`N` samples) — the first half of
+    /// the next transform block.
+    history: Vec<f32>,
+}
+
+impl MdctAnalysis {
+    /// Create an analysis state for frame size (MDCT hop) `n`, with a
+    /// zero history.
+    pub fn new(n: usize) -> Self {
+        Self {
+            history: vec![0.0; n],
+        }
+    }
+
+    /// Frame size `N` this state was created for.
+    #[inline]
+    pub fn frame_size(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Zero the carried history (encoder reset, the mirror of the
+    /// §4.5.2 decoder reset).
+    pub fn reset(&mut self) {
+        self.history.iter_mut().for_each(|s| *s = 0.0);
+    }
+
+    /// Analyze one frame: form the `2*N` block `[history | input]`,
+    /// multiply by the `2*N`-sample analysis `window`, forward-MDCT it,
+    /// and write the `N` spectral bins into `out`. `input` becomes the
+    /// new history.
+    ///
+    /// Returns `false` (state and `out` untouched) when
+    /// `input.len() != N`, `window.len() != 2 * N`, or
+    /// `out.len() != N`.
+    pub fn frame(&mut self, input: &[f32], window: &[f32], out: &mut [f32]) -> bool {
+        let n = self.history.len();
+        if n == 0 || input.len() != n || window.len() != 2 * n || out.len() != n {
+            return false;
+        }
+        let mut block = vec![0.0f32; 2 * n];
+        for ((b, &x), &w) in block[..n]
+            .iter_mut()
+            .zip(self.history.iter())
+            .zip(window[..n].iter())
+        {
+            *b = x * w;
+        }
+        for ((b, &x), &w) in block[n..]
+            .iter_mut()
+            .zip(input.iter())
+            .zip(window[n..].iter())
+        {
+            *b = x * w;
+        }
+        if !mdct_naive_f32(&block, out) {
+            return false;
+        }
+        self.history.copy_from_slice(input);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +654,161 @@ mod tests {
         assert!(synth.frame(&spec, &w, &mut after_reset));
         for i in 0..n {
             assert!((after_reset[i] - out[i]).abs() <= 1e-7);
+        }
+    }
+
+    // ---- MdctAnalysis (encoder direction) ----
+
+    /// The streaming analysis matches the offline windowed forward
+    /// MDCT of the sliding `[history | input]` block, frame by frame.
+    #[test]
+    fn streaming_analysis_matches_offline_blocks() {
+        let n = 120usize;
+        let w = build_low_overlap_window_f32(n, n).expect("valid");
+        let x = test_signal(n * 4, 0x5EEDED);
+        let mut ana = MdctAnalysis::new(n);
+        assert_eq!(ana.frame_size(), n);
+        let mut spec = vec![0.0f32; n];
+        // Zero-history first frame, then sliding blocks.
+        let mut padded = vec![0.0f32; n];
+        padded.extend_from_slice(&x);
+        for t in 0..4 {
+            assert!(ana.frame(&x[t * n..(t + 1) * n], &w, &mut spec));
+            let windowed: Vec<f32> = (0..2 * n).map(|i| padded[t * n + i] * w[i]).collect();
+            let mut expected = vec![0.0f32; n];
+            assert!(mdct_naive_f32(&windowed, &mut expected));
+            for k in 0..n {
+                assert!(
+                    (spec[k] - expected[k]).abs() <= 1e-5,
+                    "frame {t} bin {k}: streaming {} vs offline {}",
+                    spec[k],
+                    expected[k]
+                );
+            }
+        }
+    }
+
+    /// The streaming analysis → synthesis pair is the identity with
+    /// exactly one frame (`N` samples) of delay — the [PRINCEN86]
+    /// time-domain aliasing cancellation through the §4.3.7 window
+    /// pair, full-overlap geometry.
+    #[test]
+    fn analysis_synthesis_round_trip_one_frame_delay_full_overlap() {
+        let n = BASIC_WINDOW_HALF;
+        let w = build_low_overlap_window_f32(n, n).expect("valid");
+        let x = test_signal(n * 6, 0xFEED01);
+        let mut ana = MdctAnalysis::new(n);
+        let mut synth = MdctSynthesis::new(n);
+        let mut spec = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+        let mut recovered = Vec::new();
+        for t in 0..6 {
+            assert!(ana.frame(&x[t * n..(t + 1) * n], &w, &mut spec));
+            assert!(synth.frame(&spec, &w, &mut out));
+            recovered.extend_from_slice(&out);
+        }
+        // Output frame t reconstructs input frame t-1: compare
+        // recovered[N..] against x[..5N].
+        for i in 0..5 * n {
+            assert!(
+                (recovered[n + i] - x[i]).abs() <= 1e-4,
+                "one-frame-delay PR broken at {i}: {} vs {}",
+                recovered[n + i],
+                x[i]
+            );
+        }
+    }
+
+    /// Same round-trip through the **low-overlap** window geometry
+    /// (N = 240, overlap 120 — one step of the §4.3.7 zero-pad + ones
+    /// construction).
+    #[test]
+    fn analysis_synthesis_round_trip_low_overlap() {
+        let n = 240usize;
+        let w = build_low_overlap_window_f32(n, 120).expect("valid");
+        let x = test_signal(n * 5, 0xA11CE5);
+        let mut ana = MdctAnalysis::new(n);
+        let mut synth = MdctSynthesis::new(n);
+        let mut spec = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+        let mut recovered = Vec::new();
+        for t in 0..5 {
+            assert!(ana.frame(&x[t * n..(t + 1) * n], &w, &mut spec));
+            assert!(synth.frame(&spec, &w, &mut out));
+            recovered.extend_from_slice(&out);
+        }
+        for i in 0..4 * n {
+            assert!(
+                (recovered[n + i] - x[i]).abs() <= 1e-4,
+                "low-overlap analysis/synthesis PR broken at {i}"
+            );
+        }
+    }
+
+    /// Analysis of a stream synthesized from known spectra recovers
+    /// those spectra with one frame of delay (the synthesis map is
+    /// injective on the window support, so the time-domain PR pins the
+    /// spectral round-trip too).
+    #[test]
+    fn analysis_recovers_synthesized_spectra() {
+        let n = 120usize;
+        let w = build_low_overlap_window_f32(n, n).expect("valid");
+        let spectra: Vec<Vec<f32>> = (0..5)
+            .map(|t| test_signal(n, 0xD1CE00 + t as u32))
+            .collect();
+        // Synthesize the stream.
+        let mut synth = MdctSynthesis::new(n);
+        let mut pcm = Vec::new();
+        let mut out = vec![0.0f32; n];
+        for spec in &spectra {
+            assert!(synth.frame(spec, &w, &mut out));
+            pcm.extend_from_slice(&out);
+        }
+        // Analyze it back: analysis frame t sees synthesis block t-1.
+        let mut ana = MdctAnalysis::new(n);
+        let mut recovered = vec![0.0f32; n];
+        for t in 0..5 {
+            assert!(ana.frame(&pcm[t * n..(t + 1) * n], &w, &mut recovered));
+            if t >= 1 {
+                // Steady state needs both halves of block t-1 present:
+                // block t-1's first half overlaps block t-2's tail, so
+                // from t = 2 the recovery is exact; t = 1 sees block 0
+                // whose first half folded against a zero tail.
+                if t >= 2 {
+                    for k in 0..n {
+                        assert!(
+                            (recovered[k] - spectra[t - 1][k]).abs() <= 1e-4,
+                            "spectral round-trip broken at frame {} bin {k}",
+                            t - 1
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bad shapes are rejected without touching the state; `reset()`
+    /// restores the fresh zero-history behaviour.
+    #[test]
+    fn streaming_analysis_rejects_bad_shapes_and_resets() {
+        let n = 16usize;
+        let w = build_low_overlap_window_f32(n, n).expect("valid");
+        let mut ana = MdctAnalysis::new(n);
+        let x = test_signal(n, 0xBEEF);
+        let mut spec = vec![0.0f32; n];
+        assert!(!ana.frame(&x[..n - 1], &w, &mut spec));
+        assert!(!ana.frame(&x, &w[..2 * n - 1], &mut spec));
+        assert!(!ana.frame(&x, &w, &mut spec[..n - 1]));
+        // First good frame from fresh state.
+        assert!(ana.frame(&x, &w, &mut spec));
+        let first = spec.clone();
+        // Second frame differs (history is now x).
+        assert!(ana.frame(&x, &w, &mut spec));
+        // reset() reproduces the fresh-state output.
+        ana.reset();
+        assert!(ana.frame(&x, &w, &mut spec));
+        for k in 0..n {
+            assert!((spec[k] - first[k]).abs() <= 1e-7);
         }
     }
 }

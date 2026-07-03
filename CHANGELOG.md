@@ -6,6 +6,29 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-385 (2026-07-03) — streaming windowed forward-MDCT analysis
+  (`MdctAnalysis`, the exact mirror of `MdctSynthesis`):** the second
+  stage of the PCM→MDCT front end. Each call consumes `N` new input
+  samples, forms the `2N` sliding transform block `[history | input]`
+  (hop `N`, one-frame history — the block layout the synthesis side
+  overlap-adds at), applies the same power-complementary §4.3.7 window
+  the synthesis side uses, and runs the forward MDCT
+  (`mdct_naive_f32`), emitting `N` spectral bins; the first call folds
+  against a zero history (the mirror of the synthesis zero tail).
+  Latency contract: analysis → synthesis through the same window is
+  the identity with exactly **one frame of delay** (analysis call `t`
+  transforms the block covering input frames `t-1`/`t`; synthesis call
+  `t` finishes that block's first half). Validated by
+  streaming-vs-offline block agreement, the one-frame-delay perfect
+  reconstruction through both the full-overlap and low-overlap window
+  geometries, spectral recovery of a stream synthesized from known
+  spectra, and the shape-rejection / reset guards. +5 tests.
+  Provenance: RFC 6716 §4.3.7 (window + transform + WOLA, decode side)
+  and §5.3 (the encoder performs the inverse); the one-frame-history
+  alignment is the documented encoder decision under which the
+  [PRINCEN86] TDAC round trip closes with no extra buffering. No
+  external library source consulted.
+
 * **Round-385 (2026-07-03) — §4.3.7.2 encoder-side *pre-emphasis*
   (`Preemphasis`, the exact FIR inverse of `Deemphasis`):** the first
   stage of the PCM→MDCT analysis front end. §4.3.7.2 writes the decoder
