@@ -536,9 +536,18 @@ fn encode_celt_frame_impl(
         }
     };
 
+    // §5.3.4.2 trim (auto mode): the spectral-tilt deviation over the
+    // analyzed window energies (no stereo term for mono). Explicit
+    // modes keep the safe default of 5.
+    let alloc_trim = if band_k.is_none() && !header.silence {
+        crate::encoder_decisions::choose_alloc_trim(&energy_target[0][start..end], None)
+    } else {
+        BandAllocation::defaults().alloc_trim
+    };
+
     // Table-56 prefix: header → coarse energy → TF (identity) → spread
     // (None) → boosts (§5.3.4.1 / caller-chosen, gate-truncated) →
-    // allocation (defaults).
+    // allocation (§5.3.4.2 trim, other fields at defaults).
     let mut enc = RangeEncoder::new();
     let spec = FramePrefixSpec {
         header: CeltFrameHeader {
@@ -553,7 +562,10 @@ fn encode_celt_frame_impl(
         },
         spread: Spread::None,
         target_boost,
-        allocation: BandAllocation::defaults(),
+        allocation: BandAllocation {
+            alloc_trim,
+            ..BandAllocation::defaults()
+        },
     };
     let prefix = encode_frame_prefix(
         &mut enc,
@@ -826,7 +838,8 @@ fn encode_stereo_celt_frame_impl(
 
     // §5.3.4.1 boosts (auto mode) over the per-band channel maximum: a
     // band poking out in either channel earns the boost.
-    let target_boost: Vec<i32> = if band_k.is_none() && !header.silence {
+    let auto_decisions = band_k.is_none() && !header.silence;
+    let target_boost: Vec<i32> = if auto_decisions {
         let max_energy: Vec<f32> = (start..end)
             .map(|b| energy_target[0][b].max(energy_target[1][b]))
             .collect();
@@ -834,6 +847,26 @@ fn encode_stereo_celt_frame_impl(
             .ok_or(Error::InvalidParameter)?
     } else {
         vec![0i32; coded_bands]
+    };
+
+    // §5.3.4.2 trim (auto mode): spectral tilt of the per-band mean of
+    // the two channels' log-energies, plus the stereo low-band
+    // correlation deviation (skipped for a window that codes no low
+    // bands). Explicit-allocation mode keeps the safe default (the
+    // caller's fixed allocations were budgeted against it).
+    let alloc_trim = if auto_decisions {
+        let mean_energy: Vec<f32> = (start..end)
+            .map(|b| 0.5 * (energy_target[0][b] + energy_target[1][b]))
+            .collect();
+        let corr = crate::encoder_decisions::low_band_stereo_correlation(
+            left_spectrum,
+            right_spectrum,
+            lm,
+            start,
+        );
+        crate::encoder_decisions::choose_alloc_trim(&mean_energy, corr)
+    } else {
+        BandAllocation::defaults().alloc_trim
     };
 
     // Table-56 prefix with the stereo channel count. The dual selector
@@ -854,6 +887,7 @@ fn encode_stereo_celt_frame_impl(
         spread: Spread::None,
         target_boost: &target_boost,
         allocation: BandAllocation {
+            alloc_trim,
             intensity_band_offset: coded_bands as u32,
             dual_stereo: true,
             ..BandAllocation::defaults()
@@ -1324,6 +1358,113 @@ mod tests {
             ),
             Err(Error::NotImplemented)
         ));
+    }
+
+    /// The §5.3.4.2 auto trim lands on the wire and stays in
+    /// lockstep: a low-heavy spectrum encodes trim 7, a high-heavy
+    /// spectrum trim 3, and a fully-correlated stereo signal pulls
+    /// the trim down by 4 — each read back verbatim by the decoder.
+    #[test]
+    fn auto_trim_lands_on_the_wire() {
+        use crate::derive_pulses::decode_celt_frame_auto;
+        use crate::frame_synthesis::{CeltDecodeState, StereoCeltDecodeState};
+
+        let lm = 2u32;
+        let total = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+        let header = CeltFrameHeader {
+            silence: false,
+            post_filter: None,
+            transient: false,
+            intra: true,
+            anti_collapse_on: None,
+        };
+
+        // Low-heavy mono: amplitudes falling steeply with frequency.
+        let mut spectrum = vec![0.0f32; total];
+        let mut offset = 0usize;
+        for band in 0..NUM_BANDS {
+            let n = band_bins(band, lm).unwrap() as usize;
+            let amp = 2.0f32.powf(-(band as f32)) + 1e-4;
+            for s in &mut spectrum[offset..offset + n] {
+                *s = amp;
+            }
+            offset += n;
+        }
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_celt_frame_auto(
+            &mut enc_state,
+            &spectrum,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        assert_eq!(frame.prefix.allocation.alloc_trim, 7, "low-heavy mono");
+        let mut dec_state = CeltDecodeState::new(lm).unwrap();
+        let decoded = decode_celt_frame_auto(&mut dec_state, &frame.bytes, 0, NUM_BANDS).unwrap();
+        assert_eq!(decoded.prefix.allocation.alloc_trim, 7);
+
+        // High-heavy mono: reverse the tilt.
+        let mut spectrum_hi = vec![0.0f32; total];
+        let mut offset = 0usize;
+        for band in 0..NUM_BANDS {
+            let n = band_bins(band, lm).unwrap() as usize;
+            let amp = 2.0f32.powf(band as f32 - 20.0) + 1e-4;
+            for s in &mut spectrum_hi[offset..offset + n] {
+                *s = amp;
+            }
+            offset += n;
+        }
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_celt_frame_auto(
+            &mut enc_state,
+            &spectrum_hi,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        assert_eq!(frame.prefix.allocation.alloc_trim, 3, "high-heavy mono");
+
+        // Fully-correlated flat stereo (identical channels): the
+        // stereo deviation pulls the flat-tilt default 5 down to 1.
+        // Equal per-band energy (each band's bins at 1/sqrt(N)) keeps
+        // the tilt exactly zero.
+        let mut flat = vec![0.0f32; total];
+        let mut offset = 0usize;
+        for band in 0..NUM_BANDS {
+            let n = band_bins(band, lm).unwrap() as usize;
+            let amp = 1.0 / (n as f32).sqrt();
+            for s in &mut flat[offset..offset + n] {
+                *s = amp;
+            }
+            offset += n;
+        }
+        let mut enc_state = CoarseEnergyState::new();
+        let frame = encode_stereo_celt_frame_auto(
+            &mut enc_state,
+            &flat,
+            &flat,
+            &header,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        assert_eq!(
+            frame.prefix.allocation.alloc_trim, 1,
+            "dual-mono stereo trim"
+        );
+        let mut dec_state = StereoCeltDecodeState::new(lm).unwrap();
+        let decoded = dec_state
+            .decode_stereo_frame_auto(&frame.bytes, 0, NUM_BANDS)
+            .unwrap();
+        assert_eq!(decoded.prefix.allocation.alloc_trim, 1);
     }
 
     // --- Dual-stereo frame encode/decode round trips ---

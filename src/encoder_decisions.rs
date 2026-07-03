@@ -1,5 +1,6 @@
-//! Encoder-side control decisions RFC 6716 §5.3.4 spells out in
-//! closed form — currently the §5.3.4.1 band-boost rule.
+//! Encoder-side control decisions from RFC 6716 §5.3 — the §5.3.4.1
+//! band-boost rule, the §5.3.4.2 allocation-trim decision, and the
+//! §5.3.3 intra/inter coarse-mode selection.
 //!
 //! ## §5.3.4.1 Band Boost
 //!
@@ -34,17 +35,47 @@
 //! everything from the bitstream, so any output of this rule stays in
 //! lockstep automatically.
 //!
-//! The §5.3.4.2 allocation-trim deviation ("the trim can deviate by
-//! +/- 2 depending on the spectral tilt") is **not** implemented: the
-//! RFC gives the direction and the bound but not the tilt→deviation
-//! map, so a closed-form transcription is not possible from the
-//! staged docs (documented docs gap; the safe default of 5 stands).
+//! ## §5.3.4.2 Allocation Trim
+//!
+//! > "The encoder starts with a safe 'default' of 5 and deviates
+//! > from that default in two different ways. First, the trim can
+//! > deviate by +/- 2 depending on the spectral tilt of the input
+//! > signal. For signals with more low frequencies, the trim is
+//! > increased by up to 2, while for signals with more high
+//! > frequencies, the trim is decreased by up to 2. For stereo
+//! > inputs, the trim value can be decreased by up to 4 when the
+//! > inter-channel correlation at low frequency (first 8 bands) is
+//! > high."
+//!
+//! The RFC pins the *envelope* of the decision — the default, both
+//! deviation directions, and both bounds — but not the exact
+//! tilt→deviation or correlation→deviation maps. Trim is pure
+//! encoder freedom (any coded value in `0..=10` keeps the decoder in
+//! lockstep — it reads the trim off the wire), so
+//! [`choose_alloc_trim`] fills the two maps with documented in-crate
+//! choices that stay inside the RFC's envelope:
+//!
+//! * **Tilt:** the least-squares slope of the per-band base-2
+//!   log-energy across the coded window (log-energy units per band
+//!   index). The deviation is `round(-slope * TRIM_TILT_GAIN)`
+//!   clamped to `-2..=2` — a *negative* slope (low-heavy signal)
+//!   raises the trim, a positive slope lowers it, saturating at
+//!   `|slope| >= 0.5` (3 dB per band) with `TRIM_TILT_GAIN = 4`.
+//! * **Stereo:** the deviation is `round(4 * r^2)` clamped to
+//!   `0..=4`, subtracted from the trim, where `r ∈ [0, 1]` is the
+//!   normalized inter-channel correlation over the first 8 coded
+//!   bands' MDCT bins ([`low_band_stereo_correlation`]). The
+//!   quadratic keeps weakly-correlated content from moving the trim;
+//!   `r = 1` (dual-mono) hits the full −4.
 //!
 //! ## Clean-room provenance
 //!
-//! RFC 6716 §5.3.4/§5.3.4.1 (`docs/audio/opus/rfc6716-opus.txt`) and
-//! the §4.3.3 dynalloc quantum already transcribed in
-//! [`crate::band_cap`]. No external library source was consulted.
+//! RFC 6716 §5.3.4/§5.3.4.1/§5.3.4.2
+//! (`docs/audio/opus/rfc6716-opus.txt`) and the §4.3.3 dynalloc
+//! quantum already transcribed in [`crate::band_cap`]. The tilt and
+//! correlation map constants are in-crate encoder freedom inside the
+//! §5.3.4.2 envelope, documented above. No external library source
+//! was consulted.
 
 use crate::band_minimums::BAND_BINS_LM;
 use crate::coarse_energy::NUM_BANDS;
@@ -119,6 +150,120 @@ pub fn choose_band_boosts(
         }
     }
     Some(out)
+}
+
+/// The tilt→deviation gain of the §5.3.4.2 trim map: the ±2 bound
+/// saturates at a spectral tilt of `2 / TRIM_TILT_GAIN = 0.5`
+/// log2-energy units per band (3 dB per band). An in-crate constant —
+/// the RFC pins the direction and the bound, not the map (see the
+/// module docs).
+pub const TRIM_TILT_GAIN: f32 = 4.0;
+
+/// The least-squares spectral-tilt slope of a per-band log-energy
+/// window, in base-2 log-energy units per band index.
+///
+/// This is the "spectral tilt of the input signal" measure feeding
+/// the §5.3.4.2 trim deviation: negative for low-heavy signals
+/// (energy falling with frequency), positive for high-heavy ones.
+/// Windows shorter than 2 bands have no defined tilt and return 0.
+pub fn spectral_tilt_slope(window_log_energy: &[f32]) -> f32 {
+    let n = window_log_energy.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let nf = n as f32;
+    let mean_x = (nf - 1.0) / 2.0;
+    let mean_y = window_log_energy.iter().sum::<f32>() / nf;
+    let mut num = 0.0f32;
+    let mut den = 0.0f32;
+    for (j, &e) in window_log_energy.iter().enumerate() {
+        let dx = j as f32 - mean_x;
+        num += dx * (e - mean_y);
+        den += dx * dx;
+    }
+    if den > 0.0 {
+        num / den
+    } else {
+        0.0
+    }
+}
+
+/// The normalized inter-channel correlation over the first 8 coded
+/// bands' MDCT bins — the "inter-channel correlation at low
+/// frequency (first 8 bands)" measure of the §5.3.4.2 stereo trim
+/// deviation.
+///
+/// `left` / `right` are the two channels' coded-window spectra (the
+/// band-contiguous layout the frame encoders consume, window starting
+/// at absolute band `start`); the correlation is `|<L, R>| /
+/// (||L|| * ||R||)` over the bins of absolute bands `0..8`, i.e. the
+/// first `sum(N[0..8])` bins — only defined for a window with
+/// `start == 0` (a Hybrid window codes no low bands, so the stereo
+/// deviation does not apply there).
+///
+/// Returns `None` when `start != 0`, `lm > 3`, either spectrum is
+/// shorter than the low-band span, or either channel has zero
+/// low-band energy (no direction to correlate). The result is in
+/// `[0, 1]`.
+pub fn low_band_stereo_correlation(
+    left: &[f32],
+    right: &[f32],
+    lm: u32,
+    start: usize,
+) -> Option<f32> {
+    if start != 0 || lm > 3 {
+        return None;
+    }
+    let span: u32 = BAND_BINS_LM[lm as usize][..8].iter().sum();
+    let span = span as usize;
+    if left.len() < span || right.len() < span {
+        return None;
+    }
+    let mut dot = 0.0f64;
+    let mut ll = 0.0f64;
+    let mut rr = 0.0f64;
+    for (l, r) in left[..span].iter().zip(&right[..span]) {
+        dot += f64::from(*l) * f64::from(*r);
+        ll += f64::from(*l) * f64::from(*l);
+        rr += f64::from(*r) * f64::from(*r);
+    }
+    if ll <= 0.0 || rr <= 0.0 {
+        return None;
+    }
+    Some((dot.abs() / (ll.sqrt() * rr.sqrt())).min(1.0) as f32)
+}
+
+/// The §5.3.4.2 allocation-trim decision.
+///
+/// Starts from the safe default of 5 and applies the two RFC-pinned
+/// deviations (see the module docs for the in-crate maps):
+///
+/// * `+/-2` from the spectral tilt of `window_log_energy` (the coded
+///   window's per-band base-2 log-energies —
+///   [`spectral_tilt_slope`]): low-heavy signals raise the trim,
+///   high-heavy signals lower it.
+/// * up to `-4` from a high low-frequency inter-channel correlation
+///   (`stereo_low_band_correlation`, the
+///   [`low_band_stereo_correlation`] output; pass `None` for mono or
+///   when the window codes no low bands).
+///
+/// The result is clamped to the legal `0..=10` field range. Trim is
+/// encoder freedom: whatever this returns is coded on the wire and
+/// read back by the decoder, so lockstep holds for any output.
+pub fn choose_alloc_trim(
+    window_log_energy: &[f32],
+    stereo_low_band_correlation: Option<f32>,
+) -> u8 {
+    let slope = spectral_tilt_slope(window_log_energy);
+    let tilt_dev = (-slope * TRIM_TILT_GAIN).round().clamp(-2.0, 2.0) as i32;
+    let stereo_dev = match stereo_low_band_correlation {
+        Some(r) => {
+            let r = r.clamp(0.0, 1.0);
+            (4.0 * r * r).round().clamp(0.0, 4.0) as i32
+        }
+        None => 0,
+    };
+    (5 + tilt_dev - stereo_dev).clamp(0, 10) as u8
 }
 
 /// The §5.3.3 coarse-energy prediction-mode decision: "it is best to
@@ -263,6 +408,91 @@ mod tests {
         let boosts = choose_band_boosts(&window, 3, 17, NUM_BANDS).unwrap();
         let n = BAND_BINS_LM[3][18];
         assert_eq!(boosts, vec![0, 2 * boost_quanta_8th(n), 0, 0]);
+    }
+
+    /// A flat envelope has zero tilt and lands on the §5.3.4.2 safe
+    /// default of 5, mono and stereo-uncorrelated alike.
+    #[test]
+    fn trim_flat_envelope_is_default() {
+        let flat = vec![1.5f32; NUM_BANDS];
+        assert_eq!(spectral_tilt_slope(&flat), 0.0);
+        assert_eq!(choose_alloc_trim(&flat, None), 5);
+        assert_eq!(choose_alloc_trim(&flat, Some(0.0)), 5);
+        // Degenerate windows: no defined tilt.
+        assert_eq!(choose_alloc_trim(&[], None), 5);
+        assert_eq!(choose_alloc_trim(&[3.0], None), 5);
+    }
+
+    /// The tilt deviation follows the §5.3.4.2 directions — low-heavy
+    /// raises the trim, high-heavy lowers it — and saturates at ±2.
+    #[test]
+    fn trim_tilt_direction_and_bound() {
+        // Gentle low-heavy tilt (slope -0.25): +1.
+        let gentle_low: Vec<f32> = (0..NUM_BANDS).map(|b| 4.0 - 0.25 * b as f32).collect();
+        assert_eq!(choose_alloc_trim(&gentle_low, None), 6);
+        // Steep low-heavy tilt (slope -1.0): saturates at +2.
+        let steep_low: Vec<f32> = (0..NUM_BANDS).map(|b| 10.0 - b as f32).collect();
+        assert_eq!(choose_alloc_trim(&steep_low, None), 7);
+        // Gentle high-heavy tilt: -1.
+        let gentle_high: Vec<f32> = (0..NUM_BANDS).map(|b| 0.25 * b as f32).collect();
+        assert_eq!(choose_alloc_trim(&gentle_high, None), 4);
+        // Steep high-heavy tilt: saturates at -2.
+        let steep_high: Vec<f32> = (0..NUM_BANDS).map(|b| b as f32).collect();
+        assert_eq!(choose_alloc_trim(&steep_high, None), 3);
+    }
+
+    /// The stereo deviation subtracts up to 4 for fully-correlated
+    /// low bands, is quadratic (weak correlation barely moves it),
+    /// and the final trim clamps into `0..=10`.
+    #[test]
+    fn trim_stereo_deviation_and_clamp() {
+        let flat = vec![1.0f32; NUM_BANDS];
+        assert_eq!(choose_alloc_trim(&flat, Some(1.0)), 1); // 5 - 4
+        assert_eq!(choose_alloc_trim(&flat, Some(0.5)), 4); // 4*0.25 = 1
+        assert_eq!(choose_alloc_trim(&flat, Some(0.2)), 5); // ~0.16 rounds to 0
+                                                            // Steep high tilt + full correlation: 5 - 2 - 4 = -1 → clamp 0.
+        let steep_high: Vec<f32> = (0..NUM_BANDS).map(|b| b as f32).collect();
+        assert_eq!(choose_alloc_trim(&steep_high, Some(1.0)), 0);
+        // Out-of-range correlation input saturates safely.
+        assert_eq!(choose_alloc_trim(&flat, Some(7.0)), 1);
+    }
+
+    /// `low_band_stereo_correlation` measures the first-8-bands span:
+    /// identical channels score 1, orthogonal low bands score 0, a
+    /// Hybrid window (start != 0) and degenerate inputs return None.
+    #[test]
+    fn low_band_correlation_measure() {
+        let lm = 1u32;
+        let span: usize = BAND_BINS_LM[lm as usize][..8].iter().sum::<u32>() as usize;
+        let coded = 200usize; // 100 << lm
+        let l: Vec<f32> = (0..coded)
+            .map(|i| ((i * 7 + 1) % 13) as f32 - 6.0)
+            .collect();
+        let mut r = l.clone();
+        // Identical channels: r = 1 (higher bands may differ freely).
+        for v in r[span..].iter_mut() {
+            *v = -*v;
+        }
+        let c = low_band_stereo_correlation(&l, &r, lm, 0).unwrap();
+        assert!((c - 1.0).abs() < 1e-6, "identical low bands: {c}");
+        // Anti-correlated low bands still score |r| = 1 (sign-blind).
+        for i in 0..span {
+            r[i] = -l[i];
+        }
+        let c = low_band_stereo_correlation(&l, &r, lm, 0).unwrap();
+        assert!((c - 1.0).abs() < 1e-6, "sign-blind correlation: {c}");
+        // Orthogonal low bands: r = 0. Build right as an exact
+        // orthogonal permutation-with-signs of left over an even span.
+        for i in 0..span {
+            r[i] = if i % 2 == 0 { l[i + 1] } else { -l[i - 1] };
+        }
+        let c = low_band_stereo_correlation(&l, &r, lm, 0).unwrap();
+        assert!(c.abs() < 1e-6, "orthogonal low bands: {c}");
+        // Hybrid window / zero-energy channel / short slice: None.
+        assert!(low_band_stereo_correlation(&l, &r, lm, 17).is_none());
+        assert!(low_band_stereo_correlation(&l, &vec![0.0; coded], lm, 0).is_none());
+        assert!(low_band_stereo_correlation(&l[..span - 1], &r, lm, 0).is_none());
+        assert!(low_band_stereo_correlation(&l, &r, 4, 0).is_none());
     }
 
     /// `choose_intra_mode` equals a manual two-pass cost comparison

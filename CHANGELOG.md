@@ -6,6 +6,25 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-389 (2026-07-04) — §5.3.4.2 allocation-trim decision
+  (`choose_alloc_trim` + `spectral_tilt_slope` +
+  `low_band_stereo_correlation`), wired through the auto encoders:**
+  the third §5.3.4 encoder decision. The RFC pins the decision's
+  envelope — default 5, ±2 from the spectral tilt (low-heavy raises,
+  high-heavy lowers), up to −4 for high low-frequency (first 8 bands)
+  inter-channel correlation — but not the exact maps; the in-crate
+  maps (least-squares log-energy slope × `TRIM_TILT_GAIN = 4`
+  saturating at 3 dB/band; `round(4·r²)` on the normalized low-band
+  correlation) are documented encoder freedom inside that envelope
+  (trim is coded on the wire, so lockstep holds for any value). The
+  mono auto encoders apply the tilt term; the stereo auto encoders
+  add the correlation term over the two coded spectra (skipped on
+  Hybrid windows, which code no low bands). Pinned by direction /
+  saturation / clamp unit tests, the sign-blind + orthogonal
+  correlation measure, and a wire-level test (low-heavy mono → trim 7,
+  high-heavy → 3, dual-mono stereo → 1, each decoded back verbatim).
+  +5 tests.
+
 * **Round-389 (2026-07-04) — stereo PCM codec loop
   (`StereoCeltEncodeState`, `encode_stereo_celt_frame_pcm[_auto]`):**
   the top of the stereo encode stack. The streaming state wraps the

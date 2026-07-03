@@ -364,7 +364,8 @@ pub use e_prob_model::{
     PRED_INTRA,
 };
 pub use encoder_decisions::{
-    boost_quanta_8th, boost_thresholds, choose_band_boosts, choose_intra_mode,
+    boost_quanta_8th, boost_thresholds, choose_alloc_trim, choose_band_boosts, choose_intra_mode,
+    low_band_stereo_correlation, spectral_tilt_slope, TRIM_TILT_GAIN,
 };
 pub use fine_energy::{
     decode_fine_energy, decode_fine_energy_band, encode_fine_energy, encode_fine_energy_band,
