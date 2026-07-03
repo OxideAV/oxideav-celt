@@ -65,13 +65,15 @@ docs-gap boundaries, the same shape the mono path keeps for `band_k`.
 Not yet implemented: the §4.3.3 reallocation loop that produces
 `band_k` / `fine_bits` (concurrent skip decoding + fine/shape split),
 the §4.3.4.4 split-gain band-split path, the §4.3.4.4 stereo `itheta`
-mid/side bitstream coupling, the main §4.3.2.2 fine-energy per-channel
-interleave, the transient short-block time-domain reassembly
-(§4.3.1 / §4.3.7), and the §4.3.5 anti-collapse injection — each blocked
-on detail that RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.1 / §4.3.7 / §4.3.5 and
-the clean-room narrative §2.7 defer to the reference implementation.
-Both `decode_celt_frame` and `decode_stereo_frame` reject a transient
-frame with `Error::NotImplemented` rather than mis-decode it.
+mid/side bitstream coupling (the r389 stereo codec uses the uncoupled
+dual path instead — see below), the transient short-block time-domain
+reassembly (§4.3.1 / §4.3.7), and the §4.3.5 anti-collapse injection —
+each blocked on detail that RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.1 /
+§4.3.7 / §4.3.5 and the clean-room narrative §2.7 defer to the
+reference implementation. Every frame decoder rejects a transient
+frame with `Error::NotImplemented` rather than mis-decode it, and the
+stereo decoders reject a joint-coded (non-dual) or intensity-coded
+prefix the same way.
 
 **End-to-end mono frame encode (spectrum → bytes → PCM), r382.** The
 encode direction now closes the loop: `encode_celt_frame` chains §4.3.6
@@ -168,9 +170,98 @@ signal (steady-state relative L2 error < 0.8, correlation > 0.6 with
 no fine bits spent), and spectral closure (re-analyzing the decoded
 PCM recovers the encoder's reconstructed spectra one frame delayed).
 Remaining encode-side gaps: the codec-registration entry point, the
-§5.3.1 pitch pre-filter (period search unspecified), transient
-(short-block) analysis (§4.3.1 geometry docs gap), and the §5.3.4.2
-trim map.
+§5.3.1 pitch pre-filter (period search unspecified), and transient
+(short-block) analysis (§4.3.1 geometry docs gap).
+
+**Stereo PCM codec loop (dual/uncoupled path), r389.** The stereo
+dimension now closes the same loop the mono side closed in r385:
+`encode_stereo_celt_frame_pcm_auto` →
+`StereoCeltDecodeState::decode_stereo_frame_auto` is a fully
+self-contained **interleaved stereo PCM → bytes → PCM** codec, with
+no out-of-band data. The wire is the RFC 6716 Table-56 stereo layout
+over the *uncoupled* path ("dual stereo: encodes the left and right
+channels separately"):
+
+* the stereo prefix (both channels' §4.3.2.1 coarse energy — the
+  within-band channel interleave the RFC *does* specify — plus the
+  `dual = 1` and intensity-"never applies" selectors; a frame whose
+  §4.3.3 budget gates cannot carry them is rejected with
+  `NotImplemented` rather than mis-encoded as the joint layout,
+  which is the §4.3.4.4 docs gap);
+* §4.3.2.2 fine energy walked band-major, channel 0 then channel 1
+  within each band — an in-crate wire convention mirroring the
+  specified coarse interleave (the RFC does not pin the main
+  fine-energy channel order; interop caveat, like the silence-frame
+  caveat);
+* the dual residual (`decode_stereo_residual_bands` /
+  `encode_stereo_celt_frame`): one PVQ index per channel per band at
+  a **shared** `K`, shared spread/TF (Table 56 codes one of each per
+  frame), each channel denormalized against its own §4.3.2 envelope;
+* the shared `K` derived on both sides from the bit-identical prefix
+  (`derive_band_pulses_dual`: the §4.3.3 combined column search with
+  the stereo scaling, each band's allocation split evenly per
+  channel, one §4.3.4.1 bits-to-pulses pass).
+
+`StereoCeltEncodeState` carries the per-channel front end
+(`StereoPcmAnalysis`) plus the shared two-channel coarse prediction;
+`tests/stereo_pcm_codec_loop.rs` pins the loop at every `LM` (coarse
+lockstep, decoded PCM ≡ synthesis of the encoder's bit-exact
+per-channel reconstructions), per-channel waveform fidelity on
+distinct L/R tones (relative L2 < 0.8, correlation > 0.6, channels
+unswapped), a stereo silence run decaying in lockstep, byte
+determinism + reset, and the explicit-allocation
+(`decode_stereo_frame_coded`) round trip.
+
+**Allocation-seam correctness fixes, r389.** Driving two PVQ indices
+per band exposed two latent mono-era defects, both fixed:
+
+* the §4.3.4.1 band loops updated the balance accumulator with the
+  *adjusted* target, double-counting the granted share (surplus never
+  depleted; aggregate spend could exceed the §4.3.3 budget). They now
+  update with the raw target per `BalanceAccumulator::update`'s
+  documented contract, restoring `sum(bits_used) <= sum(raw_target)`
+  (new conservation property test);
+* the pulse derivations now cap the arithmetic §4.3.3 budget by the
+  re-measured wire remainder
+  (`FramePrefix::{tell_frac_after_prefix, frame_bytes}`; the
+  arithmetic budget never pays for the boost/trim/skip/intensity/dual
+  symbols themselves) and run on the §4.1.5 worst-case `dec_uint`
+  cost estimator instead of the staged `cache_bits50` curve — the
+  staged cache's `band*5 + LM` mapping prices some symbols far below
+  their measured wire cost (a 2-bin band's `K = 40` index at 7
+  eighth-bits vs ~59 measured) and its run-sharing table assigns
+  (band, LM) tuples of different `N` to one cost curve, which no
+  `(N, K)` cache can satisfy (docs question filed against
+  `docs/audio/opus/pulse-cache-format-trace.md` §2). The estimator
+  never under-prices, so the encoded frame provably fits its byte
+  budget at every `LM`, mono and stereo.
+
+**§5.3 encoder decisions, r389.** Alongside the r385 §5.3.4.1 boost
+rule and §5.3.3 intra/inter selection, the crate now carries:
+
+* `choose_alloc_trim` (§5.3.4.2), wired through the mono and stereo
+  auto encoders: default 5, ±2 from the least-squares spectral tilt
+  (low-heavy raises, high-heavy lowers; `TRIM_TILT_GAIN = 4`,
+  saturating at 3 dB/band), and up to −4 from the normalized
+  first-8-bands inter-channel correlation (`round(4·r²)`) on stereo
+  frames. The RFC pins the envelope (default, directions, bounds) but
+  not the maps — the maps are documented in-crate encoder freedom,
+  and the coded trim keeps the decoder in lockstep by construction.
+* `choose_mid_side_stereo` (§5.3.5): the literal
+  `L1_ms/(bins+E) < L1_lr/bins` verdict over the first 13 bands
+  (`E = 13` for `LM > 1`, else 5; orthonormal `(l±r)/√2` rotation
+  documented as the in-crate scaling reading). Decision-only: the
+  encoders can honour just the dual verdict until the §4.3.4.4
+  `itheta` gap closes (§5.3.5 sanctions either choice on any frame).
+* `intensity_start_band` (§5.3.5 Table 66): the bitrate→first-
+  intensity-band map with the 80-bit/frame coarse subtraction; the
+  RFC's printed "84-84" row is read as the 68–84 gap it leaves
+  (apparent erratum). Decision-only for the same reason.
+
+The §5.3.1 encoder-side post-filter (pitch pre-filter) decision
+remains a docs gap: the RFC gives only optimization criteria
+(continuity, avoidance of pitch multiples), not a period search, so
+the PCM encoders keep rejecting a signalled post-filter.
 
 **Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
 the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps

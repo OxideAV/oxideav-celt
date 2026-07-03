@@ -2,6 +2,29 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-07-04):** round-389. The **stereo PCM codec loop**
+//! closes over the uncoupled (Table 56 `dual`) path:
+//! [`encode_stereo_celt_frame_pcm_auto`] →
+//! [`StereoCeltDecodeState::decode_stereo_frame_auto`] is a fully
+//! self-contained interleaved stereo PCM → bytes → PCM codec with no
+//! out-of-band data — stereo Table-56 prefix (both channels' coarse
+//! energy + the dual/intensity selectors), band-major channel-minor
+//! fine energy, one PVQ index per channel per band at a shared `K`
+//! derived on both sides from the bit-identical prefix
+//! ([`derive_band_pulses_dual`]), per-channel §4.3.6 → §4.3.7.2
+//! synthesis. Two latent §4.3.4.1/§4.3.3 defects fixed on the way:
+//! the balance accumulator no longer double-counts the granted share
+//! (aggregate spend now conserves under the raw-target budget), and
+//! the pulse derivations cap the arithmetic budget by the re-measured
+//! wire remainder + run on the §4.1.5 worst-case cost estimator (the
+//! staged `cache_bits50` mapping is inconsistent — docs question
+//! filed). §5.3 encoder decisions grew the §5.3.4.2 allocation trim
+//! (wired through the auto encoders) and the §5.3.5 mid/side-vs-dual
+//! and Table-66 intensity threshold helpers (decision-only until the
+//! §4.3.4.4 `itheta` gap closes). The joint (`itheta`) stereo
+//! coupling, transient short blocks, anti-collapse, and the §5.3.1
+//! pitch search stay documented docs gaps.
+//!
 //! **Status (2026-06-21):** round-356. The frame-decode → PCM
 //! orchestrator now covers the **stereo** dimension:
 //! [`StereoCeltDecodeState::decode_stereo_frame`] decodes the stereo
