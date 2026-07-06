@@ -400,3 +400,54 @@ fn stereo_pcm_rejections_and_explicit_variant() {
     assert_eq!(enc2.coarse_energy().energy, dec.coarse_energy().energy);
     assert_eq!(frame.envelope_q8, decoded.envelope_q8);
 }
+
+/// **Stereo budget fit is rigorous across byte budgets and frame
+/// sizes.** The dual wire codes two PVQ symbols per band, so the
+/// §4.3.4.1 derivation provisions two eighth-bits per band against
+/// the measured one-eighth-bit-per-symbol `enc_uint` overshoot; every
+/// stereo frame must fit its exact byte budget across the ladder.
+/// (A budget whose gates cannot carry the stereo selectors is
+/// rejected up front with `NotImplemented` — the documented §4.3.4.4
+/// dual/intensity gate boundary — which the sweep records as a legal
+/// outcome for that rung; what it must never see is an overflow.)
+#[test]
+fn stereo_quantized_loop_fits_across_byte_budgets() {
+    for lm in 0..=3u32 {
+        let n = 120usize << lm;
+        for &frame_bytes in &[32u32, 48, 64, 96, 128, 160, 200] {
+            let input = test_signal(3 * 2 * n, 0xACE5 + lm * 733 + frame_bytes);
+            let mut enc = StereoCeltEncodeState::new(lm).unwrap();
+            let mut dec = StereoCeltDecodeState::new(lm).unwrap();
+            for t in 0..3 {
+                let header = plain_header(t == 0);
+                let frame = match encode_stereo_celt_frame_pcm_auto(
+                    &mut enc,
+                    &input[t * 2 * n..(t + 1) * 2 * n],
+                    &header,
+                    frame_bytes,
+                    0,
+                    NUM_BANDS,
+                ) {
+                    Ok(f) => f,
+                    Err(oxideav_celt::Error::NotImplemented) => {
+                        // The stereo gate rejection: legal at tight
+                        // budgets; the streaming state is untouched,
+                        // so the sweep just moves on.
+                        continue;
+                    }
+                    Err(e) => {
+                        panic!("lm={lm} bytes={frame_bytes} frame {t}: stereo encode failed: {e:?}")
+                    }
+                };
+                assert_eq!(frame.bytes.len(), frame_bytes as usize);
+                let decoded = dec
+                    .decode_stereo_frame_auto(&frame.bytes, 0, NUM_BANDS)
+                    .unwrap_or_else(|e| {
+                        panic!("lm={lm} bytes={frame_bytes} frame {t}: stereo decode failed: {e:?}")
+                    });
+                assert_eq!(decoded.pcm.len(), 2 * n);
+                assert!(decoded.pcm.iter().all(|s| s.is_finite()));
+            }
+        }
+    }
+}

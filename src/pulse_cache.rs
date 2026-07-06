@@ -294,6 +294,91 @@ pub fn cached_bits_to_pulses(band: usize, lm: usize, budget_8th: u32) -> Option<
     Some(best)
 }
 
+/// Largest `K` the extended (beyond-`maxK`) inversion will probe —
+/// matches [`crate::bits_to_pulses::K_SEARCH_CAP`] so the extended
+/// walk has the same deterministic worst case as the estimator loop
+/// it supersedes.
+pub const EXTENDED_K_CAP: u32 = 128;
+
+/// The exact monolithic PVQ index cost `ceil(8 * log2(V(N, K)))` in
+/// 1/8-bit units, or `None` when the codebook saturates the 32-bit
+/// bound ([`V_COUNT_SATURATION`](crate::pvq::V_COUNT_SATURATION)).
+///
+/// `K = 0` costs zero. Powers of two evaluate exactly; other sizes
+/// use f64 (`log2` error ~1e-13, far below the ~2.8e-5 nearest
+/// integer approach verified offline over the cached region with
+/// exact big-integer arithmetic). Both codec sides call the same
+/// function, so allocation lockstep is bit-exact by construction even
+/// in a hypothetical misceil corner.
+pub fn cost_exact_8th(n: u32, k: u32) -> Option<u32> {
+    use crate::pvq::{v_count, V_COUNT_SATURATION};
+    if k == 0 {
+        return Some(0);
+    }
+    let v = v_count(n, k);
+    if v == V_COUNT_SATURATION {
+        return None;
+    }
+    if v <= 1 {
+        return Some(0);
+    }
+    if v.is_power_of_two() {
+        return Some(8 * v.trailing_zeros());
+    }
+    Some((8.0 * f64::from(v).log2()).ceil() as u32)
+}
+
+/// Invert a per-band 1/8-bit budget into the largest `K` whose cost
+/// does not exceed it — the cached walk of [`cached_bits_to_pulses`]
+/// **extended past the run's `maxK`** with exact monolithic pricing,
+/// for the in-crate single-block wire that codes one PVQ index per
+/// band at any representable `K` (no §4.3.4.4 split).
+///
+/// Above `maxK` the reference would split the band, so the cache
+/// stops there; this crate's documented wire instead codes the
+/// monolithic index (both sides derive the same `K` from the
+/// bit-identical prefix). The extension prices `K > maxK` at
+/// `max(ceil(8*log2 V(N, K)), retrieved cost at maxK)` — the exact
+/// monolithic cost floored by the cache's splitting-aware `maxK`
+/// value so the priced curve stays monotone across the seam — and
+/// walks until the budget, the 32-bit codebook bound, or
+/// [`EXTENDED_K_CAP`] stops it.
+///
+/// `n` must be the band's Table-55 size at `lm` (the caller already
+/// holds it); it is only used for the extension pricing. Returns
+/// `None` for out-of-range `(band, LM)`.
+pub fn cached_bits_to_pulses_extended(
+    band: usize,
+    lm: usize,
+    n: u32,
+    budget_8th: u32,
+) -> Option<CachedPulses> {
+    let base = cached_bits_to_pulses(band, lm, budget_8th)?;
+    let off = cache_offset(band, lm)?;
+    let max_k = u32::from(CACHE_BITS50[off]);
+    if base.k < max_k {
+        return Some(base);
+    }
+    // The cached walk reached maxK with budget to spare: continue on
+    // the exact monolithic curve, floored at the maxK retrieved cost.
+    let floor_cost = u32::from(CACHE_BITS50[off + max_k as usize]) + 1;
+    let mut best = base;
+    for k in (max_k + 1)..=EXTENDED_K_CAP {
+        let Some(exact) = cost_exact_8th(n, k) else {
+            break; // codebook saturates: the hard representability wall
+        };
+        let cost = exact.max(floor_cost);
+        if cost > budget_8th {
+            break;
+        }
+        best = CachedPulses {
+            k,
+            bits_used_8th: cost,
+        };
+    }
+    Some(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -19,33 +19,30 @@
 //!   concurrent skip decoding and the fine-energy-vs-shape split — are a
 //!   documented docs gap.
 //!
-//! ## Cost model: worst-case estimator, not the staged cache
+//! ## Cost model: the bit-exact pulse cache (corrected LM-major trace)
 //!
-//! The bits-to-pulses search here runs on the **§4.1.5 worst-case
-//! `dec_uint` cost estimator**
-//! ([`cost_log2_v_count_8th`](crate::bits_to_pulses::cost_log2_v_count_8th)),
-//! not the staged `cache_bits50` curve. Two reasons:
-//!
-//! * **Budget safety.** The estimator never under-prices a symbol
-//!   (`ceil(log2 V(N, K))` is an upper bound on the range coder's
-//!   actual `tell_frac` delta for the §4.1.5 split decode), and the
-//!   band loop's search rounds *down* ("does not exceed"), so the sum
-//!   of true wire costs telescopes under the sum of targets — the
-//!   encoded frame provably fits its byte budget. A stereo frame
-//!   writes two PVQ indices per band, doubling any per-symbol
-//!   mis-pricing, so this bound is load-bearing there.
-//! * **The staged cache mapping is inconsistent.** Driving the same
-//!   loop from `cache_bits50` (via the
-//!   `docs/audio/opus/pulse-cache-format-trace.md` §2 `band*5 + LM`
-//!   index mapping) prices some symbols far below their measured wire
-//!   cost — e.g. a 2-bin band's `K = 40` index (`V(2,40) = 160`,
-//!   ~7.3 bits on the wire) at 7 *eighth*-bits — which over-inflates
-//!   the derived `K` until the frame overruns its byte budget. The
-//!   trace's run-sharing table also assigns (band, LM) tuples of
-//!   *different* `N` to a single cost curve, which no per-`(N, K)`
-//!   cost cache can satisfy; the mapping (or the trace's reading of
-//!   it) is a documented docs question. Until it is resolved, the
-//!   worst-case estimator is the honest documented cost model.
+//! The bits-to-pulses search here runs on the **bit-exact
+//! `cache_index50` / `cache_bits50` cost curves**
+//! ([`bits_to_pulses_band_loop_cached`]) under the corrected LM-major
+//! index mapping (`docs/audio/opus/pulse-cache-format-trace.md`,
+//! corrected per issue #184) with the trace §2.3 `qbits[K] + 1`
+//! retrieval convention. This replaces the r389 §4.1.5 worst-case
+//! `dec_uint` estimator, which the earlier (band-major) reading of the
+//! trace had forced: under that reading the cache priced some symbols
+//! far below their wire cost (a 2-bin band's `K = 40` index at 7
+//! eighth-bits vs ~59 monolithic) and mixed band sizes onto single
+//! cost curves. The corrected mapping resolves both defects, and the
+//! budget-safety property transfers: the retrieved cost
+//! `qbits[K] + 1` never under-prices the monolithic
+//! `ceil(8*log2 V(N, K))` index cost (exact for `K <= 16`; the
+//! high-`K` surplus is the splitting-aware accounting) — proven
+//! against this crate's own `V(N, K)` combinatorics in the
+//! `pulse_cache` validation tests — while pricing up to 7 eighth-bits
+//! *tighter* than the whole-bit estimator, so the same budget buys
+//! more pulses without overrunning the frame. The cached walk also
+//! caps each band's `K` at the run's `maxK` (the cached pulse
+//! ceiling), which keeps every derived codebook `u32`-representable
+//! by construction.
 //!
 //! [`derive_band_pulses`] composes the **documented** parts into the
 //! single derivation the residual loop's `band_k` input wants: from a
@@ -87,7 +84,7 @@
 
 use crate::alloc_combine::find_combined_alloc;
 use crate::band_minimums::BAND_BINS_LM;
-use crate::bits_to_pulses::{bits_to_pulses_band_loop, cost_log2_v_count_8th};
+use crate::bits_to_pulses::bits_to_pulses_band_loop_cached;
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::frame_decode::{decode_frame_prefix, FramePrefix};
 use crate::frame_synthesis::{decode_celt_frame, CeltDecodeState, DecodedFrame};
@@ -124,6 +121,19 @@ fn shape_budget_1_8th(prefix: &FramePrefix) -> i64 {
     let wire = i64::from(prefix.frame_bytes) * 64 - i64::from(prefix.tell_frac_after_prefix) - 1;
     arithmetic.min(wire.max(0))
 }
+
+/// Per-coded-PVQ-symbol budget provision in 1/8 bits.
+///
+/// The bit-exact cache prices a `K`-pulse index at
+/// `ceil(8*log2 V(N, K))` in its exact-identity region, but the §5.1.4
+/// `enc_uint` wire cost measured through this crate's own range
+/// encoder can exceed that by **one** eighth-bit (`tell_frac` interval
+/// rounding; e.g. `ft = 279`), never more. One provisioned eighth-bit
+/// per coded PVQ symbol therefore makes the budget rigorous:
+/// `sum(actual) <= sum(priced) + symbols <= (budget - symbols) +
+/// symbols = budget`. Both sides derive the identical provision from
+/// the bit-identical prefix, so lockstep is preserved.
+const PER_SYMBOL_PROVISION_8TH: i64 = 1;
 
 /// Derive the per-band PVQ pulse counts `band_k` from a decoded
 /// [`FramePrefix`], using the documented §4.3.3 / §4.3.4.1 allocation
@@ -177,9 +187,11 @@ pub fn derive_band_pulses(
     // The remaining budget the §4.3.3 search drives toward: the
     // band-boost loop's `total_bits` at exit (in 1/8 bits), the budget
     // the §4.3.3 prose says the downstream allocation steps inherit after
-    // every accepted boost has been subtracted. The combined column
-    // search compares its per-band window total against this.
-    let budget_1_8th = shape_budget_1_8th(prefix);
+    // every accepted boost has been subtracted — less one provisioned
+    // eighth-bit per coded band (one PVQ symbol each; see
+    // `PER_SYMBOL_PROVISION_8TH`).
+    let budget_1_8th =
+        (shape_budget_1_8th(prefix) - PER_SYMBOL_PROVISION_8TH * (end - start) as i64).max(0);
 
     let search = find_combined_alloc(
         start,
@@ -197,7 +209,8 @@ pub fn derive_band_pulses(
     // construction (the combine step floors at zero).
     let targets: Vec<u32> = search.alloc.bits.iter().map(|&b| b.max(0) as u32).collect();
 
-    let (per_band, _balance) = bits_to_pulses_band_loop(&bins, &targets, cost_log2_v_count_8th)?;
+    let (per_band, _balance) =
+        bits_to_pulses_band_loop_cached(lm as usize, start, &bins, &targets)?;
 
     Some(
         per_band
@@ -246,7 +259,10 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
     }
 
     let bins: Vec<u32> = BAND_BINS_LM[lm as usize][start..end].to_vec();
-    let budget_1_8th = shape_budget_1_8th(prefix);
+    // Two PVQ symbols per band on the dual wire, so two provisioned
+    // eighth-bits per band (see `PER_SYMBOL_PROVISION_8TH`).
+    let budget_1_8th =
+        (shape_budget_1_8th(prefix) - 2 * PER_SYMBOL_PROVISION_8TH * (end - start) as i64).max(0);
 
     let search = find_combined_alloc(
         start,
@@ -268,7 +284,8 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
         .map(|&b| (b.max(0) as u32) / 2)
         .collect();
 
-    let (per_band, _balance) = bits_to_pulses_band_loop(&bins, &targets, cost_log2_v_count_8th)?;
+    let (per_band, _balance) =
+        bits_to_pulses_band_loop_cached(lm as usize, start, &bins, &targets)?;
 
     Some(
         per_band

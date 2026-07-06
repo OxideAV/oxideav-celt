@@ -333,9 +333,17 @@ impl RangeEncoder {
     /// the symbols already written).
     pub fn finish_to_size(mut self, target_len: usize) -> Result<Vec<u8>, Error> {
         self.finalize_state();
-        // Front: range-coded bytes (+ buffered rem byte).
+        // Front: range-coded bytes (+ buffered rem byte). A finalized
+        // `rem` of zero is pure §5.1.5 padding, not data: after the
+        // "while end != 0" emission loop every un-emitted bit position
+        // lies strictly below the trailing-zeros bound `b` (bit `b` is
+        // the lowest set bit of `end`, and the loop cannot stop before
+        // emitting it), and §5.1.5 explicitly permits those positions
+        // to "be set to arbitrary values" — the decoder substitutes
+        // zeros past the frame end. Dropping it reclaims one byte of a
+        // tight frame instead of overflowing it.
         let mut front = self.buf.clone();
-        if self.rem != REM_EMPTY {
+        if self.rem != REM_EMPTY && self.rem != 0 {
             front.push(self.rem as u8);
         }
         // Back: raw bytes reversed so raw[0] lands at the frame end.
@@ -348,9 +356,16 @@ impl RangeEncoder {
             let raw_start = target_len - back.len();
             out[raw_start..].copy_from_slice(&back);
             Ok(out)
-        } else if front.len() + back.len() == target_len + 1 && !front.is_empty() {
+        } else if front.len() + back.len() == target_len + 1
+            && !front.is_empty()
+            && !back.is_empty()
+        {
             // §5.1.5 shared-byte merge: the last range byte and the
             // first (frame-order) raw byte share one slot; OR them.
+            // Both regions must be non-empty — the merge ORs the last
+            // range byte with the first raw byte, so with no raw bytes
+            // an over-long front is a genuine overflow (rejected
+            // below), not a mergeable overlap.
             let mut out = vec![0u8; target_len];
             out[..front.len()].copy_from_slice(&front);
             let raw_start = target_len - back.len();

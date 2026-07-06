@@ -100,7 +100,7 @@
 //! (#118) with values from `docs/audio/opus/tables/cache-bits50.csv`
 //! and `cache-index50.csv`. No external library source was consulted.
 
-use crate::pulse_cache::{cache_offset, cached_bits_to_pulses};
+use crate::pulse_cache::{cache_offset, cached_bits_to_pulses_extended};
 use crate::pvq::{v_count, V_COUNT_SATURATION};
 
 /// Number of 1/8 bits per whole bit. Pinned for arithmetic clarity
@@ -457,8 +457,10 @@ pub fn bits_to_pulses_band_loop_cached(
         let celt_band = band_start + i;
         let result = match cache_offset(celt_band, lm) {
             Some(_) => {
-                // Bit-exact cache path.
-                let cp = cached_bits_to_pulses(celt_band, lm, adjusted_target)?;
+                // Bit-exact cache path, extended past the run's maxK
+                // with exact monolithic pricing for the in-crate
+                // single-block wire (see `cached_bits_to_pulses_extended`).
+                let cp = cached_bits_to_pulses_extended(celt_band, lm, n, adjusted_target)?;
                 BitsToPulses {
                     k: cp.k,
                     bits_used_8th: cp.bits_used_8th,
@@ -937,13 +939,14 @@ mod tests {
 
     /// Under the corrected LM-major mapping every in-range band is
     /// cached — including band 0 (N = 1, the flat one-bit run). A
-    /// one-bit budget therefore buys the run's full `maxK = 40` (the
-    /// cached pulse ceiling), not the estimator's `K_SEARCH_CAP` walk.
+    /// one-bit budget walks the flat curve through `maxK` and the
+    /// exact-cost extension to `EXTENDED_K_CAP` (`V(1, K) = 2` prices
+    /// every `K` at one bit).
     #[test]
-    fn cached_loop_band_zero_is_cached_and_caps_at_max_k() {
+    fn cached_loop_band_zero_is_cached_and_walks_flat_extension() {
         let (out, _) = bits_to_pulses_band_loop_cached(0, 0, &[1], &[8]).unwrap();
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].k, 40);
+        assert_eq!(out[0].k, crate::pulse_cache::EXTENDED_K_CAP);
         assert_eq!(out[0].bits_used_8th, 8);
     }
 
@@ -990,7 +993,6 @@ mod tests {
         // Band 20 LM0 is cached (run @295, N = 22, maxK = 9); band 21
         // is out of range ⇒ estimator path. Both produce a result.
         assert!(out[0].k >= 1);
-        assert!(out[0].k <= 9, "cached band capped at the run maxK");
         assert!(out[1].k >= 1);
     }
 }

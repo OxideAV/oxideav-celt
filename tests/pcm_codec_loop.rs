@@ -295,3 +295,52 @@ fn quantized_loop_reanalysis_recovers_reconstruction() {
         }
     }
 }
+
+/// **Budget fit is rigorous across byte budgets and frame sizes.**
+/// The §4.3.4.1 derivation prices shape symbols from the bit-exact
+/// pulse cache (`ceil(8*log2 V(N, K))` in its exact-identity region)
+/// while the measured §5.1.4 `enc_uint` wire cost can exceed that
+/// price by one eighth-bit per symbol; the derivation provisions one
+/// eighth-bit per coded PVQ symbol so every frame provably fits its
+/// byte budget. This sweep drives the full PCM loop across every LM
+/// and a ladder of byte budgets: the encoder must always produce a
+/// frame of exactly the requested size and the decoder must accept
+/// it.
+#[test]
+fn quantized_loop_fits_across_byte_budgets() {
+    for lm in 0..=3u32 {
+        let n = 120usize << lm;
+        for &frame_bytes in &[20u32, 32, 48, 64, 96, 128, 160, 200] {
+            let input = test_signal(3 * n, 0xB1D5 + lm * 977 + frame_bytes);
+            let mut enc = CeltEncodeState::new(lm).unwrap();
+            let mut dec = CeltDecodeState::new(lm).unwrap();
+            for t in 0..3 {
+                let header = plain_header(t == 0);
+                let frame = encode_celt_frame_pcm_auto(
+                    &mut enc,
+                    &input[t * n..(t + 1) * n],
+                    &header,
+                    frame_bytes,
+                    0,
+                    NUM_BANDS,
+                )
+                .unwrap_or_else(|e| {
+                    panic!("lm={lm} bytes={frame_bytes} frame {t}: encode failed: {e:?}")
+                });
+                assert_eq!(
+                    frame.bytes.len(),
+                    frame_bytes as usize,
+                    "lm={lm} bytes={frame_bytes}: frame size mismatch"
+                );
+                let decoded = decode_celt_frame_auto(&mut dec, &frame.bytes, 0, NUM_BANDS)
+                    .unwrap_or_else(|e| {
+                        panic!("lm={lm} bytes={frame_bytes} frame {t}: decode failed: {e:?}")
+                    });
+                assert_eq!(decoded.pcm.len(), n);
+                for &s in &decoded.pcm {
+                    assert!(s.is_finite());
+                }
+            }
+        }
+    }
+}
