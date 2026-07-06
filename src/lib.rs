@@ -430,8 +430,8 @@ pub use post_filter::{
     POST_FILTER_TAPS_F32, POST_FILTER_TAPS_Q15, TAPS_PER_SET,
 };
 pub use pulse_cache::{
-    cache_cost_8th, cache_max_k, cache_offset, cached_bits_to_pulses, CachedPulses, CACHE_BITS50,
-    CACHE_INDEX50,
+    cache_cost_8th, cache_max_k, cache_offset, cache_offset_half_block, cache_stored_qbits,
+    cached_bits_to_pulses, CachedPulses, CACHE_BITS50, CACHE_INDEX50, NUM_FRAME_LM, NUM_LM_ROWS,
 };
 pub use pvq::{
     decode_index_to_pulses, decode_pulses, decode_unit_shape, encode_pulses,

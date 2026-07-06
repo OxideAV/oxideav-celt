@@ -182,6 +182,31 @@ fn clamp_k_to_decodable(n: u32, k: u32) -> u32 {
     k
 }
 
+/// Scan seeds for a payload whose derived-`band_k` decode lands on the
+/// documented success path. Some non-transient frames signal a
+/// per-band `tf_change` that, in the single-block long-MDCT decode,
+/// requests Hadamard levels that do not exist for a band the improved
+/// (bit-exact cache) pricing now gives pulses to — exactly the
+/// §4.3.4.5 / §4.3.4.4 territory the residual loop correctly surfaces
+/// as `NotImplemented`. The composition test wants a frame on the
+/// documented success path; the gate itself is covered elsewhere.
+fn decodable_payload(len: usize, start_seed: u8, lm: u32, start: usize, end: usize) -> Vec<u8> {
+    for off in 0..=255u32 {
+        let seed = start_seed.wrapping_add(off as u8);
+        let buf = payload(len, seed);
+        if is_transient(&buf, lm, start, end) {
+            continue;
+        }
+        let band_k = derive_band_k(&buf, lm, start, end);
+        let mut state = CeltDecodeState::new(lm).expect("decode state");
+        let fine_bits = [0u32; NUM_BANDS];
+        if decode_celt_frame(&mut state, &buf, start, end, &fine_bits, &band_k).is_ok() {
+            return buf;
+        }
+    }
+    panic!("no documented-success payload found (len={len})");
+}
+
 /// The full chain composes: a real frame's prefix yields a combined
 /// allocation, which yields integer pulse counts, which the synthesis
 /// pipeline accepts and turns into finite PCM. Every per-band `K` is
@@ -189,7 +214,7 @@ fn clamp_k_to_decodable(n: u32, k: u32) -> u32 {
 #[test]
 fn documented_chain_composes_to_pcm_mono() {
     let lm = 3u32; // 20 ms / 960-sample frame
-    let buf = nontransient_payload(48, 11, lm, 0, NUM_BANDS);
+    let buf = decodable_payload(48, 11, lm, 0, NUM_BANDS);
 
     let band_k = derive_band_k(&buf, lm, 0, NUM_BANDS);
     assert_eq!(band_k.len(), NUM_BANDS, "one K per coded band");
