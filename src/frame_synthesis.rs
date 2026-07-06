@@ -127,6 +127,33 @@ use crate::post_filter::{
 use crate::range_decoder::RangeDecoder;
 use crate::residual::decode_residual_bands;
 use crate::synthesis::CELT_OVERLAP;
+
+/// Cross-frame §4.3.7.1 post-filter history depth: the maximum legal
+/// pitch period plus the two-sample §4.3.7.1 lobe extent, so every
+/// legal `T` finds real samples regardless of the frame size.
+pub(crate) const POST_FILTER_HISTORY_LEN: usize =
+    crate::post_filter::POST_FILTER_PERIOD_MAX as usize + 2;
+
+/// Shift `block` (a frame of filtered output, oldest first) into a
+/// most-recent-first cross-frame history buffer: `history[k]` becomes
+/// `y(-1 - k)` for the next frame, per the
+/// [`apply_post_filter_transition_f32`] contract.
+pub(crate) fn push_post_filter_history(history: &mut [f32], block: &[f32]) {
+    let n = block.len();
+    let h = history.len();
+    if n >= h {
+        for (k, slot) in history.iter_mut().enumerate() {
+            *slot = block[n - 1 - k];
+        }
+        return;
+    }
+    // Age the existing history by n samples, then prepend the block
+    // reversed (most recent first).
+    history.copy_within(0..h - n, n);
+    for k in 0..n {
+        history[k] = block[n - 1 - k];
+    }
+}
 use crate::synthesis::{LongMdctSynthesis, StereoLongMdctSynthesis};
 use crate::Error;
 
@@ -174,13 +201,12 @@ impl CeltDecodeState {
     /// window construction is total for every in-range `lm`).
     pub fn new(lm: u32) -> Option<Self> {
         let synth = LongMdctSynthesis::new(lm)?;
-        let frame_size = synth.frame_size();
         Some(Self {
             lm,
             coarse: CoarseEnergyState::new(),
             synth,
             deemph: Deemphasis::new(),
-            post_filter_history: vec![0.0; frame_size],
+            post_filter_history: vec![0.0; POST_FILTER_HISTORY_LEN],
             prev_post_filter: PfTransitionParams::OFF,
         })
     }
@@ -383,8 +409,8 @@ pub fn decode_celt_frame(
     );
     // Save this frame's post-filtered (pre-de-emphasis) output and
     // parameters as the next frame's post-filter history / transition
-    // predecessor.
-    state.post_filter_history.copy_from_slice(&pcm);
+    // predecessor (most-recent-first, per the transition contract).
+    push_post_filter_history(&mut state.post_filter_history, &pcm);
     state.prev_post_filter = cur_pf;
 
     // §4.3.7.2 single-pole de-emphasis, carrying the filter memory.
@@ -460,13 +486,15 @@ impl StereoCeltDecodeState {
     /// Returns `None` if `lm > 3`.
     pub fn new(lm: u32) -> Option<Self> {
         let synth = StereoLongMdctSynthesis::new(lm)?;
-        let frame_size = synth.frame_size();
         Some(Self {
             lm,
             coarse: CoarseEnergyState::new(),
             synth,
             deemph: [Deemphasis::new(), Deemphasis::new()],
-            post_filter_history: [vec![0.0; frame_size], vec![0.0; frame_size]],
+            post_filter_history: [
+                vec![0.0; POST_FILTER_HISTORY_LEN],
+                vec![0.0; POST_FILTER_HISTORY_LEN],
+            ],
             prev_post_filter: [PfTransitionParams::OFF; 2],
         })
     }
@@ -898,8 +926,9 @@ impl StereoCeltDecodeState {
             // passthrough when both frames had the post-filter off).
             apply_post_filter_transition_f32(chan, history, *prev, cur_pf, CELT_OVERLAP);
             // Save this frame's post-filtered (pre-de-emphasis) output and
-            // parameters as the next frame's transition predecessor.
-            history.copy_from_slice(chan);
+            // parameters as the next frame's transition predecessor
+            // (most-recent-first, per the transition contract).
+            push_post_filter_history(history, chan);
             *prev = cur_pf;
             // §4.3.7.2 de-emphasis, carrying this channel's filter memory.
             deemph.apply_in_place(chan);

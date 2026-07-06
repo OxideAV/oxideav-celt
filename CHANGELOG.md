@@ -6,6 +6,31 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-393 (2026-07-06) — §5.3.1 pitch pre-filter + pitch search,
+  wired into the mono PCM loop:**
+  `apply_pitch_prefilter_transition_f32` is the exact FIR inverse of
+  the decoder's §4.3.7.1 post-filter transition (pinned by a
+  multi-frame identity test with parameter changes); `pitch_search` /
+  `choose_post_filter_params` implement the two §5.3.1 criteria the
+  RFC states (continuity + avoidance of pitch multiples; the
+  algorithm and thresholds are documented in-crate encoder freedom).
+  `encode_celt_frame_pcm_auto` now honours a signalled post-filter —
+  pre-filter after pre-emphasis, cross-frame unfiltered-input history
+  and previous parameters carried in `CeltEncodeState` — closing the
+  §5.3.1/§4.3.7.1 loop end to end (`PostFilter::from_period` derives
+  the wire octave). Stereo PCM drivers still reject a signalled
+  post-filter (front-end wiring, not a docs gap).
+
+### Fixed
+
+* **Round-393:** the mono and stereo decoders stored the §4.3.7.1
+  cross-frame post-filter history in **forward order** while the
+  transition function's contract is most-recent-first, and its depth
+  (one frame) could not cover legal periods up to 1022 at small `LM`s
+  — latent while the encoders rejected post-filter frames. History is
+  now kept most-recent-first at `POST_FILTER_PERIOD_MAX + 2` depth on
+  both decode paths (`push_post_filter_history`).
+
 * **Round-393 (2026-07-06) — corrected LM-major pulse cache +
   combinatoric validation:** the `cache_index50` offset table is
   indexed `(LM+1)*21 + band` across rows `LM ∈ {-1,0,1,2,3}` (docs

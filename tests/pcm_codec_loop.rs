@@ -346,3 +346,96 @@ fn quantized_loop_fits_across_byte_budgets() {
         }
     }
 }
+
+/// **§5.3.1 pitch pre-filter through the full PCM loop.** The encoder
+/// runs the §5.3.1 pitch search over its input, signals the chosen
+/// §4.3.7.1 parameters in the Table-56 prefix, and applies the pitch
+/// pre-filter (the exact inverse of the decoder's post-filter) after
+/// pre-emphasis; the decoder undoes it with the same signalled
+/// parameters. The loop must stay self-contained (no out-of-band
+/// data), track the waveform, and actually engage the filter.
+#[test]
+fn quantized_loop_with_pitch_postfilter() {
+    use oxideav_celt::frame_header::PostFilter;
+    use oxideav_celt::{choose_post_filter_params, pitch_search};
+
+    let lm = 2u32;
+    let n = 120usize << lm;
+    let frame_bytes = 96u32;
+    let frames = 6usize;
+
+    // A strongly periodic tone (period ~97 samples) with a soft
+    // second harmonic.
+    let period_true = 97.0f32;
+    let input: Vec<f32> = (0..frames * n)
+        .map(|i| {
+            let ph = 2.0 * std::f32::consts::PI * i as f32 / period_true;
+            0.6 * ph.sin() + 0.15 * (2.0 * ph).sin()
+        })
+        .collect();
+
+    let mut enc = CeltEncodeState::new(lm).unwrap();
+    let mut dec = CeltDecodeState::new(lm).unwrap();
+    let mut output = Vec::with_capacity(frames * n);
+    let mut prev_period: Option<u16> = None;
+    let mut engaged = 0usize;
+    for t in 0..frames {
+        // §5.3.1 pitch search over the input seen so far (the current
+        // frame is the analysis window; earlier frames are the lag
+        // history).
+        let hist_end = (t + 1) * n;
+        let est = pitch_search(&input[..hist_end], n, prev_period);
+        let pf = est
+            .and_then(choose_post_filter_params)
+            .and_then(|p| PostFilter::from_period(p.period, p.gain_index, p.tapset));
+        if pf.is_some() {
+            engaged += 1;
+            prev_period = pf.as_ref().map(|p| p.period);
+        }
+        let header = CeltFrameHeader {
+            silence: false,
+            post_filter: pf,
+            transient: false,
+            intra: t == 0,
+            anti_collapse_on: None,
+        };
+        let frame = encode_celt_frame_pcm_auto(
+            &mut enc,
+            &input[t * n..(t + 1) * n],
+            &header,
+            frame_bytes,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        let decoded = decode_celt_frame_auto(&mut dec, &frame.bytes, 0, NUM_BANDS).unwrap();
+        output.extend_from_slice(&decoded.pcm);
+    }
+    assert!(
+        engaged >= frames - 1,
+        "pitch search engaged the post-filter on only {engaged} frames"
+    );
+
+    // Steady-state fidelity, one frame of latency.
+    let lo = 2 * n;
+    let hi = (frames - 1) * n;
+    let (mut err2, mut sig2, mut dot, mut out2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for i in lo..hi {
+        let want = input[i] as f64;
+        let got = output[n + i] as f64;
+        err2 += (got - want) * (got - want);
+        sig2 += want * want;
+        dot += got * want;
+        out2 += got * got;
+    }
+    let rel = (err2 / sig2).sqrt();
+    let corr = dot / (sig2.sqrt() * out2.sqrt());
+    assert!(
+        rel < 0.15,
+        "post-filtered loop error too high: {rel} (all-zero output scores 1.0)"
+    );
+    assert!(
+        corr > 0.98,
+        "post-filtered loop correlation too low: {corr}"
+    );
+}

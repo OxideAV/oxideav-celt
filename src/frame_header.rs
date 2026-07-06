@@ -56,6 +56,28 @@ pub struct PostFilter {
     pub tapset: u8,
 }
 
+impl PostFilter {
+    /// Build the §4.3.7.1 field set from a pitch period, deriving the
+    /// octave index the wire codes: `T + 1 ∈ [16 << octave,
+    /// 32 << octave)`, i.e. `octave = floor(log2(T + 1)) - 4`.
+    ///
+    /// Returns `None` for a period outside `15..=1022`, `gain > 7`, or
+    /// `tapset > 2`.
+    pub fn from_period(period: u16, gain: u8, tapset: u8) -> Option<Self> {
+        if !(15..=1022).contains(&period) || gain > 7 || tapset > 2 {
+            return None;
+        }
+        let p1 = u32::from(period) + 1;
+        let octave = (31 - p1.leading_zeros()) - 4;
+        Some(Self {
+            octave: octave as u8,
+            period,
+            gain,
+            tapset,
+        })
+    }
+}
+
 /// CELT frame-header scalar fields (RFC 6716 §4.3, prefix portion).
 ///
 /// `anti_collapse_on` is `None` until [`decode_anti_collapse_flag`]

@@ -36,14 +36,18 @@
 //!
 //! ## Post-filter note
 //!
-//! The §5.3.1 pitch pre-filter (the encoder-side inverse of the
-//! §4.3.7.1 post-filter) is not applied: these drivers accept only a
-//! `post_filter: None` header. The pre-filter arithmetic is the
-//! documented inverse, but the §5.3.1 pitch-period *search* the
-//! encoder needs to choose `T` is described only as optimization
-//! criteria — encoding with the post-filter signalled but no
-//! pre-filter applied would mis-shape the decoded output, so the
-//! combination is rejected rather than mis-encoded.
+//! The **mono** drivers honour a signalled post-filter: a header with
+//! `post_filter: Some(..)` applies the §5.3.1 pitch pre-filter (the
+//! exact inverse of the decoder's §4.3.7.1 post-filter transition,
+//! [`apply_pitch_prefilter_transition_f32`]) after pre-emphasis, with
+//! cross-frame unfiltered-input history and previous-frame parameters
+//! carried in [`CeltEncodeState`]. The §5.3.1 period search itself is
+//! available as [`crate::pitch::pitch_search`] +
+//! [`crate::pitch::choose_post_filter_params`]; the parameter choice
+//! stays with the caller (per-frame encoder freedom). The **stereo**
+//! drivers still reject a signalled post-filter: the stereo front end
+//! fuses pre-emphasis and analysis per channel, and the per-channel
+//! pre-filter insertion is deferred wiring (not a docs gap).
 //!
 //! ## Clean-room provenance
 //!
@@ -60,7 +64,9 @@ use crate::frame_encode::{
     encode_stereo_celt_frame_auto, EncodedFrame, StereoEncodedFrame,
 };
 use crate::frame_header::CeltFrameHeader;
-use crate::synthesis::mdct_size;
+use crate::frame_synthesis::{push_post_filter_history, POST_FILTER_HISTORY_LEN};
+use crate::post_filter::{apply_pitch_prefilter_transition_f32, PostFilterParams};
+use crate::synthesis::{mdct_size, CELT_OVERLAP};
 use crate::Error;
 
 /// Streaming CELT **encoder** state carried across frames — the
@@ -83,6 +89,15 @@ pub struct CeltEncodeState {
     preemph: Preemphasis,
     analysis: LongMdctAnalysis,
     coarse: CoarseEnergyState,
+    /// §5.3.1 pitch pre-filter cross-frame input history: the most
+    /// recent [`POST_FILTER_HISTORY_LEN`] *unfiltered* pre-emphasized
+    /// input samples, most-recent-first (the
+    /// [`apply_pitch_prefilter_transition_f32`] contract).
+    prefilter_history: Vec<f32>,
+    /// The previous frame's §4.3.7.1 parameters as applied by the
+    /// pre-filter — the transition predecessor, mirroring the
+    /// decoder's `prev_post_filter`.
+    prev_pre_filter: PostFilterParams,
 }
 
 impl CeltEncodeState {
@@ -95,6 +110,8 @@ impl CeltEncodeState {
             preemph: Preemphasis::new(),
             analysis: LongMdctAnalysis::new(lm)?,
             coarse: CoarseEnergyState::new(),
+            prefilter_history: vec![0.0; POST_FILTER_HISTORY_LEN],
+            prev_pre_filter: PostFilterParams::OFF,
         })
     }
 
@@ -126,6 +143,8 @@ impl CeltEncodeState {
         self.preemph.reset();
         self.analysis.reset();
         self.coarse.reset();
+        self.prefilter_history.iter_mut().for_each(|s| *s = 0.0);
+        self.prev_pre_filter = PostFilterParams::OFF;
     }
 }
 
@@ -159,9 +178,6 @@ fn encode_pcm_impl(
     if header.transient || (header.silence && fine_bits.is_some()) {
         return Err(Error::NotImplemented);
     }
-    if header.post_filter.is_some() {
-        return Err(Error::NotImplemented);
-    }
 
     // Snapshot the front-end state so a failed encode leaves the
     // stream exactly where it was (the coarse state is only mutated by
@@ -173,6 +189,31 @@ fn encode_pcm_impl(
     // carrying the FIR tap across frames.
     let mut emphasized = pcm.to_vec();
     state.preemph.apply_in_place(&mut emphasized);
+
+    // §5.3.1 pitch pre-filter — "applied after the pre-emphasis", the
+    // exact inverse of the decoder's §4.3.7.1 post-filter transition.
+    // The comb reads pristine (unfiltered) input history; the decoder
+    // undoes the filter with the same signalled parameters, so the
+    // loop closes with no out-of-band data.
+    let unfiltered = emphasized.clone();
+    let cur_pf = match &header.post_filter {
+        Some(pf) => PostFilterParams {
+            enabled: true,
+            period: pf.period,
+            gain_index: pf.gain,
+            tapset: pf.tapset,
+        },
+        None => PostFilterParams::OFF,
+    };
+    if cur_pf.enabled || state.prev_pre_filter.enabled {
+        apply_pitch_prefilter_transition_f32(
+            &mut emphasized,
+            &state.prefilter_history,
+            state.prev_pre_filter,
+            cur_pf,
+            CELT_OVERLAP,
+        );
+    }
 
     // §4.3.7 windowed forward MDCT → coded-window spectrum.
     let spectrum = match state.analysis.analyze(&emphasized, start, end) {
@@ -209,7 +250,13 @@ fn encode_pcm_impl(
         ),
     };
     match result {
-        Ok(frame) => Ok(frame),
+        Ok(frame) => {
+            // Commit the §5.3.1 pre-filter cross-frame state only on
+            // success (mirroring the decoder's post-filter commit).
+            push_post_filter_history(&mut state.prefilter_history, &unfiltered);
+            state.prev_pre_filter = cur_pf;
+            Ok(frame)
+        }
         Err(e) => {
             state.preemph = preemph_snapshot;
             state.analysis = analysis_snapshot;
@@ -233,8 +280,10 @@ fn encode_pcm_impl(
 ///
 /// * `pcm` — exactly `120 << lm` time-domain samples (the next input
 ///   frame; see the module docs for the one-frame latency contract).
-/// * `header` — must be non-transient and have `post_filter: None`
-///   ([`Error::NotImplemented`] otherwise). A **silence** header is
+/// * `header` — must be non-transient ([`Error::NotImplemented`]
+///   otherwise). A signalled post-filter is honoured: the §5.3.1
+///   pitch pre-filter is applied after pre-emphasis and the decoder
+///   undoes it from the signalled parameters. A **silence** header is
 ///   accepted: the frame carries the Table-56 prefix (keeping the
 ///   §4.3.2.1 coarse prediction in lockstep with the analyzed input)
 ///   but no shape symbols, and the decoder's silence branch plays out
@@ -360,8 +409,9 @@ fn encode_stereo_pcm_impl(
     }
     // Same driver-level constraints as the mono PCM encoders: no
     // transients, no silence+explicit-allocation contradiction, and no
-    // signalled post-filter (the §5.3.1 pre-filter search is the
-    // documented gap).
+    // signalled post-filter (the stereo front end fuses pre-emphasis
+    // and analysis per channel; the per-channel §5.3.1 pre-filter
+    // insertion is deferred wiring).
     if header.transient || (header.silence && fine_bits.is_some()) {
         return Err(Error::NotImplemented);
     }
@@ -647,20 +697,6 @@ mod tests {
                 &fine_bits,
                 &band_k
             ),
-            Err(Error::NotImplemented)
-        ));
-        // Post-filter signalled (no §5.3.1 pre-filter is applied).
-        let post_filter = CeltFrameHeader {
-            post_filter: Some(crate::frame_header::PostFilter {
-                octave: 2,
-                period: 100,
-                gain: 3,
-                tapset: 1,
-            }),
-            ..good
-        };
-        assert!(matches!(
-            encode_celt_frame_pcm_auto(&mut state, &pcm, &post_filter, FRAME_BYTES, 0, 21),
             Err(Error::NotImplemented)
         ));
         // Bad band window.
