@@ -223,20 +223,16 @@ per band exposed two latent mono-era defects, both fixed:
   update with the raw target per `BalanceAccumulator::update`'s
   documented contract, restoring `sum(bits_used) <= sum(raw_target)`
   (new conservation property test);
-* the pulse derivations now cap the arithmetic §4.3.3 budget by the
+* the pulse derivations cap the arithmetic §4.3.3 budget by the
   re-measured wire remainder
   (`FramePrefix::{tell_frac_after_prefix, frame_bytes}`; the
   arithmetic budget never pays for the boost/trim/skip/intensity/dual
-  symbols themselves) and run on the §4.1.5 worst-case `dec_uint`
-  cost estimator instead of the staged `cache_bits50` curve — the
-  staged cache's `band*5 + LM` mapping prices some symbols far below
-  their measured wire cost (a 2-bin band's `K = 40` index at 7
-  eighth-bits vs ~59 measured) and its run-sharing table assigns
-  (band, LM) tuples of different `N` to one cost curve, which no
-  `(N, K)` cache can satisfy (docs question filed against
-  `docs/audio/opus/pulse-cache-format-trace.md` §2). The estimator
-  never under-prices, so the encoded frame provably fits its byte
-  budget at every `LM`, mono and stereo.
+  symbols themselves). r389 also had to swap the staged `cache_bits50`
+  curve for the §4.1.5 worst-case estimator because the then-current
+  trace's `band*5 + LM` mapping mispriced symbols (a 2-bin band's
+  `K = 40` index at 7 eighth-bits vs ~59 measured) — the docs question
+  filed then was resolved by the corrected **LM-major** trace (#184),
+  and r393 restored the cache as the cost model (see below).
 
 **§5.3 encoder decisions, r389.** Alongside the r385 §5.3.4.1 boost
 rule and §5.3.3 intra/inter selection, the crate now carries:
@@ -264,6 +260,52 @@ The §5.3.1 encoder-side post-filter (pitch pre-filter) decision
 remains a docs gap: the RFC gives only optimization criteria
 (continuity, avoidance of pitch multiples), not a period search, so
 the PCM encoders keep rejecting a signalled post-filter.
+
+**Corrected pulse cache + allocation pricing to exhaustion, r393.**
+The docs trace correction (#184) established the `cache_index50` /
+`cache_bits50` pair is indexed **LM-major** — `(LM+1)*21 + band`
+across rows `LM ∈ {-1..3}` — and r393 rebuilt the whole pricing stack
+on it:
+
+* `pulse_cache` under the corrected mapping: every coded `(band, LM)`
+  tuple resolves to a single-`N` cost curve (the 8 sentinels are
+  exactly bands 0–7 of the `LM = -1` half-block row), and the trace
+  §2.3 `qbits[K] + 1` retrieval convention is validated against the
+  crate's own §4.3.4.2 `V(N, K)` recursion: retrieved cost
+  `== ceil(8*log2 V(N, K))` for every `K <= 16` (single exception
+  `N=11, K=9`, one eighth-bit high) and `>=` for all `K` — a tight,
+  never-under-pricing upper bound (the high-`K` surplus is the
+  §4.3.4.4 splitting-aware accounting). `V(2,40)` regression pinned.
+* `cached_bits_to_pulses_extended` / `cost_exact_8th`: exact
+  monolithic pricing past the run's `maxK` (floored for monotonicity)
+  for the in-crate single-block wire, so high-rate frames keep the
+  pulse depth the estimator wire had.
+* The derivations (`derive_band_pulses[_dual]`, all four auto codec
+  paths) price on the cache with a **provably fitting budget**: the
+  measured §5.1.4 `enc_uint` cost exceeds `ceil(8*log2 ft)` by at most
+  one eighth-bit, so one eighth-bit per coded PVQ symbol is
+  provisioned. Byte-budget sweeps (mono 20–200 B, stereo 32–200 B,
+  every `LM`) pin exact-size encode + decode. Two latent
+  `RangeEncoder::finish_to_size` defects the sweeps exposed are fixed
+  (§5.1.5 merge-guard panic; a wasted trailing zero-`rem` padding
+  byte per tight frame).
+* **§4.3.3 hard-minimum skip floor**
+  (`bits_to_pulses_band_loop_cached_thresh`): a band whose adjusted
+  target falls below `thresh[band] = max((24*N)/16, 8*channels)` is
+  skipped and its raw target credited forward through the §4.3.4.1
+  balance — the RFC's own redistribution instrument; the skip-bit
+  *wire* symbols stay inside the deferred reallocation gap.
+* **In-crate fine/shape split** (`derive_band_allocation[_dual]` →
+  `DerivedAllocation`): `fine = min(MAX_FINE_BITS,
+  bits/(8*channels*(N+1)))` split off each band's combined allocation
+  before bits-to-pulses (skipped bands reclaim their fine bits), spent
+  as real §4.3.2.2 fine-energy refinement by all four auto paths —
+  both sides derive the identical split from the bit-identical
+  prefix. The coarse-only 6 dB envelope had been the loop's dominant
+  error: tonal codec-loop steady-state relative L2 error drops
+  **3–16x** (lm=1/40 B: 0.107 → 0.0065; lm=3/160 B: 0.124 → 0.039)
+  with correlation ≈ 1.000, and the fidelity assertions are tightened
+  to lock it in.
 
 **Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
 the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps
@@ -295,8 +337,11 @@ pulse counts). For pure-CELT mono the derived `band_k` drives the full
 `decode_celt_frame` pipeline to finite PCM, deterministically, with the
 total pulse count monotone in the frame budget — demonstrating the
 `band_k` the residual loop takes as input *can* be produced from the
-documented modules wherever §4.3.3 is not deferred. Only the fine/shape
-split + concurrent-skip reallocation remains a genuine docs gap.
+documented modules wherever §4.3.3 is not deferred. The fine/shape
+split and the hard-minimum skip now carry documented in-crate rules
+(r393, below); the reference-exact `interp_bits2pulses` reallocation
+walk (its interpolation-fraction bisection, concurrent skip-bit
+decoding, and priority determination) remains the genuine docs gap.
 
 **Caller-input-free mono decode (`decode_celt_frame_auto`).** The
 documented allocation→pulses seam is now a public API, not just a test
@@ -308,9 +353,10 @@ pulse counts — clamping each `K` to the largest value whose PVQ codebook
 `V(N, K)` stays representable in the single-block decode (a larger `K` is
 the deferred §4.3.4.4 split regime). `decode_celt_frame_auto(state,
 frame_bytes, start, end)` chains the whole thing: decode the prefix,
-derive the pulse counts, and run `decode_celt_frame` with no fine
-refinement — a mono, non-transient CELT frame → PCM with **no
-caller-supplied `band_k` / `fine_bits`**. It is the deepest
+derive the pulse counts and fine-energy bits (r393's
+`derive_band_allocation`), and run `decode_celt_frame` — a mono,
+non-transient CELT frame → PCM with **no caller-supplied `band_k` /
+`fine_bits`**. It is the deepest
 caller-input-free decode the wall permits: every step is RFC-specified
 except the deferred fine/shape split, approximated by treating the whole
 combined allocation as shape. A transient frame, an out-of-range window,

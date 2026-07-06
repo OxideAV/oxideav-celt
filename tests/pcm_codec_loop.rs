@@ -159,11 +159,10 @@ fn quantized_codec_loop_decoder_matches_encoder_reconstruction() {
 /// **Quantized loop fidelity.** For a low-band-concentrated tonal
 /// signal (where the allocation buys plenty of pulses) the decoded
 /// output tracks the delayed input: the steady-state relative L2
-/// error stays well below one (an all-zero output would score exactly
-/// one) and the normalized correlation is strongly positive. Loose
-/// bounds — the loop spends no fine-energy bits by construction — but
-/// they pin that the codec transports the waveform, not just finite
-/// noise.
+/// error stays far below one (an all-zero output would score exactly
+/// one) and the normalized correlation is near-unity. The r393
+/// derived fine/shape split funds per-band fine-energy refinement, so
+/// the envelope error no longer dominates the loop.
 #[test]
 fn quantized_codec_loop_tracks_tonal_input() {
     let lm = 3u32;
@@ -217,11 +216,14 @@ fn quantized_codec_loop_tracks_tonal_input() {
     }
     let rel = (err2 / sig2).sqrt();
     let corr = dot / (sig2.sqrt() * out2.sqrt());
+    // Thresholds tightened after the r393 derived fine/shape split
+    // landed (measured: rel ~0.039, corr ~0.9992 at lm=3/160B; ~2.5x
+    // headroom retained).
     assert!(
-        rel < 0.8,
+        rel < 0.1,
         "steady-state relative L2 error too high: {rel} (all-zero output scores 1.0)"
     );
-    assert!(corr > 0.6, "normalized correlation too low: {corr}");
+    assert!(corr > 0.99, "normalized correlation too low: {corr}");
 }
 
 /// **Re-analysis closes the loop on the spectrum axis.** The decoded

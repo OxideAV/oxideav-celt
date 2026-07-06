@@ -6,6 +6,75 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-393 (2026-07-06) — corrected LM-major pulse cache +
+  combinatoric validation:** the `cache_index50` offset table is
+  indexed `(LM+1)*21 + band` across rows `LM ∈ {-1,0,1,2,3}` (docs
+  trace correction #184), not `band*5 + LM`. Under the corrected
+  mapping every coded `(band, LM)` tuple resolves to a cost curve for
+  the band's actual Table-55 size `N`, the 8 sentinels are exactly
+  bands 0–7 of the `LM = -1` half-block row, and the trace §2.3
+  `qbits[K] + 1` retrieval convention makes the cache a tight,
+  never-under-pricing upper bound on the monolithic PVQ index cost:
+  validation tests re-derive `retrieved == ceil(8*log2 V(N, K))` for
+  every `K <= 16` (single documented exception `N=11, K=9`, one
+  eighth-bit high) and `>=` for all `K` from this crate's own
+  `V(N, K)` recursion. `cache_offset_half_block`,
+  `cache_stored_qbits`, `cost_exact_8th`,
+  `cached_bits_to_pulses_extended` (exact monolithic pricing past the
+  run's `maxK`, floored for monotonicity, for the in-crate
+  single-block wire), `EXTENDED_K_CAP`. The old `V(2,40)`-at-7
+  mispricing that had forced the r389 worst-case-estimator switch is
+  pinned as a regression test.
+
+* **Round-393 (2026-07-06) — bit-exact cache pricing in the pulse
+  derivation + rigorous budget fit:** `derive_band_pulses[_dual]`
+  (hence all four auto codec paths) now price on the corrected cache
+  instead of the whole-bit estimator. The measured §5.1.4 `enc_uint`
+  wire cost can exceed `ceil(8*log2 ft)` by exactly one eighth-bit,
+  so the derivation provisions one eighth-bit per coded PVQ symbol
+  (two per band on the dual wire) — `sum(actual) <= budget` now holds
+  by construction. Two latent `RangeEncoder` defects exposed by new
+  byte-budget sweep tests were fixed: the §5.1.5 shared-byte merge
+  panicked (slice overrun) instead of erroring when no raw bits
+  existed, and a finalized `rem == 0` byte — pure §5.1.5 padding —
+  was emitted, wasting one byte of every tight frame. Sweeps pin
+  mono 20–200-byte and stereo 32–200-byte frames at every `LM`
+  encoding to exactly the requested size and decoding.
+
+* **Round-393 (2026-07-06) — §4.3.3 hard-minimum skip floor
+  (`bits_to_pulses_band_loop_cached_thresh`):** a band whose
+  balance-adjusted target falls below
+  `thresh[band] = max((24*N)/16, 8*channels)` is skipped (`K = 0`)
+  and its raw target credited forward through the §4.3.4.1 balance —
+  the RFC's own redistribution instrument. Which bands the floor
+  zeroes is a documented deterministic in-crate reading (the
+  reference's concurrent skip-bit decoding stays a docs gap); both
+  codec sides derive it from the bit-identical prefix.
+
+* **Round-393 (2026-07-06) — in-crate fine/shape split
+  (`derive_band_allocation[_dual]`, `DerivedAllocation`):** the
+  §4.3.3 "fine-energy vs. shape split" step, whose exact algorithm
+  the RFC defers, gets a documented deterministic in-crate rule:
+  `fine = min(MAX_FINE_BITS, bits/(8*channels*(N+1)))` split off each
+  band's combined allocation before bits-to-pulses, skipped bands
+  reclaiming their fine bits. All four auto codec paths now spend
+  derived per-band fine-energy refinement with no out-of-band data.
+  Tonal codec-loop steady-state relative L2 error drops 3–16x
+  (lm=1/40B 0.107 → 0.0065; lm=3/160B 0.124 → 0.039) with
+  correlation ≈ 1.000; fidelity assertions tightened accordingly
+  (mono rel < 0.1 / corr > 0.99, stereo rel < 0.12 / corr > 0.99 per
+  channel).
+
+### Fixed
+
+* **Round-393:** `RangeEncoder::finish_to_size` §5.1.5 shared-byte
+  merge guard (`!back.is_empty()`) — a one-byte-over range-only frame
+  now returns `Err(InvalidParameter)` instead of panicking — and
+  trailing zero-`rem` padding suppression (one reclaimed byte per
+  tight frame; the decoder substitutes zeros past the frame end, and
+  every un-emitted §5.1.5 bit position lies below the trailing-zeros
+  bound the RFC declares arbitrary-safe).
+
 * **Round-389 (2026-07-04) — stereo-loop depth coverage:** the
   narrowed coded-band window (`end = 17`, reduced audio bandwidth)
   closes the same self-contained stereo loop (dual on the wire,

@@ -154,11 +154,14 @@ fn stereo_quantized_loop_tracks_tonal_input_per_channel() {
         }
         let rel = (err2 / sig2).sqrt();
         let corr = dot / (sig2.sqrt() * out2.sqrt());
+        // Thresholds tightened after the r393 derived fine/shape
+        // split landed (measured: rel ~0.04-0.05, corr ~0.999 per
+        // channel; ~2x headroom retained).
         assert!(
-            rel < 0.8,
+            rel < 0.12,
             "channel {ch}: steady-state relative L2 error too high: {rel}"
         );
-        assert!(corr > 0.6, "channel {ch}: correlation too low: {corr}");
+        assert!(corr > 0.99, "channel {ch}: correlation too low: {corr}");
     }
 }
 
