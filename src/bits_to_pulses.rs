@@ -434,8 +434,45 @@ pub fn bits_to_pulses_band_loop_cached(
     band_n: &[u32],
     band_target_8th: &[u32],
 ) -> Option<(Vec<BitsToPulses>, BalanceAccumulator)> {
+    bits_to_pulses_band_loop_cached_thresh(lm, band_start, band_n, band_target_8th, None)
+}
+
+/// [`bits_to_pulses_band_loop_cached`] with the §4.3.3 **hard-minimum
+/// skip floor** applied per band.
+///
+/// RFC 6716 §4.3.3: the allocation "computes a vector representing the
+/// hard minimum amounts allocation any band will receive for shape.
+/// This minimum is higher than the technical limit of the PVQ process,
+/// but very low rate allocations produce an excessively sparse
+/// spectrum and these bands are better served by having no allocation
+/// at all." `thresh_8th` is that vector
+/// ([`crate::band_minimums::compute_thresh`], in 1/8 bits): a band
+/// whose balance-adjusted target falls below its threshold is
+/// **skipped** — forced to `K = 0`, zero bits — and its whole raw
+/// target is credited to the running balance, flowing forward to the
+/// remaining bands exactly through the §4.3.4.1 share mechanism (the
+/// redistribution instrument the RFC provides; the reference's
+/// concurrent skip-bit *decoding* and its final reallocation walk stay
+/// a docs gap, so which bands the floor zeroes is this crate's
+/// documented deterministic reading — both codec sides derive it from
+/// the bit-identical prefix, keeping lockstep by construction).
+///
+/// `thresh_8th = None` disables the floor (the plain cached walk);
+/// `Some(t)` must match the window length.
+pub fn bits_to_pulses_band_loop_cached_thresh(
+    lm: usize,
+    band_start: usize,
+    band_n: &[u32],
+    band_target_8th: &[u32],
+    thresh_8th: Option<&[u32]>,
+) -> Option<(Vec<BitsToPulses>, BalanceAccumulator)> {
     if band_n.len() != band_target_8th.len() {
         return None;
+    }
+    if let Some(t) = thresh_8th {
+        if t.len() != band_n.len() {
+            return None;
+        }
     }
 
     let nbands = band_n.len();
@@ -453,6 +490,20 @@ pub fn bits_to_pulses_band_loop_cached(
         };
 
         let adjusted_target = balance.adjusted_target(raw_target, divisor);
+
+        // §4.3.3 hard-minimum skip floor: below-threshold bands carry
+        // no shape allocation at all (see the function docs); the raw
+        // target is credited to the balance below, unspent.
+        if let Some(t) = thresh_8th {
+            if adjusted_target < t[i] {
+                balance.update(raw_target, 0);
+                out.push(BitsToPulses {
+                    k: 0,
+                    bits_used_8th: 0,
+                });
+                continue;
+            }
+        }
 
         let celt_band = band_start + i;
         let result = match cache_offset(celt_band, lm) {
@@ -979,6 +1030,61 @@ mod tests {
             // Mirror the loop's raw-target update contract exactly.
             balance.update(ti, out[i].bits_used_8th);
         }
+    }
+
+    // ---------- bits_to_pulses_band_loop_cached_thresh ----------
+
+    /// A band whose adjusted target falls below its §4.3.3 hard
+    /// minimum is skipped (K = 0, zero bits) and its raw target is
+    /// credited forward through the balance.
+    #[test]
+    fn thresh_floor_skips_sub_minimum_band_and_credits_balance() {
+        // Band 12 LM 0 has N = 4: thresh = max(24*4/16, 8) = 8 for
+        // mono... use an explicit thresh to pin the mechanics: two
+        // N = 4 bands, targets 20 and 30, thresh 25 each.
+        // Band 0 (divisor 2): adjusted 20 < 25 ⇒ skipped, balance +20.
+        // Band 1 (divisor 1): adjusted 30 + 20 = 50 ≥ 25 ⇒ search
+        // runs; run @123 retrieved costs 24 (K=1), 40 (K=2), 52 (K=3):
+        // K = 2 at 40 fits 50.
+        let (out, bal) =
+            bits_to_pulses_band_loop_cached_thresh(0, 12, &[4, 4], &[20, 30], Some(&[25, 25]))
+                .unwrap();
+        assert_eq!(out[0].k, 0);
+        assert_eq!(out[0].bits_used_8th, 0);
+        assert_eq!(out[1].k, 2);
+        assert_eq!(out[1].bits_used_8th, 40);
+        // Balance: +20 (band 0 skip) + (30 - 40) = 10.
+        assert_eq!(bal.balance_8th, 10);
+    }
+
+    /// `None` thresh is the plain cached walk; a mismatched thresh
+    /// length is rejected.
+    #[test]
+    fn thresh_floor_none_matches_plain_walk_and_validates_length() {
+        let plain = bits_to_pulses_band_loop_cached(2, 0, &[4, 8, 16], &[60, 120, 200]).unwrap();
+        let with_none =
+            bits_to_pulses_band_loop_cached_thresh(2, 0, &[4, 8, 16], &[60, 120, 200], None)
+                .unwrap();
+        assert_eq!(plain.0, with_none.0);
+        assert!(bits_to_pulses_band_loop_cached_thresh(
+            2,
+            0,
+            &[4, 8, 16],
+            &[60, 120, 200],
+            Some(&[8, 8])
+        )
+        .is_none());
+    }
+
+    /// A zero thresh never skips: identical to the plain walk.
+    #[test]
+    fn thresh_floor_zero_never_skips() {
+        let n = [2u32, 4, 8];
+        let t = [40u32, 80, 120];
+        let plain = bits_to_pulses_band_loop_cached(1, 4, &n, &t).unwrap();
+        let zeroed =
+            bits_to_pulses_band_loop_cached_thresh(1, 4, &n, &t, Some(&[0, 0, 0])).unwrap();
+        assert_eq!(plain.0, zeroed.0);
     }
 
     /// Out-of-range absolute band index falls back to the estimator

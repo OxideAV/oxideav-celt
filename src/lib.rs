@@ -364,9 +364,10 @@ pub use bit_allocation::{
     BandAllocationGates, DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE,
 };
 pub use bits_to_pulses::{
-    bits_to_pulses_band_loop, bits_to_pulses_band_loop_cached, bits_to_pulses_search,
-    cost_log2_v_count_8th, BalanceAccumulator, BitsToPulses, DEFAULT_BALANCE_DIVISOR,
-    EIGHTH_BITS_PER_BIT, K_SEARCH_CAP, LAST_BALANCE_DIVISOR, SECOND_TO_LAST_BALANCE_DIVISOR,
+    bits_to_pulses_band_loop, bits_to_pulses_band_loop_cached,
+    bits_to_pulses_band_loop_cached_thresh, bits_to_pulses_search, cost_log2_v_count_8th,
+    BalanceAccumulator, BitsToPulses, DEFAULT_BALANCE_DIVISOR, EIGHTH_BITS_PER_BIT, K_SEARCH_CAP,
+    LAST_BALANCE_DIVISOR, SECOND_TO_LAST_BALANCE_DIVISOR,
 };
 pub use coarse_energy::{
     decode_coarse_energy, encode_coarse_energy, CoarseEnergyState, BETA_COEF_Q15, INTRA_ALPHA_Q15,
@@ -431,7 +432,8 @@ pub use post_filter::{
 };
 pub use pulse_cache::{
     cache_cost_8th, cache_max_k, cache_offset, cache_offset_half_block, cache_stored_qbits,
-    cached_bits_to_pulses, CachedPulses, CACHE_BITS50, CACHE_INDEX50, NUM_FRAME_LM, NUM_LM_ROWS,
+    cached_bits_to_pulses, cached_bits_to_pulses_extended, cost_exact_8th, CachedPulses,
+    CACHE_BITS50, CACHE_INDEX50, EXTENDED_K_CAP, NUM_FRAME_LM, NUM_LM_ROWS,
 };
 pub use pvq::{
     decode_index_to_pulses, decode_pulses, decode_unit_shape, encode_pulses,

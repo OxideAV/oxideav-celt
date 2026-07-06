@@ -83,8 +83,9 @@
 //! source was consulted.
 
 use crate::alloc_combine::find_combined_alloc;
+use crate::band_minimums::compute_thresh;
 use crate::band_minimums::BAND_BINS_LM;
-use crate::bits_to_pulses::bits_to_pulses_band_loop_cached;
+use crate::bits_to_pulses::bits_to_pulses_band_loop_cached_thresh;
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::frame_decode::{decode_frame_prefix, FramePrefix};
 use crate::frame_synthesis::{decode_celt_frame, CeltDecodeState, DecodedFrame};
@@ -209,8 +210,18 @@ pub fn derive_band_pulses(
     // construction (the combine step floors at zero).
     let targets: Vec<u32> = search.alloc.bits.iter().map(|&b| b.max(0) as u32).collect();
 
+    // §4.3.3 hard-minimum skip floor: `thresh[band] = max((24*N)/16,
+    // 8*channels)` — a band whose adjusted target falls below it is
+    // better served by no allocation at all (see
+    // `bits_to_pulses_band_loop_cached_thresh`).
+    let mut thresh_i32 = vec![0i32; bins.len()];
+    if !compute_thresh(channels, &bins, &mut thresh_i32) {
+        return None;
+    }
+    let thresh: Vec<u32> = thresh_i32.iter().map(|&t| t.max(0) as u32).collect();
+
     let (per_band, _balance) =
-        bits_to_pulses_band_loop_cached(lm as usize, start, &bins, &targets)?;
+        bits_to_pulses_band_loop_cached_thresh(lm as usize, start, &bins, &targets, Some(&thresh))?;
 
     Some(
         per_band
@@ -284,8 +295,17 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
         .map(|&b| (b.max(0) as u32) / 2)
         .collect();
 
+    // §4.3.3 hard-minimum skip floor, halved onto the per-channel
+    // axis the dual targets live on (thresh is computed for the
+    // 2-channel frame; each channel's share carries half of it).
+    let mut thresh_i32 = vec![0i32; bins.len()];
+    if !compute_thresh(2, &bins, &mut thresh_i32) {
+        return None;
+    }
+    let thresh: Vec<u32> = thresh_i32.iter().map(|&t| (t.max(0) as u32) / 2).collect();
+
     let (per_band, _balance) =
-        bits_to_pulses_band_loop_cached(lm as usize, start, &bins, &targets)?;
+        bits_to_pulses_band_loop_cached_thresh(lm as usize, start, &bins, &targets, Some(&thresh))?;
 
     Some(
         per_band
