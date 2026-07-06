@@ -138,9 +138,9 @@ identity test at every `LM`:
   `pcm_encode`) — the top-level PCM driver, the encode-side mirror of
   `CeltDecodeState`: carries the pre-emphasis FIR tap, the MDCT
   analysis history, and the §4.3.2.1 coarse prediction across frames;
-  any error leaves the streaming state untouched. A signalled
-  post-filter is rejected (the §5.3.1 pitch pre-filter *search* is
-  described only as optimization criteria).
+  any error leaves the streaming state untouched. Since r393 a
+  signalled post-filter is honoured (the §5.3.1 pitch pre-filter is
+  applied after pre-emphasis; see below).
 * `encoder_decisions::choose_band_boosts` — the §5.3.4.1 band-boost
   rule (`D_j = 2E_j - E_{j-1} - E_{j+1}` vs `(t1, t2) = (2, 4)` for
   `LM >= 1` / `(3, 5)` below, one §4.3.3 dynalloc quantum per boost),
@@ -171,9 +171,9 @@ encoder's bit-exact reconstruction, waveform fidelity on a tonal
 signal (steady-state relative L2 error < 0.8, correlation > 0.6 with
 no fine bits spent), and spectral closure (re-analyzing the decoded
 PCM recovers the encoder's reconstructed spectra one frame delayed).
-Remaining encode-side gaps: the codec-registration entry point, the
-§5.3.1 pitch pre-filter (period search unspecified), and transient
-(short-block) analysis (§4.3.1 geometry docs gap).
+Remaining encode-side gaps: the codec-registration entry point and
+transient (short-block) analysis (§4.3.1 geometry docs gap); the
+§5.3.1 pitch pre-filter landed in r393 (below).
 
 **Stereo PCM codec loop (dual/uncoupled path), r389.** The stereo
 dimension now closes the same loop the mono side closed in r385:
@@ -256,10 +256,28 @@ rule and §5.3.3 intra/inter selection, the crate now carries:
   RFC's printed "84-84" row is read as the 68–84 gap it leaves
   (apparent erratum). Decision-only for the same reason.
 
-The §5.3.1 encoder-side post-filter (pitch pre-filter) decision
-remains a docs gap: the RFC gives only optimization criteria
-(continuity, avoidance of pitch multiples), not a period search, so
-the PCM encoders keep rejecting a signalled post-filter.
+**§5.3.1 pitch pre-filter + pitch search, r393.**
+`apply_pitch_prefilter_transition_f32` is the exact FIR inverse of the
+decoder's §4.3.7.1 post-filter transition ("applied in such a way as
+to be the inverse of the decoder's post-filter"): the post-filter
+recursion `y = x + L[y_past]` inverts to `x = in - L[in_past]` over
+the pristine input history, with the same squared-window parameter
+crossfade — pinned by a multi-frame identity test. `pitch_search` /
+`choose_post_filter_params` (module `pitch`) implement the two §5.3.1
+criteria the RFC states — continuity and avoidance of pitch multiples
+— as a normalized-autocorrelation scan with a sub-period demotion
+pass and a previous-period preference window (the algorithm and
+thresholds are documented in-crate encoder freedom; §5.3 grants it).
+`encode_celt_frame_pcm_auto` honours a signalled post-filter
+(`PostFilter::from_period` derives the wire octave), closing the
+§5.3.1/§4.3.7.1 loop end to end on the mono path; the stereo PCM
+drivers still reject one (per-channel front-end wiring, not a docs
+gap). Two latent decode-side §4.3.7.1 history defects fixed along the
+way: the cross-frame history was stored in forward order (the
+transition contract is most-recent-first) at one-frame depth (too
+short for legal periods up to 1022 at small LMs) — now
+most-recent-first at `POST_FILTER_PERIOD_MAX + 2` on both decode
+paths.
 
 **Corrected pulse cache + allocation pricing to exhaustion, r393.**
 The docs trace correction (#184) established the `cache_index50` /
