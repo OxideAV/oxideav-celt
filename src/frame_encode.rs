@@ -348,7 +348,7 @@ pub fn encode_celt_frame(
         frame_bytes,
         start,
         end,
-        fine_bits,
+        Some(fine_bits),
         Some(band_k),
         None,
     )
@@ -367,10 +367,10 @@ pub fn encode_celt_frame(
 /// round-trips), so both sides land on the same `band_k` with **no
 /// allocation exchanged out of band**: `encode_celt_frame_auto` →
 /// [`decode_celt_frame_auto`](crate::derive_pulses::decode_celt_frame_auto)
-/// is a fully self-contained codec loop. Like the auto-decoder, no
-/// fine-energy refinement is spent (`fine_bits = 0`, the RFC-deferred
-/// fine/shape split approximated by treating the whole combined
-/// allocation as shape).
+/// is a fully self-contained codec loop. The fine-energy bits are
+/// derived alongside the pulse counts (the in-crate fine/shape split
+/// `derive_band_allocation` documents), so both sides spend the same
+/// per-band refinement with no out-of-band data.
 ///
 /// The §4.3.3 dynalloc band boosts are chosen by the §5.3.4.1
 /// contrast rule
@@ -393,7 +393,6 @@ pub fn encode_celt_frame_auto(
     start: usize,
     end: usize,
 ) -> Result<EncodedFrame, Error> {
-    let fine_bits = [0u32; NUM_BANDS];
     encode_celt_frame_impl(
         coarse_state,
         spectrum,
@@ -402,7 +401,7 @@ pub fn encode_celt_frame_auto(
         frame_bytes,
         start,
         end,
-        &fine_bits,
+        None,
         None,
         None,
     )
@@ -430,7 +429,6 @@ pub fn encode_celt_frame_auto_boosted(
     end: usize,
     target_boost: &[i32],
 ) -> Result<EncodedFrame, Error> {
-    let fine_bits = [0u32; NUM_BANDS];
     encode_celt_frame_impl(
         coarse_state,
         spectrum,
@@ -439,7 +437,7 @@ pub fn encode_celt_frame_auto_boosted(
         frame_bytes,
         start,
         end,
-        &fine_bits,
+        None,
         None,
         Some(target_boost),
     )
@@ -460,7 +458,7 @@ fn encode_celt_frame_impl(
     frame_bytes: u32,
     start: usize,
     end: usize,
-    fine_bits: &[u32; NUM_BANDS],
+    fine_bits: Option<&[u32; NUM_BANDS]>,
     band_k: Option<&[u32]>,
     target_boost: Option<&[i32]>,
 ) -> Result<EncodedFrame, Error> {
@@ -584,17 +582,26 @@ fn encode_celt_frame_impl(
     // just-encoded prefix via the documented §4.3.3 → §4.3.4.1 seam
     // (the identical derivation the auto-decoder runs over the decoded
     // prefix).
-    let derived_k;
-    let band_k: &[u32] = match band_k {
-        Some(k) => k,
-        None if header.silence => {
-            derived_k = vec![0u32; coded_bands];
-            &derived_k
+    let derived_alloc;
+    let zero_alloc;
+    let (band_k, fine_bits): (&[u32], &[u32; NUM_BANDS]) = match (band_k, fine_bits) {
+        (Some(k), Some(fb)) => (k, fb),
+        (Some(k), None) => {
+            zero_alloc = (Vec::new(), [0u32; NUM_BANDS]);
+            (k, &zero_alloc.1)
         }
-        None => {
-            derived_k = crate::derive_pulses::derive_band_pulses(&prefix, lm, 1, false)
+        (None, _) if header.silence => {
+            zero_alloc = (vec![0u32; coded_bands], [0u32; NUM_BANDS]);
+            (&zero_alloc.0, &zero_alloc.1)
+        }
+        (None, _) => {
+            // Derived allocation: pulse counts AND fine bits from the
+            // just-encoded prefix — the identical derivation the
+            // auto-decoder runs over the decoded (bit-identical)
+            // prefix, so both sides split fine from shape in lockstep.
+            derived_alloc = crate::derive_pulses::derive_band_allocation(&prefix, lm, 1, false)
                 .ok_or(Error::InvalidParameter)?;
-            &derived_k
+            (&derived_alloc.band_k, &derived_alloc.fine_bits)
         }
     };
 
@@ -733,7 +740,7 @@ pub fn encode_stereo_celt_frame(
         frame_bytes,
         start,
         end,
-        fine_bits,
+        Some(fine_bits),
         Some(band_k),
     )
 }
@@ -748,8 +755,9 @@ pub fn encode_stereo_celt_frame(
 /// Both sides derive the identical `band_k` from the bit-identical
 /// prefix, so `encode_stereo_celt_frame_auto` →
 /// `decode_stereo_frame_auto` is a fully self-contained stereo codec
-/// loop with no out-of-band data. No fine-energy bits are spent
-/// (`fine_bits = 0`, the RFC-deferred fine/shape split). The §4.3.3
+/// loop with no out-of-band data. Fine-energy bits are derived
+/// alongside the pulse counts (`derive_band_allocation_dual`'s
+/// in-crate fine/shape split). The §4.3.3
 /// band boosts are chosen by the §5.3.4.1 contrast rule over the
 /// per-band **maximum** of the two channels' log-energies (a band
 /// poking out in either channel earns the boost — an in-crate encoder
@@ -765,7 +773,6 @@ pub fn encode_stereo_celt_frame_auto(
     start: usize,
     end: usize,
 ) -> Result<StereoEncodedFrame, Error> {
-    let fine_bits = [0u32; NUM_BANDS];
     encode_stereo_celt_frame_impl(
         coarse_state,
         left_spectrum,
@@ -775,7 +782,7 @@ pub fn encode_stereo_celt_frame_auto(
         frame_bytes,
         start,
         end,
-        &fine_bits,
+        None,
         None,
     )
 }
@@ -791,7 +798,7 @@ fn encode_stereo_celt_frame_impl(
     frame_bytes: u32,
     start: usize,
     end: usize,
-    fine_bits: &[u32; NUM_BANDS],
+    fine_bits: Option<&[u32; NUM_BANDS]>,
     band_k: Option<&[u32]>,
 ) -> Result<StereoEncodedFrame, Error> {
     if lm > 3 || start > end || end > NUM_BANDS {
@@ -916,20 +923,26 @@ fn encode_stereo_celt_frame_impl(
         return Err(Error::NotImplemented);
     }
 
-    // Shared per-band pulse counts: caller-supplied, silence-zero, or
-    // derived from the just-encoded prefix (the identical derivation
-    // the auto-decoder runs over the decoded prefix).
-    let derived_k;
-    let band_k: &[u32] = match band_k {
-        Some(k) => k,
-        None if header.silence => {
-            derived_k = vec![0u32; coded_bands];
-            &derived_k
+    // Shared per-band pulse counts + fine bits: caller-supplied,
+    // silence-zero, or derived from the just-encoded prefix (the
+    // identical derivation the auto-decoder runs over the decoded
+    // prefix, fine/shape split included).
+    let derived_alloc;
+    let zero_alloc;
+    let (band_k, fine_bits): (&[u32], &[u32; NUM_BANDS]) = match (band_k, fine_bits) {
+        (Some(k), Some(fb)) => (k, fb),
+        (Some(k), None) => {
+            zero_alloc = (Vec::new(), [0u32; NUM_BANDS]);
+            (k, &zero_alloc.1)
         }
-        None => {
-            derived_k = crate::derive_pulses::derive_band_pulses_dual(&prefix, lm)
+        (None, _) if header.silence => {
+            zero_alloc = (vec![0u32; coded_bands], [0u32; NUM_BANDS]);
+            (&zero_alloc.0, &zero_alloc.1)
+        }
+        (None, _) => {
+            derived_alloc = crate::derive_pulses::derive_band_allocation_dual(&prefix, lm)
                 .ok_or(Error::InvalidParameter)?;
-            &derived_k
+            (&derived_alloc.band_k, &derived_alloc.fine_bits)
         }
     };
 

@@ -49,18 +49,20 @@
 //! decoded [`FramePrefix`] it runs the column search over the
 //! post-boost budget, then the §4.3.4.1 bits-to-pulses loop (threading
 //! the balance accumulator across the coded-band window in spec order),
-//! and returns the per-band pulse counts. It treats the whole combined
-//! column-search allocation as the **shape** budget — i.e. it makes no
-//! fine-energy reservation, which is the maximal documented
-//! approximation given the deferred fine/shape split. Each pulse count
+//! and returns the per-band pulse counts. [`derive_band_allocation`]
+//! additionally splits each band's fine-energy bits off the combined
+//! allocation first (the in-crate deterministic fine/shape split —
+//! see [`split_fine_from_band`]) and applies the §4.3.3 hard-minimum
+//! skip floor. Each pulse count
 //! is clamped to the largest `K` whose PVQ codebook `V(N, K)` is still
 //! representable in the documented single-block decode (a `K` that
 //! overflows is exactly the regime the deferred §4.3.4.4 band split
 //! exists for).
 //!
 //! [`decode_celt_frame_auto`] chains the whole thing: it decodes the
-//! prefix, derives the pulse counts, and runs the documented mono
-//! synthesis ([`decode_celt_frame`]) with no fine refinement — a
+//! prefix, derives the pulse counts **and** fine-energy bits
+//! ([`derive_band_allocation`]'s in-crate fine/shape split), and runs
+//! the documented mono synthesis ([`decode_celt_frame`]) — a
 //! caller-input-free end-to-end mono decode of the documented seam.
 //!
 //! ## Why this is not the full decode
@@ -87,6 +89,7 @@ use crate::band_minimums::compute_thresh;
 use crate::band_minimums::BAND_BINS_LM;
 use crate::bits_to_pulses::bits_to_pulses_band_loop_cached_thresh;
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
+use crate::fine_energy::MAX_FINE_BITS;
 use crate::frame_decode::{decode_frame_prefix, FramePrefix};
 use crate::frame_synthesis::{decode_celt_frame, CeltDecodeState, DecodedFrame};
 use crate::pvq::{v_count, V_COUNT_SATURATION};
@@ -147,10 +150,6 @@ const PER_SYMBOL_PROVISION_8TH: i64 = 1;
 /// count is clamped so its PVQ codebook size is representable in the
 /// documented single-block decode (see [`clamp_k_to_decodable`]).
 ///
-/// The whole combined allocation is treated as the **shape** budget (no
-/// fine reservation); this is the maximal documented approximation given
-/// the deferred fine/shape split (see the module docs).
-///
 /// ## Parameters
 ///
 /// * `prefix` — a decoded [`FramePrefix`] (from
@@ -174,6 +173,64 @@ pub fn derive_band_pulses(
     channels: u32,
     stereo: bool,
 ) -> Option<Vec<u32>> {
+    derive_band_allocation(prefix, lm, channels, stereo).map(|a| a.band_k)
+}
+
+/// A derived per-band allocation: the §4.3.4.1 pulse counts plus the
+/// fine-energy bit counts split off the same combined §4.3.3
+/// allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DerivedAllocation {
+    /// Per-coded-band PVQ pulse counts, indexed from the window origin
+    /// (`prefix.start`), length `prefix.end - prefix.start`.
+    pub band_k: Vec<u32>,
+    /// Per-band §4.3.2.2 fine-energy bit counts `B_i` on the absolute
+    /// 21-band axis (zero outside the coded window and on skipped
+    /// bands) — the shape [`decode_celt_frame`] and the frame encoders
+    /// consume directly.
+    pub fine_bits: [u32; NUM_BANDS],
+}
+
+/// Split one band's combined 1/8-bit allocation into a fine-energy
+/// bit count and the remaining shape budget — the in-crate
+/// deterministic reading of the §4.3.3 "determination of the
+/// fine-energy vs. shape split" step, whose exact algorithm RFC 6716
+/// defers to the reference.
+///
+/// The rule: `fine = min(MAX_FINE_BITS, bits / (8*channels*(N+1)))` —
+/// roughly one fine-energy bit per bit-per-sample of allocation,
+/// counting the band's gain as one extra degree of freedom alongside
+/// its `N` shape samples, so narrow bands (which RFC 6716 §4.3.3
+/// notes "receive greater benefit from the coarse energy coding")
+/// reach fine precision sooner than wide ones. The remaining shape
+/// budget is the allocation less the exact raw-bit cost of the fine
+/// field (`8*channels*fine` eighth-bits). Both codec sides derive the
+/// identical split from the bit-identical prefix.
+#[inline]
+fn split_fine_from_band(bits_8th: u32, n: u32, channels: u32) -> (u32, u32) {
+    let denom = 8 * channels * (n + 1);
+    let fine = (bits_8th / denom.max(1)).min(MAX_FINE_BITS);
+    let shape = bits_8th - 8 * channels * fine;
+    (fine, shape)
+}
+
+/// Derive the per-band pulse counts **and** fine-energy bits from a
+/// decoded [`FramePrefix`] — [`derive_band_pulses`] plus the in-crate
+/// fine/shape split ([`split_fine_from_band`]).
+///
+/// The fine bits are split off each band's combined §4.3.3 allocation
+/// first (their raw-bit cost is exact), the §4.3.3 hard-minimum skip
+/// floor and the §4.3.4.1 bits-to-pulses loop then run on the
+/// remaining shape budgets, and finally any band the floor skipped
+/// (`K = 0`) has its fine bits reclaimed to zero — a zero shape
+/// renders as silence regardless of envelope precision, so fine bits
+/// there would be spent on nothing audible.
+pub fn derive_band_allocation(
+    prefix: &FramePrefix,
+    lm: u32,
+    channels: u32,
+    stereo: bool,
+) -> Option<DerivedAllocation> {
     let start = prefix.start;
     let end = prefix.end;
     if lm > 3 || start > end || end > NUM_BANDS || !(1..=2).contains(&channels) {
@@ -205,10 +262,16 @@ pub fn derive_band_pulses(
         budget_1_8th,
     )?;
 
-    // The combined per-band shape allocation (1/8 bits) drives the
-    // §4.3.4.1 bits-to-pulses loop. Targets are non-negative by
-    // construction (the combine step floors at zero).
-    let targets: Vec<u32> = search.alloc.bits.iter().map(|&b| b.max(0) as u32).collect();
+    // The combined per-band allocation (1/8 bits): split each band's
+    // fine-energy bits off first (exact raw-bit cost), then drive the
+    // §4.3.4.1 bits-to-pulses loop with the remaining shape budgets.
+    let mut fine_bits = [0u32; NUM_BANDS];
+    let mut targets = Vec::with_capacity(bins.len());
+    for (i, (&b, &n)) in search.alloc.bits.iter().zip(bins.iter()).enumerate() {
+        let (fine, shape) = split_fine_from_band(b.max(0) as u32, n, channels);
+        fine_bits[start + i] = fine;
+        targets.push(shape);
+    }
 
     // §4.3.3 hard-minimum skip floor: `thresh[band] = max((24*N)/16,
     // 8*channels)` — a band whose adjusted target falls below it is
@@ -223,13 +286,21 @@ pub fn derive_band_pulses(
     let (per_band, _balance) =
         bits_to_pulses_band_loop_cached_thresh(lm as usize, start, &bins, &targets, Some(&thresh))?;
 
-    Some(
-        per_band
-            .iter()
-            .zip(bins.iter())
-            .map(|(r, &n)| clamp_k_to_decodable(n, r.k))
-            .collect(),
-    )
+    let band_k: Vec<u32> = per_band
+        .iter()
+        .zip(bins.iter())
+        .map(|(r, &n)| clamp_k_to_decodable(n, r.k))
+        .collect();
+
+    // Reclaim fine bits on skipped bands: a zero shape renders as
+    // silence regardless of envelope precision.
+    for (i, &k) in band_k.iter().enumerate() {
+        if k == 0 {
+            fine_bits[start + i] = 0;
+        }
+    }
+
+    Some(DerivedAllocation { band_k, fine_bits })
 }
 
 /// Derive the shared per-band pulse counts for a **dual-stereo**
@@ -260,6 +331,16 @@ pub fn derive_band_pulses(
 /// Returns `Some(band_k)` with one shared `K` per coded band, or
 /// `None` on the same failure paths as [`derive_band_pulses`].
 pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>> {
+    derive_band_allocation_dual(prefix, lm).map(|a| a.band_k)
+}
+
+/// Derive the shared per-band pulse counts **and** fine-energy bits
+/// for a dual-stereo frame — [`derive_band_pulses_dual`] plus the
+/// in-crate fine/shape split ([`split_fine_from_band`], with
+/// `channels = 2`: the dual wire writes each band's fine field once
+/// per channel, so a band's fine reservation costs `16 * B_i`
+/// eighth-bits of the combined allocation).
+pub fn derive_band_allocation_dual(prefix: &FramePrefix, lm: u32) -> Option<DerivedAllocation> {
     let start = prefix.start;
     let end = prefix.end;
     if lm > 3 || start > end || end > NUM_BANDS {
@@ -286,14 +367,16 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
         budget_1_8th,
     )?;
 
-    // Per-channel share: half the band's combined allocation (the odd
+    // Split fine bits off the combined 2-channel allocation, then the
+    // per-channel share is half the remaining shape budget (the odd
     // 1/8 bit floors away — conservative on both sides).
-    let targets: Vec<u32> = search
-        .alloc
-        .bits
-        .iter()
-        .map(|&b| (b.max(0) as u32) / 2)
-        .collect();
+    let mut fine_bits = [0u32; NUM_BANDS];
+    let mut targets = Vec::with_capacity(bins.len());
+    for (i, (&b, &n)) in search.alloc.bits.iter().zip(bins.iter()).enumerate() {
+        let (fine, shape) = split_fine_from_band(b.max(0) as u32, n, 2);
+        fine_bits[start + i] = fine;
+        targets.push(shape / 2);
+    }
 
     // §4.3.3 hard-minimum skip floor, halved onto the per-channel
     // axis the dual targets live on (thresh is computed for the
@@ -307,13 +390,19 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
     let (per_band, _balance) =
         bits_to_pulses_band_loop_cached_thresh(lm as usize, start, &bins, &targets, Some(&thresh))?;
 
-    Some(
-        per_band
-            .iter()
-            .zip(bins.iter())
-            .map(|(r, &n)| clamp_k_to_decodable(n, r.k))
-            .collect(),
-    )
+    let band_k: Vec<u32> = per_band
+        .iter()
+        .zip(bins.iter())
+        .map(|(r, &n)| clamp_k_to_decodable(n, r.k))
+        .collect();
+
+    for (i, &k) in band_k.iter().enumerate() {
+        if k == 0 {
+            fine_bits[start + i] = 0;
+        }
+    }
+
+    Some(DerivedAllocation { band_k, fine_bits })
 }
 
 /// Decode one mono, non-transient CELT frame to time-domain PCM,
@@ -321,11 +410,11 @@ pub fn derive_band_pulses_dual(prefix: &FramePrefix, lm: u32) -> Option<Vec<u32>
 /// §4.3.4.1 allocation arithmetic rather than taking them as a caller
 /// input.
 ///
-/// This is [`decode_celt_frame`] with the `band_k` (and `fine_bits`)
+/// This is [`decode_celt_frame`] with the `band_k` and `fine_bits`
 /// inputs supplied internally: it decodes the prefix, runs
-/// [`derive_band_pulses`] over it, and feeds the result back into the
-/// documented synthesis chain with no fine refinement
-/// (`fine_bits = 0`). It is the deepest caller-input-free mono decode
+/// [`derive_band_allocation`] over it (pulse counts plus the in-crate
+/// fine/shape split), and feeds the result back into the documented
+/// synthesis chain. It is the deepest caller-input-free mono decode
 /// the wall permits — every step is RFC-specified except the deferred
 /// fine/shape split, which is approximated by treating the whole
 /// combined allocation as shape (see the module docs).
@@ -385,13 +474,13 @@ pub fn decode_celt_frame_auto(
     // silence. The Table-56 walk (including coarse energy) still ran
     // above, keeping the §4.3.2.1 prediction in encoder/decoder
     // lockstep — the wire contract `encode_celt_frame_auto` writes.
-    let band_k = if prefix.header.silence {
-        vec![0u32; end - start]
+    let (band_k, fine_bits) = if prefix.header.silence {
+        (vec![0u32; end - start], [0u32; NUM_BANDS])
     } else {
-        derive_band_pulses(&prefix, lm, 1, false).ok_or(Error::InvalidParameter)?
+        let alloc = derive_band_allocation(&prefix, lm, 1, false).ok_or(Error::InvalidParameter)?;
+        (alloc.band_k, alloc.fine_bits)
     };
 
-    let fine_bits = [0u32; NUM_BANDS];
     decode_celt_frame(state, frame_bytes, start, end, &fine_bits, &band_k)
 }
 
@@ -559,8 +648,9 @@ mod tests {
     }
 
     /// `decode_celt_frame_auto` matches the manual compose:
-    /// `decode_frame_prefix` → `derive_band_pulses` → `decode_celt_frame`
-    /// with `fine_bits = 0` produces the same PCM the auto driver does.
+    /// `decode_frame_prefix` → `derive_band_allocation` →
+    /// `decode_celt_frame` with the derived `band_k` **and** derived
+    /// `fine_bits` produces the same PCM the auto driver does.
     #[test]
     fn auto_matches_manual_compose() {
         let lm = 3u32;
@@ -568,17 +658,60 @@ mod tests {
 
         // Manual compose.
         let pfx = prefix_of(&buf, lm, 0, NUM_BANDS);
-        let band_k = derive_band_pulses(&pfx, lm, 1, false).expect("derive");
+        let alloc = derive_band_allocation(&pfx, lm, 1, false).expect("derive");
         let mut s_manual = CeltDecodeState::new(lm).expect("state");
-        let fine_bits = [0u32; NUM_BANDS];
-        let manual =
-            decode_celt_frame(&mut s_manual, &buf, 0, NUM_BANDS, &fine_bits, &band_k).unwrap();
+        let manual = decode_celt_frame(
+            &mut s_manual,
+            &buf,
+            0,
+            NUM_BANDS,
+            &alloc.fine_bits,
+            &alloc.band_k,
+        )
+        .unwrap();
 
         // Auto compose.
         let mut s_auto = CeltDecodeState::new(lm).expect("state");
         let auto = decode_celt_frame_auto(&mut s_auto, &buf, 0, NUM_BANDS).unwrap();
 
         assert_eq!(auto.pcm, manual.pcm, "auto / manual PCM diverge");
+    }
+
+    /// The derived allocation splits fine bits off the same combined
+    /// §4.3.3 allocation the pulse counts draw on: fine bits are
+    /// bounded by `MAX_FINE_BITS`, zero outside the coded window,
+    /// zero on skipped (`K = 0`) bands, and the delegating
+    /// `derive_band_pulses` returns exactly the allocation's `band_k`.
+    #[test]
+    fn derived_allocation_fine_bits_are_coherent() {
+        let lm = 2u32;
+        let buf = nontransient_payload(64, lm, 0, NUM_BANDS);
+        let pfx = prefix_of(&buf, lm, 0, NUM_BANDS);
+
+        let alloc = derive_band_allocation(&pfx, lm, 1, false).expect("derive");
+        let only_k = derive_band_pulses(&pfx, lm, 1, false).expect("derive k");
+        assert_eq!(alloc.band_k, only_k);
+
+        for band in 0..NUM_BANDS {
+            assert!(
+                alloc.fine_bits[band] <= crate::fine_energy::MAX_FINE_BITS,
+                "band {band} fine {} over cap",
+                alloc.fine_bits[band]
+            );
+            if alloc.band_k[band] == 0 {
+                assert_eq!(
+                    alloc.fine_bits[band], 0,
+                    "band {band}: fine bits on a skipped band"
+                );
+            }
+        }
+
+        // A well-funded frame spends at least one fine bit somewhere
+        // (the whole point of the split).
+        assert!(
+            alloc.fine_bits.iter().sum::<u32>() > 0,
+            "no fine bits derived on a 64-byte frame"
+        );
     }
 
     /// A transient frame is rejected with `NotImplemented`, not silently

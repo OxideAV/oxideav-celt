@@ -777,8 +777,10 @@ impl StereoCeltDecodeState {
     /// [`decode_celt_frame_auto`](crate::derive_pulses::decode_celt_frame_auto),
     /// and the decode side of the self-contained stereo codec loop
     /// ([`encode_stereo_celt_frame_auto`](crate::frame_encode::encode_stereo_celt_frame_auto)
-    /// writes the matching frames). No fine refinement is spent
-    /// (`fine_bits = 0`, the RFC-deferred fine/shape split).
+    /// writes the matching frames). Fine-energy bits are derived
+    /// alongside the pulse counts
+    /// ([`derive_band_allocation_dual`](crate::derive_pulses::derive_band_allocation_dual)'s
+    /// in-crate fine/shape split).
     pub fn decode_stereo_frame_auto(
         &mut self,
         frame_bytes: &[u8],
@@ -810,14 +812,14 @@ impl StereoCeltDecodeState {
             return Err(Error::NotImplemented);
         }
 
-        let band_k = if prefix.header.silence {
-            vec![0u32; end - start]
+        let (band_k, fine_bits) = if prefix.header.silence {
+            (vec![0u32; end - start], [0u32; NUM_BANDS])
         } else {
-            crate::derive_pulses::derive_band_pulses_dual(&prefix, lm)
-                .ok_or(Error::InvalidParameter)?
+            let alloc = crate::derive_pulses::derive_band_allocation_dual(&prefix, lm)
+                .ok_or(Error::InvalidParameter)?;
+            (alloc.band_k, alloc.fine_bits)
         };
 
-        let fine_bits = [0u32; NUM_BANDS];
         self.decode_stereo_frame_coded(frame_bytes, start, end, &fine_bits, &band_k)
     }
 

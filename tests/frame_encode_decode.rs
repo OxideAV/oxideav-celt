@@ -17,9 +17,8 @@
 
 use oxideav_celt::{
     band_bins, coded_total_bins, decode_celt_frame, decode_celt_frame_auto, decode_fine_energy,
-    decode_frame_prefix, decode_residual_bands, derive_band_pulses, encode_celt_frame,
-    encode_celt_frame_auto, v_count, CeltDecodeState, CeltFrameHeader, CoarseEnergyState,
-    PostFilter, RangeDecoder, NUM_BANDS,
+    decode_frame_prefix, decode_residual_bands, encode_celt_frame, encode_celt_frame_auto, v_count,
+    CeltDecodeState, CeltFrameHeader, CoarseEnergyState, PostFilter, RangeDecoder, NUM_BANDS,
 };
 
 const FRAME_BYTES: u32 = 160;
@@ -378,16 +377,16 @@ fn auto_encode_auto_decode_self_contained_loop() {
     // Encoder and decoder coarse prediction stay in lockstep.
     assert_eq!(enc_state.energy[0], state.coarse_energy().energy[0]);
 
-    // Bit-exact spectrum check: derive band_k from the encoder's
-    // returned prefix (the same values the auto-decoder derives from
-    // its decoded copy) and walk the residual manually.
-    let band_k = derive_band_pulses(&encoded.prefix, lm, 1, false).unwrap();
+    // Bit-exact spectrum check: derive band_k AND fine_bits from the
+    // encoder's returned prefix (the same values the auto-decoder
+    // derives from its decoded copy) and walk the residual manually.
+    let alloc = oxideav_celt::derive_band_allocation(&encoded.prefix, lm, 1, false).unwrap();
+    let band_k = alloc.band_k;
     let mut dec = RangeDecoder::new(&encoded.bytes);
     let mut dec_state = CoarseEnergyState::new();
     let prefix =
         decode_frame_prefix(&mut dec, &mut dec_state, lm, FRAME_BYTES, false, start, end).unwrap();
-    let fine_bits = [0u32; NUM_BANDS];
-    let fine_q14 = decode_fine_energy(&mut dec, &fine_bits);
+    let fine_q14 = decode_fine_energy(&mut dec, &alloc.fine_bits);
     let env_q8 =
         oxideav_celt::assemble_band_log_energy_q8(&dec_state, 0, Some(&fine_q14), None).unwrap();
     assert_eq!(env_q8, encoded.envelope_q8);
