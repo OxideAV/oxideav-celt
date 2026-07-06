@@ -437,10 +437,239 @@ pub fn apply_post_filter_transition_f32(
     n_total
 }
 
+/// Apply the §5.3.1 **pitch pre-filter** to one block in place — the
+/// encoder-side inverse of [`apply_post_filter_transition_f32`].
+///
+/// RFC 6716 §5.3.1: "The pitch pre-filter is applied after the
+/// pre-emphasis. It is applied in such a way as to be the inverse of
+/// the decoder's post-filter." The post-filter recursion is
+/// `y(n) = x(n) + L[y_past](n)` where `L` is the gain-scaled §4.3.7.1
+/// comb lobe over the filter's own *output* history; its exact inverse
+/// is the pure FIR `x(n) = in(n) - L[in_past](n)` over the pristine
+/// *input* history — when the decoder's post-filter then runs on `x`
+/// with matching parameters and aligned history, `y ≡ in` holds by
+/// induction (each side adds/subtracts the same lobe value computed
+/// from the same samples). The blend mirrors the decoder's §4.3.7.1
+/// gain-transition crossfade exactly: over the first `overlap` samples
+/// the previous frame's parameters contribute `(1 - w²)` and the
+/// current frame's `w²`, with the same squared synthesis window.
+///
+/// * `out` — the block to pre-filter in place (pre-emphasized input;
+///   the comb reads a pristine copy, not the filtered output).
+/// * `prev_input` — most-recent-first history of *unfiltered*
+///   pre-emphasized input from previous blocks (`prev_input[0]` is the
+///   immediately preceding sample). Should span at least
+///   `POST_FILTER_PERIOD_MAX + 2` samples for full-depth periods;
+///   missing history reads as zero (startup).
+/// * `prev` / `cur` — the previous and current frames' §4.3.7.1
+///   parameters (the same pair the decoder feeds its transition).
+/// * `overlap` — the §4.3.7.1 transition-region length (the decoder
+///   uses `CELT_OVERLAP`).
+///
+/// Returns the number of samples written (`out.len()`).
+pub fn apply_pitch_prefilter_transition_f32(
+    out: &mut [f32],
+    prev_input: &[f32],
+    prev: PostFilterParams,
+    cur: PostFilterParams,
+    overlap: usize,
+) -> usize {
+    use crate::mdct::celt_window_f32;
+
+    let n_total = out.len();
+    // The comb reads the pristine input, never the filtered output.
+    let orig: Vec<f32> = out.to_vec();
+
+    let g_old = prev.gain();
+    let g_new = cur.gain();
+    let t_old = (prev.period.max(POST_FILTER_PERIOD_MIN)) as usize;
+    let t_new = (cur.period.max(POST_FILTER_PERIOD_MIN)) as usize;
+    let (o0, o1, o2) = tap_coefficients_f32(prev.tapset);
+    let (c0, c1, c2) = tap_coefficients_f32(cur.tapset);
+
+    let region = overlap.min(n_total);
+
+    for n in 0..n_total {
+        let x = orig[n];
+        let lookup = |back: usize| -> f32 {
+            if back == 0 {
+                return 0.0;
+            }
+            if back <= n {
+                orig[n - back]
+            } else {
+                let pi = back - n - 1;
+                if pi < prev_input.len() {
+                    prev_input[pi]
+                } else {
+                    0.0
+                }
+            }
+        };
+
+        let new_lobe = if g_new != 0.0 {
+            let centre = lookup(t_new);
+            let p1 = lookup(t_new.saturating_sub(1));
+            let m1 = lookup(t_new + 1);
+            let p2 = lookup(t_new.saturating_sub(2));
+            let m2 = lookup(t_new + 2);
+            g_new * (c0 * centre + c1 * (p1 + m1) + c2 * (p2 + m2))
+        } else {
+            0.0
+        };
+
+        if n < region {
+            let w = celt_window_f32(n, region);
+            let w2 = w * w;
+            let old_lobe = if g_old != 0.0 {
+                let centre = lookup(t_old);
+                let p1 = lookup(t_old.saturating_sub(1));
+                let m1 = lookup(t_old + 1);
+                let p2 = lookup(t_old.saturating_sub(2));
+                let m2 = lookup(t_old + 2);
+                g_old * (o0 * centre + o1 * (p1 + m1) + o2 * (p2 + m2))
+            } else {
+                0.0
+            };
+            // Mirror the decoder's `x + (1-w2)*old + w2*new` term
+            // order so the inverse cancels to the ulp.
+            out[n] = x - ((1.0 - w2) * old_lobe + w2 * new_lobe);
+        } else {
+            out[n] = x - new_lobe;
+        }
+    }
+    n_total
+}
+
 #[cfg(test)]
 #[allow(clippy::excessive_precision)]
 mod tests {
     use super::*;
+
+    /// Deterministic pseudo-random signal in [-1, 1).
+    fn prefilter_test_signal(len: usize, mut seed: u32) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    /// **§5.3.1 inverse identity.** Pre-filtering a multi-frame stream
+    /// (with per-frame parameter changes, exercising the transition
+    /// crossfade) and then post-filtering the result with the same
+    /// parameter sequence recovers the original signal: each side
+    /// adds/subtracts the same comb lobe computed from the same
+    /// samples, so the loop closes to rounding noise.
+    #[test]
+    fn prefilter_then_postfilter_is_identity() {
+        let n = 480usize;
+        let overlap = 120usize;
+        let frames = 5usize;
+        let input = prefilter_test_signal(frames * n, 0xF17E);
+
+        let params = [
+            PostFilterParams::OFF,
+            PostFilterParams {
+                enabled: true,
+                period: 97,
+                gain_index: 5,
+                tapset: 0,
+            },
+            PostFilterParams {
+                enabled: true,
+                period: 97,
+                gain_index: 5,
+                tapset: 0,
+            },
+            PostFilterParams {
+                enabled: true,
+                period: 233,
+                gain_index: 7,
+                tapset: 2,
+            },
+            PostFilterParams::OFF,
+        ];
+
+        // Encoder side: pre-filter with unfiltered-input history.
+        let hist_len = POST_FILTER_PERIOD_MAX as usize + 2;
+        let mut pre_out = Vec::with_capacity(frames * n);
+        let mut prev_params = PostFilterParams::OFF;
+        for t in 0..frames {
+            let mut block = input[t * n..(t + 1) * n].to_vec();
+            // Most-recent-first unfiltered history.
+            let mut prev_input = vec![0.0f32; hist_len];
+            for (i, slot) in prev_input.iter_mut().enumerate() {
+                let idx = t * n;
+                if i < idx {
+                    *slot = input[idx - 1 - i];
+                }
+            }
+            apply_pitch_prefilter_transition_f32(
+                &mut block,
+                &prev_input,
+                prev_params,
+                params[t],
+                overlap,
+            );
+            pre_out.extend_from_slice(&block);
+            prev_params = params[t];
+        }
+
+        // Decoder side: post-filter with filtered-output history.
+        let mut post_out = Vec::with_capacity(frames * n);
+        let mut prev_params = PostFilterParams::OFF;
+        for t in 0..frames {
+            let mut block = pre_out[t * n..(t + 1) * n].to_vec();
+            let mut prev_output = vec![0.0f32; hist_len];
+            for (i, slot) in prev_output.iter_mut().enumerate() {
+                let idx = t * n;
+                if i < idx {
+                    *slot = post_out[idx - 1 - i];
+                }
+            }
+            apply_post_filter_transition_f32(
+                &mut block,
+                &prev_output,
+                prev_params,
+                params[t],
+                overlap,
+            );
+            post_out.extend_from_slice(&block);
+            prev_params = params[t];
+        }
+
+        for (i, (&want, &got)) in input.iter().zip(post_out.iter()).enumerate() {
+            assert!(
+                (want - got).abs() <= 1e-5,
+                "sample {i}: {got} vs original {want}"
+            );
+        }
+        // The pre-filter actually did something on the filtered frames.
+        let mid = &pre_out[n..2 * n];
+        assert!(
+            mid.iter()
+                .zip(&input[n..2 * n])
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "pre-filter was a no-op on an enabled frame"
+        );
+    }
+
+    /// OFF → OFF pre-filtering is exact passthrough.
+    #[test]
+    fn prefilter_off_is_passthrough() {
+        let input = prefilter_test_signal(240, 3);
+        let mut block = input.clone();
+        apply_pitch_prefilter_transition_f32(
+            &mut block,
+            &[],
+            PostFilterParams::OFF,
+            PostFilterParams::OFF,
+            120,
+        );
+        assert_eq!(block, input);
+    }
 
     /// The three tap rows are transcribed from §4.3.7.1; the f32
     /// constants must equal the RFC's decimal listings to f32

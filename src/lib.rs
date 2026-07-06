@@ -316,6 +316,7 @@ pub mod hadamard;
 pub mod laplace;
 pub mod mdct;
 pub mod pcm_encode;
+pub mod pitch;
 pub mod post_filter;
 pub mod pulse_cache;
 pub mod pvq;
@@ -428,10 +429,14 @@ pub use pcm_encode::{
     encode_celt_frame_pcm, encode_celt_frame_pcm_auto, encode_stereo_celt_frame_pcm,
     encode_stereo_celt_frame_pcm_auto, CeltEncodeState, StereoCeltEncodeState,
 };
+pub use pitch::{
+    choose_post_filter_params, pitch_search, PitchEstimate, CONTINUITY_HALF_WIDTH,
+    CONTINUITY_RATIO, MIN_PITCH_CORRELATION, MULTIPLE_AVOIDANCE_RATIO,
+};
 pub use post_filter::{
-    apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,
-    tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN,
-    POST_FILTER_TAPS_F32, POST_FILTER_TAPS_Q15, TAPS_PER_SET,
+    apply_pitch_prefilter_transition_f32, apply_post_filter_f32, filter_sample_f32, gain_f32,
+    gain_q15, tap_coefficients_f32, tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX,
+    POST_FILTER_PERIOD_MIN, POST_FILTER_TAPS_F32, POST_FILTER_TAPS_Q15, TAPS_PER_SET,
 };
 pub use pulse_cache::{
     cache_cost_8th, cache_max_k, cache_offset, cache_offset_half_block, cache_stored_qbits,
