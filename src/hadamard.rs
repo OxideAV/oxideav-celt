@@ -203,6 +203,72 @@ pub fn apply_tf_resolution_change(band: &mut [f32], tf_adjustment: i8, nb_blocks
     }
 }
 
+/// In-place **inverse** of [`walsh_hadamard_sequency_inplace`].
+///
+/// The forward sequency transform is `R ∘ H` (orthonormal natural-order
+/// WHT `H`, then the sequency reorder `R`); its inverse is therefore
+/// `H ∘ R⁻¹` — undo the reorder first, then apply the self-inverse
+/// orthonormal `H`. Same shape contract as
+/// [`walsh_hadamard_inplace`].
+#[inline]
+pub fn walsh_hadamard_sequency_inverse_inplace(samples: &mut [f32], levels: u32) {
+    sequency_reorder_inverse_inplace(samples, levels);
+    walsh_hadamard_inplace(samples, levels);
+}
+
+/// Apply the exact **inverse** of [`apply_tf_resolution_change`], in
+/// place — the encode-direction TF transform (RFC 6716 §5.3: "the
+/// filters and rotations in the encoder are simply the inverse of the
+/// operation performed by the decoder").
+///
+/// Same parameters and shape contract as
+/// [`apply_tf_resolution_change`]; `tf_adjustment` is the **decoder's**
+/// adjustment (the encoder inverts it, it does not negate it). The
+/// positive (across-blocks, natural-order) branch is its own inverse
+/// (the orthonormal Hadamard matrix is involutive); the negative
+/// (per-block, sequency-ordered) branch undoes the sequency reorder
+/// before the involutive butterfly cascade.
+///
+/// Returns `true` on success, `false` (band untouched) on the same
+/// shape violations `apply_tf_resolution_change` rejects.
+pub fn apply_tf_resolution_change_inverse(
+    band: &mut [f32],
+    tf_adjustment: i8,
+    nb_blocks: usize,
+) -> bool {
+    if tf_adjustment == 0 {
+        return true;
+    }
+    if nb_blocks == 0 || band.is_empty() || band.len() % nb_blocks != 0 {
+        return false;
+    }
+    let sub_len = band.len() / nb_blocks;
+    let levels_abs = (tf_adjustment.unsigned_abs()) as u32;
+
+    if tf_adjustment < 0 {
+        if !is_power_of_two(sub_len) {
+            return false;
+        }
+        let sub_levels = sub_len.trailing_zeros();
+        if levels_abs > sub_levels {
+            return false;
+        }
+        let sub_xform_len = 1usize << levels_abs;
+        for block in 0..nb_blocks {
+            let start = block * sub_len;
+            walsh_hadamard_sequency_inverse_inplace(
+                &mut band[start..start + sub_xform_len],
+                levels_abs,
+            );
+        }
+        true
+    } else {
+        // The natural-order across-blocks branch is involutive: the
+        // forward pass is its own inverse.
+        apply_tf_resolution_change(band, tf_adjustment, nb_blocks)
+    }
+}
+
 // --- Private helpers -------------------------------------------------
 
 #[inline]
@@ -252,6 +318,21 @@ fn sequency_reorder_inplace(samples: &mut [f32], levels: u32) {
         *slot = samples[src];
     }
     samples.copy_from_slice(&reordered);
+}
+
+/// The exact inverse of [`sequency_reorder_inplace`]: scatter each
+/// sequency-ordered coefficient back to its natural-Hadamard bin.
+fn sequency_reorder_inverse_inplace(samples: &mut [f32], levels: u32) {
+    if levels == 0 {
+        return;
+    }
+    let n = 1usize << levels;
+    debug_assert_eq!(samples.len(), n);
+    let mut natural = vec![0.0f32; n];
+    for (i, &v) in samples.iter().enumerate() {
+        natural[gray_then_bit_reverse(i, levels)] = v;
+    }
+    samples.copy_from_slice(&natural);
 }
 
 /// Compute `bit_reverse(gray_code(i), levels)` — the index in the
@@ -423,6 +504,103 @@ mod tests {
 
         let mut band = [0.0f32; 8]; // 3 blocks ≠ power-of-two
         assert!(!apply_tf_resolution_change(&mut band, 1, 3));
+    }
+
+    /// Deterministic pseudo-random band for the inverse tests.
+    fn test_band(len: usize, mut seed: u32) -> Vec<f32> {
+        (0..len)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    /// The sequency inverse undoes the sequency forward exactly (both
+    /// composition orders), for every level count.
+    #[test]
+    fn sequency_inverse_round_trips() {
+        for levels in 1..=5u32 {
+            let n = 1usize << levels;
+            let original = test_band(n, 0xACE + levels);
+            // inverse(forward(x)) == x
+            let mut buf = original.clone();
+            walsh_hadamard_sequency_inplace(&mut buf, levels);
+            walsh_hadamard_sequency_inverse_inplace(&mut buf, levels);
+            for (got, want) in buf.iter().zip(original.iter()) {
+                assert!((got - want).abs() < 1e-5, "inv∘fwd broken at {levels}");
+            }
+            // forward(inverse(x)) == x
+            let mut buf = original.clone();
+            walsh_hadamard_sequency_inverse_inplace(&mut buf, levels);
+            walsh_hadamard_sequency_inplace(&mut buf, levels);
+            for (got, want) in buf.iter().zip(original.iter()) {
+                assert!((got - want).abs() < 1e-5, "fwd∘inv broken at {levels}");
+            }
+        }
+    }
+
+    /// `apply_tf_resolution_change_inverse` undoes
+    /// `apply_tf_resolution_change` exactly for every adjustment sign
+    /// and a spread of band shapes (both composition orders).
+    #[test]
+    fn tf_inverse_round_trips_all_shapes() {
+        let cases: &[(usize, usize, i8)] = &[
+            (8, 1, -1),
+            (8, 1, -3),
+            (16, 2, -2),
+            (32, 4, -1),
+            (8, 2, 1),
+            (16, 4, 2),
+            (32, 8, 3),
+            (8, 8, 1),
+            (16, 1, 0),
+        ];
+        for &(len, blocks, adj) in cases {
+            let original = test_band(
+                len,
+                0xBEEu32.wrapping_add(len as u32).wrapping_add(adj as u32),
+            );
+            let mut buf = original.clone();
+            assert!(
+                apply_tf_resolution_change(&mut buf, adj, blocks),
+                "forward rejected ({len}, {blocks}, {adj})"
+            );
+            assert!(
+                apply_tf_resolution_change_inverse(&mut buf, adj, blocks),
+                "inverse rejected ({len}, {blocks}, {adj})"
+            );
+            for (got, want) in buf.iter().zip(original.iter()) {
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "inv∘fwd broken at ({len}, {blocks}, {adj})"
+                );
+            }
+            let mut buf = original.clone();
+            assert!(apply_tf_resolution_change_inverse(&mut buf, adj, blocks));
+            assert!(apply_tf_resolution_change(&mut buf, adj, blocks));
+            for (got, want) in buf.iter().zip(original.iter()) {
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "fwd∘inv broken at ({len}, {blocks}, {adj})"
+                );
+            }
+        }
+    }
+
+    /// The inverse rejects the same bad shapes the forward rejects.
+    #[test]
+    fn tf_inverse_rejects_bad_shape() {
+        let mut band = [0.0f32; 5];
+        assert!(!apply_tf_resolution_change_inverse(&mut band, -1, 2));
+        let mut band = [0.0f32; 6];
+        assert!(!apply_tf_resolution_change_inverse(&mut band, -1, 2));
+        let mut band = [0.0f32; 8];
+        assert!(!apply_tf_resolution_change_inverse(&mut band, -3, 2));
+        let mut band = [0.0f32; 8];
+        assert!(!apply_tf_resolution_change_inverse(&mut band, 1, 3));
+        let mut band: [f32; 0] = [];
+        assert!(!apply_tf_resolution_change_inverse(&mut band, 1, 1));
     }
 
     /// `gray_then_bit_reverse` against a hand-computed N=4 table:
