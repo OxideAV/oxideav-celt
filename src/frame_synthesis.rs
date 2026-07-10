@@ -83,29 +83,30 @@
 //! as inputs (the same docs-gap boundary the mono path draws for
 //! `band_k`).
 //!
-//! Three CELT features are deferred to the reference by the RFC and
-//! therefore remain out of scope (inputs, or rejected):
+//! ## Transient frames and anti-collapse (r406)
 //!
-//! * **Transient short blocks** (§4.3.1 / §4.3.7): the per-short-block
-//!   frequency layout and inter-block overlap-add are delegated to the
-//!   reference and not in the staged docs;
-//!   [`crate::synthesis::LongMdctSynthesis`] keeps that boundary, and a
-//!   transient prefix is rejected with [`Error::NotImplemented`] in both
-//!   the mono and stereo drivers.
-//! * **Stereo joint coding** (§4.3.4.4 `itheta` mid/side) and the
-//!   **main §4.3.2.2 fine-energy channel interleave**: the angle PDF and
-//!   the fine-energy per-channel bit order are deferred to the reference.
-//!   The stereo driver takes the per-channel residual spectra and fine
-//!   corrections as inputs for exactly this reason; the **coarse** energy
-//!   it decodes itself.
-//! * **Anti-collapse injection** (§4.3.5): the narrative describes the
-//!   *intent* — "a pseudo-random signal is inserted with an energy
-//!   corresponding to the minimum energy over the two previous frames" —
-//!   but gives **no** collapse-detection threshold, pseudo-random
-//!   generator, or injection magnitude formula; this is a documented docs
-//!   gap. Since both drivers only handle non-transient frames (where
-//!   §4.3.5 says the anti-collapse bit is not even decoded), the gap does
-//!   not block the long-MDCT path.
+//! * **Transient short blocks** (§4.3.1 / §4.3.7): both drivers decode
+//!   transient frames — the residual loop decodes `2^lm` interleaved
+//!   short blocks per band, and
+//!   [`LongMdctSynthesis::synthesize_frame`](crate::synthesis::LongMdctSynthesis::synthesize_frame)
+//!   runs the short-block inverse MDCTs over the shared overlap tail
+//!   (the placement is derived from the \[PRINCEN86\] boundary
+//!   cancellation — see
+//!   [`short_block_geometry`](crate::mdct::short_block_geometry)).
+//! * **Anti-collapse** (§4.3.5): the `{1,1}/2` bit is decoded at its
+//!   Table-56 position (after the band shapes) whenever the §4.3.3
+//!   reservation was made on a non-silent transient frame; a set bit
+//!   runs [`apply_anti_collapse`] against the two-frame per-band energy
+//!   history the state carries (the detection/PRNG/arithmetic details
+//!   are documented in-crate decisions — see [`crate::anti_collapse`]).
+//!
+//! One stereo feature remains deferred by the RFC and out of scope:
+//! **stereo joint coding** (§4.3.4.4 `itheta` mid/side) and the **main
+//! §4.3.2.2 fine-energy channel interleave** — the angle PDF and the
+//! fine-energy per-channel bit order are deferred to the reference.
+//! The stereo driver takes the per-channel residual spectra and fine
+//! corrections as inputs for exactly this reason; the **coarse** energy
+//! it decodes itself.
 //!
 //! ## Clean-room provenance
 //!
@@ -116,11 +117,13 @@
 //! delegates to an existing RFC-grounded module whose own provenance is
 //! recorded in that module. No external library source was consulted.
 
+use crate::anti_collapse::{apply_anti_collapse, ENERGY_HISTORY_FLOOR_LOG2};
 use crate::band_energy::assemble_band_log_energy_q8;
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::deemphasis::Deemphasis;
 use crate::fine_energy::decode_fine_energy;
 use crate::frame_decode::{decode_frame_prefix, FramePrefix};
+use crate::frame_header::decode_anti_collapse_flag;
 use crate::post_filter::{
     apply_post_filter_transition_f32, PostFilterParams as PfTransitionParams,
 };
@@ -190,6 +193,17 @@ pub struct CeltDecodeState {
     /// [`crate::post_filter::PostFilterParams::OFF`] on a fresh / reset
     /// state.
     prev_post_filter: PfTransitionParams,
+    /// The previous frame's final per-band log-2 energies — half of the
+    /// two-frame history the §4.3.5 anti-collapse injection draws its
+    /// "minimum energy over the two previous frames" from. Fresh /
+    /// reset states hold [`ENERGY_HISTORY_FLOOR_LOG2`].
+    energy_prev1: [f32; NUM_BANDS],
+    /// The final per-band log-2 energies of the frame before that (the
+    /// other half of the §4.3.5 history).
+    energy_prev2: [f32; NUM_BANDS],
+    /// The §4.3.5 pseudo-random seed, advanced by every injected
+    /// sample (see [`crate::anti_collapse`]).
+    anti_collapse_seed: u32,
 }
 
 impl CeltDecodeState {
@@ -208,6 +222,9 @@ impl CeltDecodeState {
             deemph: Deemphasis::new(),
             post_filter_history: vec![0.0; POST_FILTER_HISTORY_LEN],
             prev_post_filter: PfTransitionParams::OFF,
+            energy_prev1: [ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS],
+            energy_prev2: [ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS],
+            anti_collapse_seed: 0,
         })
     }
 
@@ -238,6 +255,25 @@ impl CeltDecodeState {
         self.deemph.reset();
         self.post_filter_history.iter_mut().for_each(|s| *s = 0.0);
         self.prev_post_filter = PfTransitionParams::OFF;
+        self.energy_prev1 = [ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS];
+        self.energy_prev2 = [ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS];
+        self.anti_collapse_seed = 0;
+    }
+}
+
+/// Shift a frame's final per-band log-2 energies (from the Q8
+/// envelope, coded window only) into the two-frame §4.3.5
+/// anti-collapse history.
+fn push_energy_history(
+    prev1: &mut [f32; NUM_BANDS],
+    prev2: &mut [f32; NUM_BANDS],
+    env_q8: &[i32; NUM_BANDS],
+    start: usize,
+    end: usize,
+) {
+    *prev2 = *prev1;
+    for band in start..end {
+        prev1[band] = env_q8[band] as f32 / 256.0;
     }
 }
 
@@ -304,10 +340,10 @@ pub struct StereoDecodedFrame {
 ///
 /// * [`Error::InvalidParameter`] when the band window or `lm` is out of
 ///   range, or `band_k.len() != end - start`.
-/// * [`Error::NotImplemented`] when the decoded prefix signals a
-///   transient frame (the §4.3.1 / §4.3.7 short-block reassembly gap),
-///   or when a band's codebook saturates (the §4.3.4.4 split gap
-///   surfaced by [`decode_residual_bands`]).
+/// * [`Error::NotImplemented`] when a band's codebook saturates (the
+///   §4.3.4.4 split gap surfaced by [`decode_residual_bands`]) or a
+///   decoded `tf_change` requests a TF transform the band's short-block
+///   geometry cannot carry (the same residual constraint family).
 ///
 /// A `silence`-flagged frame (§4.3 silence bit) carries no shape
 /// symbols: the caller supplies the matching silence allocation
@@ -338,7 +374,7 @@ pub fn decode_celt_frame(
     // Table 56 prefix: silence / post-filter / transient / intra →
     // coarse energy → TF / spread → caps → boosts → reservations →
     // band allocation. Mutates the coarse-energy prediction state.
-    let prefix = decode_frame_prefix(
+    let mut prefix = decode_frame_prefix(
         &mut dec,
         &mut state.coarse,
         lm,
@@ -347,12 +383,7 @@ pub fn decode_celt_frame(
         start,
         end,
     )?;
-
-    // This driver handles the non-transient (single long MDCT) case
-    // only; the transient short-block reassembly is a documented gap.
-    if prefix.header.transient {
-        return Err(Error::NotImplemented);
-    }
+    let transient = prefix.header.transient;
 
     // §4.3.2.2 fine-energy refinement for the allocator's per-band bit
     // counts. Reads raw bits from the back of the frame.
@@ -368,13 +399,16 @@ pub fn decode_celt_frame(
     // residual loop, which indexes per-coded-band.
     let window_energy: Vec<i32> = env_q8[start..end].to_vec();
 
-    // §4.3.4 residual (shape) decode → denormalized MDCT-domain spectrum.
-    let residual = decode_residual_bands(
+    // §4.3.4 residual (shape) decode → denormalized MDCT-domain spectrum
+    // (a transient frame decodes `2^lm` interleaved short blocks per
+    // band; the per-band chain applies the §4.3.4.5 TF adjustment and
+    // the §4.3.4.3 per-block spreading).
+    let mut residual = decode_residual_bands(
         &mut dec,
         lm,
         start,
         end,
-        false,
+        transient,
         prefix.tf.tf_select,
         &prefix.tf.tf_changes,
         band_k,
@@ -382,9 +416,49 @@ pub fn decode_celt_frame(
         &window_energy,
     )?;
 
-    // §4.3.6 → §4.3.7 long-MDCT synthesis: place the residual spectrum
-    // and run the inverse MDCT + weighted overlap-add.
-    let mut pcm = state.synth.synthesize(&residual.samples, start, end)?;
+    // §4.3.5 anti-collapse: Table 56 places the {1,1}/2 bit right after
+    // the band shape vectors. It is present only when the §4.3.3
+    // reservation was made (transient, LM > 1, budget — carried in the
+    // prefix's reservations) and the frame carries shape symbols at all
+    // (the in-crate silence wire stops after the prefix + fine energy).
+    if transient && !prefix.header.silence && prefix.reservations.anti_collapse_rsv != 0 {
+        let on = decode_anti_collapse_flag(&mut dec, transient);
+        prefix.header.anti_collapse_on = Some(on);
+        if on {
+            // Inject pseudo-random fill into collapsed (band, short-MDCT)
+            // pairs at the minimum-of-two-previous-frames energy, then
+            // renormalize each touched band to its coded envelope.
+            if !apply_anti_collapse(
+                &mut residual.samples,
+                lm,
+                start,
+                end,
+                &window_energy,
+                &state.energy_prev1,
+                &state.energy_prev2,
+                &mut state.anti_collapse_seed,
+            ) {
+                return Err(Error::InvalidParameter);
+            }
+        }
+    }
+
+    // Shift this frame's final envelope into the two-frame §4.3.5
+    // energy history for the following frames.
+    push_energy_history(
+        &mut state.energy_prev1,
+        &mut state.energy_prev2,
+        &env_q8,
+        start,
+        end,
+    );
+
+    // §4.3.6 → §4.3.7 synthesis: place the residual spectrum and run
+    // the inverse MDCT (single long block, or `2^lm` short blocks on a
+    // transient frame) + weighted overlap-add.
+    let mut pcm = state
+        .synth
+        .synthesize_frame(&residual.samples, start, end, transient)?;
 
     // §4.3.7.1 post-filter, with the §4.3.7.1 squared-window
     // gain-transition crossfade against the previous frame's parameters.
@@ -460,6 +534,14 @@ pub struct StereoCeltDecodeState {
     /// [`crate::post_filter::PostFilterParams::OFF`] on a fresh / reset
     /// state.
     prev_post_filter: [PfTransitionParams; 2],
+    /// Per-channel §4.3.5 anti-collapse energy history (previous frame),
+    /// same role as the mono [`CeltDecodeState::energy_prev1`].
+    energy_prev1: [[f32; NUM_BANDS]; 2],
+    /// Per-channel §4.3.5 energy history (two frames back).
+    energy_prev2: [[f32; NUM_BANDS]; 2],
+    /// The §4.3.5 pseudo-random seed (shared across channels; each
+    /// injected sample advances it).
+    anti_collapse_seed: u32,
 }
 
 /// Per-channel §4.3.7.1 post-filter parameters for a stereo synthesis
@@ -496,6 +578,9 @@ impl StereoCeltDecodeState {
                 vec![0.0; POST_FILTER_HISTORY_LEN],
             ],
             prev_post_filter: [PfTransitionParams::OFF; 2],
+            energy_prev1: [[ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS]; 2],
+            energy_prev2: [[ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS]; 2],
+            anti_collapse_seed: 0,
         })
     }
 
@@ -532,6 +617,9 @@ impl StereoCeltDecodeState {
             h.iter_mut().for_each(|s| *s = 0.0);
         }
         self.prev_post_filter = [PfTransitionParams::OFF; 2];
+        self.energy_prev1 = [[ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS]; 2];
+        self.energy_prev2 = [[ENERGY_HISTORY_FLOOR_LOG2; NUM_BANDS]; 2];
+        self.anti_collapse_seed = 0;
     }
 
     /// Decode one **stereo**, non-transient CELT frame to interleaved
@@ -595,8 +683,8 @@ impl StereoCeltDecodeState {
     ///
     /// * [`Error::InvalidParameter`] when the band window / `lm` is out of
     ///   range or either residual length is inconsistent.
-    /// * [`Error::NotImplemented`] when the decoded prefix signals a
-    ///   transient frame (the §4.3.1 / §4.3.7 short-block reassembly gap).
+    /// * [`Error::NotImplemented`] when the §4.3.4.4 joint/intensity
+    ///   stereo docs gap is signalled (see below).
     ///
     /// On any error the carried state (coarse prediction, overlap tails,
     /// de-emphasis, post-filter history) is left **unchanged** for the
@@ -633,12 +721,6 @@ impl StereoCeltDecodeState {
             end,
         )?;
 
-        // The per-channel short-block reassembly is a documented gap; a
-        // transient stereo frame is rejected rather than mis-decoded.
-        if prefix.header.transient {
-            return Err(Error::NotImplemented);
-        }
-
         // §4.3.2 final per-channel Q8 log-energy envelopes (bitstream
         // coarse + caller-supplied fine), one assembly per channel.
         let env_l = assemble_band_log_energy_q8(&self.coarse, 0, Some(&fine_q14[0]), None)
@@ -646,11 +728,29 @@ impl StereoCeltDecodeState {
         let env_r = assemble_band_log_energy_q8(&self.coarse, 1, Some(&fine_q14[1]), None)
             .ok_or(Error::InvalidParameter)?;
 
+        // Shift the per-channel §4.3.5 energy history.
+        for (ch, env) in [env_l, env_r].iter().enumerate() {
+            push_energy_history(
+                &mut self.energy_prev1[ch],
+                &mut self.energy_prev2[ch],
+                env,
+                start,
+                end,
+            );
+        }
+
         // Per-channel §4.3.6 → §4.3.7 synthesis from the supplied
         // denormalized spectra (validates both residual lengths before
-        // advancing either overlap tail).
-        let pcm =
-            self.synthesize_stereo_frame(left_residual, right_residual, start, end, post_filter)?;
+        // advancing either overlap tail). A transient frame runs the
+        // §4.3.1 short-block reassembly per channel.
+        let pcm = self.synthesize_stereo_frame_kind(
+            left_residual,
+            right_residual,
+            start,
+            end,
+            post_filter,
+            prefix.header.transient,
+        )?;
 
         Ok(StereoDecodedFrame {
             pcm,
@@ -715,7 +815,7 @@ impl StereoCeltDecodeState {
 
         // Table 56 stereo prefix: decodes BOTH channels' §4.3.2.1
         // coarse energy into `self.coarse`.
-        let prefix = decode_frame_prefix(
+        let mut prefix = decode_frame_prefix(
             &mut dec,
             &mut self.coarse,
             lm,
@@ -725,9 +825,7 @@ impl StereoCeltDecodeState {
             end,
         )?;
 
-        if prefix.header.transient {
-            return Err(Error::NotImplemented);
-        }
+        let transient = prefix.header.transient;
         // Only the dual (uncoupled) residual layout is documented; a
         // joint-coded or intensity-coded frame cannot be parsed past
         // this point (§4.3.4.4 docs gap). Silence frames carry no
@@ -758,7 +856,7 @@ impl StereoCeltDecodeState {
 
         // §4.3.4 dual residual walk → both channels' denormalized
         // spectra. A silence frame synthesizes the zero spectra.
-        let (left, right) = if prefix.header.silence {
+        let (mut left, mut right) = if prefix.header.silence {
             let total = crate::band_layout::coded_total_bins(start, end, lm)
                 .ok_or(Error::InvalidParameter)? as usize;
             (vec![0.0f32; total], vec![0.0f32; total])
@@ -770,7 +868,7 @@ impl StereoCeltDecodeState {
                 lm,
                 start,
                 end,
-                false,
+                transient,
                 prefix.tf.tf_select,
                 &prefix.tf.tf_changes,
                 band_k,
@@ -781,14 +879,56 @@ impl StereoCeltDecodeState {
             (residual.left, residual.right)
         };
 
+        // §4.3.5 anti-collapse: one Table-56 bit per frame (right after
+        // the band shapes), present only when the §4.3.3 reservation was
+        // made and the frame carries shape symbols; injection then runs
+        // per channel against that channel's own envelope and history.
+        if transient && !prefix.header.silence && prefix.reservations.anti_collapse_rsv != 0 {
+            let on = decode_anti_collapse_flag(&mut dec, transient);
+            prefix.header.anti_collapse_on = Some(on);
+            if on {
+                for (ch, (samples, env)) in [(&mut left, &env_l), (&mut right, &env_r)]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let window_env: Vec<i32> = env[start..end].to_vec();
+                    if !apply_anti_collapse(
+                        samples,
+                        lm,
+                        start,
+                        end,
+                        &window_env,
+                        &self.energy_prev1[ch],
+                        &self.energy_prev2[ch],
+                        &mut self.anti_collapse_seed,
+                    ) {
+                        return Err(Error::InvalidParameter);
+                    }
+                }
+            }
+        }
+
+        // Shift the per-channel §4.3.5 energy history.
+        for (ch, env) in [env_l, env_r].iter().enumerate() {
+            push_energy_history(
+                &mut self.energy_prev1[ch],
+                &mut self.energy_prev2[ch],
+                env,
+                start,
+                end,
+            );
+        }
+
         // Per-channel §4.3.6 → §4.3.7 synthesis + §4.3.7.1 post-filter
-        // (from the decoded prefix) + §4.3.7.2 de-emphasis.
+        // (from the decoded prefix) + §4.3.7.2 de-emphasis. A transient
+        // frame runs the §4.3.1 short-block reassembly per channel.
         let post_filter = prefix.header.post_filter.map(|pf| PostFilterParams {
             period: pf.period,
             gain: pf.gain,
             tapset: pf.tapset,
         });
-        let pcm = self.synthesize_stereo_frame(&left, &right, start, end, post_filter)?;
+        let pcm =
+            self.synthesize_stereo_frame_kind(&left, &right, start, end, post_filter, transient)?;
 
         Ok(StereoDecodedFrame {
             pcm,
@@ -836,10 +976,6 @@ impl StereoCeltDecodeState {
             end,
         )?;
 
-        if prefix.header.transient {
-            return Err(Error::NotImplemented);
-        }
-
         let (band_k, fine_bits) = if prefix.header.silence {
             (vec![0u32; end - start], [0u32; NUM_BANDS])
         } else {
@@ -884,12 +1020,36 @@ impl StereoCeltDecodeState {
         end: usize,
         post_filter: Option<PostFilterParams>,
     ) -> Result<Vec<f32>, Error> {
+        self.synthesize_stereo_frame_kind(
+            left_residual,
+            right_residual,
+            start,
+            end,
+            post_filter,
+            false,
+        )
+    }
+
+    /// [`synthesize_stereo_frame`](Self::synthesize_stereo_frame) with
+    /// an explicit block kind: `transient = true` runs the §4.3.1
+    /// short-block reassembly (`2^lm` interleaved short inverse MDCTs)
+    /// per channel over the same shared overlap tails, so long and
+    /// transient frames alternate freely on one state.
+    pub fn synthesize_stereo_frame_kind(
+        &mut self,
+        left_residual: &[f32],
+        right_residual: &[f32],
+        start: usize,
+        end: usize,
+        post_filter: Option<PostFilterParams>,
+        transient: bool,
+    ) -> Result<Vec<f32>, Error> {
         // §4.3.7 per-channel IMDCT + WOLA → interleaved L/R/L/R. The
         // synthesis spine advances both overlap tails atomically (it
         // validates both channels' placement before transforming either).
-        let interleaved = self
-            .synth
-            .synthesize(left_residual, right_residual, start, end)?;
+        let interleaved =
+            self.synth
+                .synthesize_frame(left_residual, right_residual, start, end, transient)?;
 
         let n = self.synth.frame_size();
         // De-interleave to per-channel buffers for the per-channel
@@ -967,6 +1127,57 @@ mod tests {
         assert_eq!(out.pcm.len(), mdct_size(3).unwrap());
         assert_eq!(out.prefix.start, 0);
         assert_eq!(out.prefix.end, 21);
+    }
+
+    /// A mono transient frame decodes through the §4.3.1 short-block
+    /// path, reading the §4.3.5 anti-collapse bit at its Table-56
+    /// position when the reservation was made. With all-zero `band_k`
+    /// every (band, block) collapses, so a set bit fires the injection;
+    /// the seed space must exercise both bit values.
+    #[test]
+    fn mono_transient_decodes_and_reads_anti_collapse_bit() {
+        use crate::coarse_energy::CoarseEnergyState;
+        use crate::frame_decode::decode_frame_prefix;
+
+        let lm = 3u32;
+        let band_k = vec![0u32; 21];
+        let mut saw = [false; 2];
+        for seed in 0..=255u32 {
+            let buf: Vec<u8> = (0..64u32)
+                .map(|i| (i.wrapping_mul(151).wrapping_add(seed * 7 + 3) & 0xff) as u8)
+                .collect();
+            // Probe: transient, non-silent, with the anti-collapse
+            // reservation made.
+            let mut probe = CoarseEnergyState::new();
+            let mut dec = RangeDecoder::new(&buf);
+            let pfx = decode_frame_prefix(&mut dec, &mut probe, lm, buf.len() as u32, false, 0, 21)
+                .unwrap();
+            if !pfx.header.transient
+                || pfx.header.silence
+                || pfx.reservations.anti_collapse_rsv == 0
+            {
+                continue;
+            }
+            let mut state = CeltDecodeState::new(lm).unwrap();
+            let out = match decode_celt_frame(&mut state, &buf, 0, 21, &zero_fine(), &band_k) {
+                Ok(out) => out,
+                // A decoded tf_change can request Hadamard levels a
+                // one-sample-per-block sub-vector cannot provide — the
+                // residual constraint gap, correctly surfaced.
+                Err(Error::NotImplemented) => continue,
+                Err(e) => panic!("transient decode (seed {seed}) failed: {e:?}"),
+            };
+            assert_eq!(out.pcm.len(), state.frame_size());
+            assert!(out.pcm.iter().all(|s| s.is_finite()));
+            let on = out
+                .prefix
+                .header
+                .anti_collapse_on
+                .expect("anti-collapse bit decoded on a reserved transient frame");
+            saw[usize::from(on)] = true;
+        }
+        assert!(saw[0], "no seed decoded anti-collapse = 0");
+        assert!(saw[1], "no seed decoded anti-collapse = 1");
     }
 
     /// Out-of-range band window / mismatched `band_k` is rejected.
@@ -1468,14 +1679,13 @@ mod tests {
         assert_eq!(fresh.envelope_q8, after.envelope_q8);
     }
 
-    /// A transient stereo frame is rejected with `NotImplemented` (the
-    /// §4.3.1 / §4.3.7 short-block reassembly gap), never silently
-    /// mis-decoded. A transient stereo prefix is reachable for some
-    /// stream; this test searches a deterministic seed space for one and
-    /// asserts every transient-decoding seed is rejected (and that at
-    /// least one such seed exists, so the rejection path is exercised).
+    /// A transient stereo frame (caller-supplied residuals) decodes to
+    /// finite interleaved PCM through the §4.3.1 short-block
+    /// reassembly. This test searches a deterministic seed space for a
+    /// transient prefix and asserts every such seed decodes (and that
+    /// at least one exists, so the transient path is exercised).
     #[test]
-    fn stereo_transient_frame_is_not_implemented() {
+    fn stereo_transient_frame_decodes() {
         use crate::coarse_energy::CoarseEnergyState;
         use crate::frame_decode::decode_frame_prefix;
 
@@ -1503,11 +1713,11 @@ mod tests {
             }
             saw_transient = true;
             let mut st = StereoCeltDecodeState::new(lm).unwrap();
-            let got = st.decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None);
-            assert!(
-                matches!(got, Err(Error::NotImplemented)),
-                "transient stereo frame (seed {s}) not rejected: {got:?}"
-            );
+            let got = st
+                .decode_stereo_frame(&buf, 0, 21, &zero_fine2(), &r, &r, None)
+                .expect("transient stereo frame decodes (r406 short-block reassembly)");
+            assert_eq!(got.pcm.len(), 2 * st.frame_size());
+            assert!(got.pcm.iter().all(|s| s.is_finite()));
         }
         assert!(
             saw_transient,

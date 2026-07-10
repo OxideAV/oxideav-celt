@@ -432,10 +432,11 @@ pub fn derive_band_allocation_dual(prefix: &FramePrefix, lm: u32) -> Option<Deri
 ///
 /// * [`Error::InvalidParameter`] when the band window or `lm` is out of
 ///   range, or the documented derivation rejects the inputs.
-/// * [`Error::NotImplemented`] when the decoded prefix signals a
-///   transient frame (the §4.3.1 / §4.3.7 short-block reassembly gap) or
-///   a band's codebook saturates (the §4.3.4.4 split gap), exactly as
-///   [`decode_celt_frame`] surfaces them.
+/// * [`Error::NotImplemented`] when a band's codebook saturates (the
+///   §4.3.4.4 split gap) or a decoded `tf_change` requests a TF
+///   transform the band geometry cannot carry, exactly as
+///   [`decode_celt_frame`] surfaces them. Transient frames decode
+///   through the §4.3.1 short-block path (r406).
 pub fn decode_celt_frame_auto(
     state: &mut CeltDecodeState,
     frame_bytes: &[u8],
@@ -463,10 +464,6 @@ pub fn decode_celt_frame_auto(
         start,
         end,
     )?;
-
-    if prefix.header.transient {
-        return Err(Error::NotImplemented);
-    }
 
     // A silence-flagged frame (§4.3 Table 56 `silence`) carries no
     // shape symbols: the residual is the zero spectrum, so the
@@ -714,30 +711,44 @@ mod tests {
         );
     }
 
-    /// A transient frame is rejected with `NotImplemented`, not silently
-    /// mis-decoded (the §4.3.1 / §4.3.7 short-block reassembly gap).
+    /// Transient frames decode through the §4.3.1 short-block path:
+    /// every transient seed either decodes to finite PCM or surfaces a
+    /// residual docs-gap constraint (`NotImplemented` — e.g. a decoded
+    /// `tf_change` requesting Hadamard levels a one-sample-per-block
+    /// sub-vector cannot provide, or a §4.3.4.4 split), never panics —
+    /// and at least one transient seed lands on the success path.
     #[test]
-    fn auto_rejects_transient() {
-        // Scan for a transient seed at lm=1 (the {7,1}/8 "1" branch).
-        let lm = 1u32;
+    fn auto_decodes_transient() {
+        // Scan for transient seeds at lm=2 (the {7,1}/8 "1" branch).
+        let lm = 2u32;
         let mut saw_transient = false;
+        let mut saw_success = false;
         for seed in 0..=255u32 {
-            let buf = payload(24, seed as u8);
+            let buf = payload(48, seed as u8);
             if !is_transient(&buf, lm, 0, NUM_BANDS) {
                 continue;
             }
             saw_transient = true;
             let mut state = CeltDecodeState::new(lm).expect("state");
-            let got = decode_celt_frame_auto(&mut state, &buf, 0, NUM_BANDS);
-            assert!(
-                matches!(got, Err(Error::NotImplemented)),
-                "transient frame (seed {seed}) not rejected: {got:?}"
-            );
+            match decode_celt_frame_auto(&mut state, &buf, 0, NUM_BANDS) {
+                Ok(frame) => {
+                    saw_success = true;
+                    assert!(frame.prefix.header.transient);
+                    assert_eq!(frame.pcm.len(), state.frame_size());
+                    assert!(
+                        frame.pcm.iter().all(|s| s.is_finite()),
+                        "non-finite transient PCM (seed {seed})"
+                    );
+                }
+                Err(Error::NotImplemented) => {} // residual docs-gap constraint
+                Err(e) => panic!("transient frame (seed {seed}) failed unexpectedly: {e:?}"),
+            }
         }
         assert!(
             saw_transient,
-            "no transient seed found to exercise the gate"
+            "no transient seed found to exercise the path"
         );
+        assert!(saw_success, "no transient seed decoded on the success path");
     }
 
     /// Decode a stereo prefix of `buf` for the dual-derivation tests.
