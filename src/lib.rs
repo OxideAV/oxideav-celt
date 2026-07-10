@@ -349,6 +349,7 @@ pub mod pulse_cache;
 pub mod pvq;
 pub mod range_decoder;
 pub mod range_encoder;
+pub mod realloc_walk;
 pub mod residual;
 pub mod spread;
 pub mod spread_rotation;
@@ -482,6 +483,9 @@ pub use pvq::{
 };
 pub use range_decoder::RangeDecoder;
 pub use range_encoder::{RangeEncoder, REM_EMPTY};
+pub use realloc_walk::{
+    realloc_walk, WalkAllocation, WalkBands, WalkBudget, WalkIo, FRAC_STEPS, SKIP_BIT_COST_8TH,
+};
 pub use residual::{
     decode_residual_bands, decode_stereo_residual_bands, ResidualSpectrum, StereoResidualSpectrum,
 };
