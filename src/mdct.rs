@@ -243,6 +243,128 @@ impl MdctSynthesis {
     }
 }
 
+/// Geometry of the §4.3.1 transient short-block layout inside one
+/// hop-`N` frame: `nb_blocks` short MDCTs of `sb = n / nb_blocks` bins
+/// each, placed at stride `sb` starting `pad = (n - sb) / 2` samples
+/// into the frame.
+///
+/// Returns `(sb, pad)` on success, or `None` when the geometry is
+/// invalid: `nb_blocks == 0`, `nb_blocks` does not divide `n`, or
+/// `n - sb` is odd (the placement offset must be integral).
+///
+/// ## Why this placement (derivation, not a free choice)
+///
+/// RFC 6716 §4.3.1 states a transient frame's coefficients "represent
+/// multiple short MDCTs in the frame" and §4.3.7 requires the
+/// synthesis window to satisfy power complementarity \[PRINCEN86\],
+/// but the RFC narrative does not spell out where the short blocks
+/// sit within the frame. The placement is nevertheless **forced** by
+/// requiring \[PRINCEN86\] time-domain aliasing cancellation to keep
+/// holding across every long↔short frame transition in a stream:
+///
+/// * The long low-overlap window ([`build_low_overlap_window_f32`])
+///   rises over frame positions `[pad_l, pad_l + overlap)` with
+///   `pad_l = (n - overlap) / 2`, and its carried tail falls over the
+///   same positions of the **next** frame (its aliasing folds about
+///   the centre of that falling region).
+/// * A short block's rising half folds about the centre of its first
+///   `sb` samples. Cancellation against a preceding long frame's tail
+///   therefore requires the first short block's rising half to occupy
+///   exactly `[pad_l, pad_l + overlap)` — i.e. `sb = overlap` and the
+///   block sequence starting at `pad = (n - sb) / 2`.
+/// * Consecutive short blocks at stride `sb` with the full-overlap
+///   basic window cancel pairwise (equal-size TDAC), and the last
+///   block's falling half then lands on `[pad, pad + sb)` of the next
+///   frame — the same positions a following long (or short) frame's
+///   rising region occupies. Every transition is covered.
+///
+/// With the canonical CELT geometry (`n = 120 << lm`,
+/// `nb_blocks = 1 << lm`) the short block size is always
+/// `sb = 120 = ` [`BASIC_WINDOW_HALF`], so the short window is the
+/// full-overlap 240-sample basic window and `pad = (n - 120) / 2`
+/// matches the long window's zero padding.
+#[inline]
+pub fn short_block_geometry(n: usize, nb_blocks: usize) -> Option<(usize, usize)> {
+    if nb_blocks == 0 || n == 0 || n % nb_blocks != 0 {
+        return None;
+    }
+    let sb = n / nb_blocks;
+    if (n - sb) % 2 != 0 {
+        return None;
+    }
+    Some((sb, (n - sb) / 2))
+}
+
+impl MdctSynthesis {
+    /// Synthesize one **transient** frame from `nb_blocks` interleaved
+    /// short MDCTs (RFC 6716 §4.3.1 / §4.3.7): de-interleave the
+    /// `N`-bin spectrum into `nb_blocks` short spectra of
+    /// `sb = N / nb_blocks` bins (`spectrum[nb_blocks * f + s]` is bin
+    /// `f` of short block `s` — the same per-block interleave the
+    /// §4.3.4.3 spreading and §4.3.4.5 Hadamard stages use), run the
+    /// §4.3.7 inverse MDCT per block, window each `2 * sb` output with
+    /// `short_window`, and overlap-add the blocks at stride `sb`
+    /// starting `pad = (N - sb) / 2` samples into the frame (the
+    /// placement [`short_block_geometry`] derives). Emits the `N`
+    /// finished output samples and carries the assembly's tail into
+    /// the shared cross-frame overlap state, so long and short frames
+    /// interleave freely in one stream.
+    ///
+    /// `short_window` must be the `2 * sb`-sample synthesis window for
+    /// the short blocks (the full-overlap window
+    /// `build_low_overlap_window_f32(sb, sb)` in the canonical
+    /// `sb = 120` geometry).
+    ///
+    /// Returns `false` (state and `out` untouched) when the block
+    /// geometry is invalid ([`short_block_geometry`]),
+    /// `spectrum.len() != N`, `short_window.len() != 2 * sb`, or
+    /// `out.len() != N`.
+    pub fn frame_short(
+        &mut self,
+        spectrum: &[f32],
+        short_window: &[f32],
+        nb_blocks: usize,
+        out: &mut [f32],
+    ) -> bool {
+        let n = self.tail.len();
+        let Some((sb, pad)) = short_block_geometry(n, nb_blocks) else {
+            return false;
+        };
+        if spectrum.len() != n || short_window.len() != 2 * sb || out.len() != n {
+            return false;
+        }
+        // Assembly buffer: the last short block ends at
+        // pad + (nb_blocks - 1) * sb + 2 * sb = n + pad + sb.
+        let ext = n + pad + sb;
+        let mut acc = vec![0.0f32; ext];
+        acc[..n].copy_from_slice(&self.tail);
+
+        let mut spec_s = vec![0.0f32; sb];
+        let mut block = vec![0.0f32; 2 * sb];
+        for s in 0..nb_blocks {
+            for (f, slot) in spec_s.iter_mut().enumerate() {
+                *slot = spectrum[nb_blocks * f + s];
+            }
+            // Lengths are consistent by construction; cannot fail.
+            if !imdct_naive_f32(&spec_s, &mut block) {
+                return false;
+            }
+            let base = pad + s * sb;
+            for (i, (&b, &w)) in block.iter().zip(short_window.iter()).enumerate() {
+                acc[base + i] += b * w;
+            }
+        }
+
+        out.copy_from_slice(&acc[..n]);
+        // New tail: the assembly's overhang past the emitted frame
+        // (extent pad + sb — the same nonzero extent the long window's
+        // second half has), zero beyond.
+        self.tail[..pad + sb].copy_from_slice(&acc[n..]);
+        self.tail[pad + sb..].iter_mut().for_each(|s| *s = 0.0);
+        true
+    }
+}
+
 /// Streaming windowed MDCT **analysis** state — the exact mirror of
 /// [`MdctSynthesis`] (RFC 6716 §4.3.7, encoder direction per §5.3:
 /// "the filters and rotations in the encoder are simply the inverse of
@@ -328,6 +450,63 @@ impl MdctAnalysis {
         }
         if !mdct_naive_f32(&block, out) {
             return false;
+        }
+        self.history.copy_from_slice(input);
+        true
+    }
+
+    /// Analyze one **transient** frame into `nb_blocks` interleaved
+    /// short MDCTs — the exact mirror of
+    /// [`MdctSynthesis::frame_short`]. Forms the `2 * N` sliding block
+    /// `[history | input]`, cuts the `nb_blocks` short segments of
+    /// `2 * sb` samples at stride `sb` starting at
+    /// `pad = (N - sb) / 2` (the [`short_block_geometry`] placement),
+    /// windows each with `short_window`, forward-MDCTs it
+    /// ([`mdct_naive_f32`]), and interleaves the per-block bins into
+    /// `out` as `out[nb_blocks * f + s]` = bin `f` of block `s`.
+    /// `input` becomes the new history.
+    ///
+    /// Feeding each emitted spectrum into
+    /// [`MdctSynthesis::frame_short`] with the same window
+    /// reconstructs the input with one frame of delay, exactly like
+    /// the long-block pair — including across mixed long/short frame
+    /// sequences (the placement derivation guarantees the transition
+    /// cancellation; see [`short_block_geometry`]).
+    ///
+    /// Returns `false` (state and `out` untouched) when the geometry
+    /// is invalid, `input.len() != N`, `short_window.len() != 2 * sb`,
+    /// or `out.len() != N`.
+    pub fn frame_short(
+        &mut self,
+        input: &[f32],
+        short_window: &[f32],
+        nb_blocks: usize,
+        out: &mut [f32],
+    ) -> bool {
+        let n = self.history.len();
+        let Some((sb, pad)) = short_block_geometry(n, nb_blocks) else {
+            return false;
+        };
+        if input.len() != n || short_window.len() != 2 * sb || out.len() != n {
+            return false;
+        }
+        let mut block2n = vec![0.0f32; 2 * n];
+        block2n[..n].copy_from_slice(&self.history);
+        block2n[n..].copy_from_slice(input);
+
+        let mut seg = vec![0.0f32; 2 * sb];
+        let mut bins = vec![0.0f32; sb];
+        for s in 0..nb_blocks {
+            let base = pad + s * sb;
+            for (i, (slot, &w)) in seg.iter_mut().zip(short_window.iter()).enumerate() {
+                *slot = block2n[base + i] * w;
+            }
+            if !mdct_naive_f32(&seg, &mut bins) {
+                return false;
+            }
+            for (f, &x) in bins.iter().enumerate() {
+                out[nb_blocks * f + s] = x;
+            }
         }
         self.history.copy_from_slice(input);
         true
@@ -809,6 +988,199 @@ mod tests {
         assert!(ana.frame(&x, &w, &mut spec));
         for k in 0..n {
             assert!((spec[k] - first[k]).abs() <= 1e-7);
+        }
+    }
+
+    // --- Transient short-block pair (§4.3.1 / §4.3.7) ---
+
+    #[test]
+    fn short_block_geometry_canonical_and_rejections() {
+        // Canonical CELT geometry: sb is always 120, pad = (n - 120)/2.
+        for lm in 0..=3u32 {
+            let n = 120usize << lm;
+            let b = 1usize << lm;
+            assert_eq!(short_block_geometry(n, b), Some((120, (n - 120) / 2)));
+        }
+        // B = 1 degenerates to sb = n, pad = 0 (the full-overlap case).
+        assert_eq!(short_block_geometry(120, 1), Some((120, 0)));
+        // Rejections: zero blocks, non-dividing blocks, odd offset.
+        assert_eq!(short_block_geometry(240, 0), None);
+        assert_eq!(short_block_geometry(240, 7), None);
+        assert_eq!(short_block_geometry(0, 1), None);
+        // n=6, b=2 → sb=3, n-sb=3 odd → rejected.
+        assert_eq!(short_block_geometry(6, 2), None);
+    }
+
+    /// The short analysis/synthesis pair reconstructs an all-short
+    /// stream with one frame of delay, exactly like the long pair.
+    #[test]
+    fn short_pair_round_trip_one_frame_delay() {
+        let n = 240usize; // lm = 1 geometry
+        let b = 2usize;
+        let sb = n / b;
+        let w = build_low_overlap_window_f32(sb, sb).expect("valid");
+        let frames = 5usize;
+        let x = test_signal(n * frames, 0x51DE5);
+
+        let mut ana = MdctAnalysis::new(n);
+        let mut synth = MdctSynthesis::new(n);
+        let mut spec = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+        for t in 0..frames {
+            assert!(ana.frame_short(&x[t * n..(t + 1) * n], &w, b, &mut spec));
+            assert!(synth.frame_short(&spec, &w, b, &mut out));
+            if t >= 1 {
+                // Synthesis call t finishes input frame t-1.
+                for k in 0..n {
+                    assert!(
+                        (out[k] - x[(t - 1) * n + k]).abs() <= 1e-4,
+                        "short PR broken at frame {} sample {k}: {} vs {}",
+                        t - 1,
+                        out[k],
+                        x[(t - 1) * n + k]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Mixed long/short streams reconstruct across every transition
+    /// (long→short, short→short, short→long): the short-block placement
+    /// keeps the \[PRINCEN86\] cancellation with the long low-overlap
+    /// window at the frame boundaries.
+    #[test]
+    fn mixed_long_short_stream_round_trip() {
+        let n = 480usize; // lm = 2 geometry
+        let b = 4usize;
+        let sb = n / b;
+        assert_eq!(sb, 120);
+        let w_long = build_low_overlap_window_f32(n, sb).expect("valid");
+        let w_short = build_low_overlap_window_f32(sb, sb).expect("valid");
+        // Frame kinds: long, short, short, long, short, long.
+        let kinds = [false, true, true, false, true, false];
+        let frames = kinds.len();
+        let x = test_signal(n * frames, 0xA11CE);
+
+        let mut ana = MdctAnalysis::new(n);
+        let mut synth = MdctSynthesis::new(n);
+        let mut spec = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+        for (t, &transient) in kinds.iter().enumerate() {
+            let input = &x[t * n..(t + 1) * n];
+            if transient {
+                assert!(ana.frame_short(input, &w_short, b, &mut spec));
+                assert!(synth.frame_short(&spec, &w_short, b, &mut out));
+            } else {
+                assert!(ana.frame(input, &w_long, &mut spec));
+                assert!(synth.frame(&spec, &w_long, &mut out));
+            }
+            if t >= 1 {
+                for k in 0..n {
+                    assert!(
+                        (out[k] - x[(t - 1) * n + k]).abs() <= 1e-4,
+                        "mixed PR broken at frame {} (kind {}) sample {k}: {} vs {}",
+                        t - 1,
+                        kinds[t - 1],
+                        out[k],
+                        x[(t - 1) * n + k]
+                    );
+                }
+            }
+        }
+    }
+
+    /// `nb_blocks = 1` short synthesis with the full-overlap window of
+    /// size N equals the long path with the same window (the degenerate
+    /// lm = 0 transient case).
+    #[test]
+    fn single_block_short_equals_long_full_overlap() {
+        let n = 120usize;
+        let w = build_low_overlap_window_f32(n, n).expect("valid");
+        let spec = test_signal(n, 0xF00D);
+        let mut s1 = MdctSynthesis::new(n);
+        let mut s2 = MdctSynthesis::new(n);
+        let mut o1 = vec![0.0f32; n];
+        let mut o2 = vec![0.0f32; n];
+        for _ in 0..3 {
+            assert!(s1.frame(&spec, &w, &mut o1));
+            assert!(s2.frame_short(&spec, &w, 1, &mut o2));
+            for k in 0..n {
+                assert!((o1[k] - o2[k]).abs() <= 1e-6);
+            }
+        }
+    }
+
+    /// Bad shapes are rejected without touching the state on both
+    /// sides of the short pair.
+    #[test]
+    fn short_pair_rejects_bad_shapes() {
+        let n = 240usize;
+        let b = 2usize;
+        let sb = n / b;
+        let w = build_low_overlap_window_f32(sb, sb).expect("valid");
+        let x = test_signal(n, 0xDEAD1);
+        let mut spec = vec![0.0f32; n];
+        let mut out = vec![0.0f32; n];
+
+        let mut ana = MdctAnalysis::new(n);
+        assert!(!ana.frame_short(&x[..n - 1], &w, b, &mut spec));
+        assert!(!ana.frame_short(&x, &w[..2 * sb - 1], b, &mut spec));
+        assert!(!ana.frame_short(&x, &w, 0, &mut spec));
+        assert!(!ana.frame_short(&x, &w, 7, &mut spec));
+        assert!(!ana.frame_short(&x, &w, b, &mut spec[..n - 1]));
+        // A good call still works from the untouched state and matches
+        // a fresh state's first call.
+        assert!(ana.frame_short(&x, &w, b, &mut spec));
+        let mut fresh = MdctAnalysis::new(n);
+        let mut spec2 = vec![0.0f32; n];
+        assert!(fresh.frame_short(&x, &w, b, &mut spec2));
+        for k in 0..n {
+            assert!((spec[k] - spec2[k]).abs() <= 1e-7);
+        }
+
+        let mut synth = MdctSynthesis::new(n);
+        assert!(!synth.frame_short(&spec[..n - 1], &w, b, &mut out));
+        assert!(!synth.frame_short(&spec, &w[..2 * sb - 1], b, &mut out));
+        assert!(!synth.frame_short(&spec, &w, 0, &mut out));
+        assert!(!synth.frame_short(&spec, &w, 7, &mut out));
+        assert!(!synth.frame_short(&spec, &w, b, &mut out[..n - 1]));
+        assert!(synth.frame_short(&spec, &w, b, &mut out));
+    }
+
+    /// The short-block interleave convention: a spectrum that is
+    /// nonzero only at the positions of one block (`nb_blocks*f + s`)
+    /// synthesizes energy concentrated in that block's time span.
+    #[test]
+    fn short_block_interleave_isolates_blocks() {
+        let n = 480usize;
+        let b = 4usize;
+        let sb = n / b;
+        let pad = (n - sb) / 2;
+        let w = build_low_overlap_window_f32(sb, sb).expect("valid");
+
+        for s in 0..b {
+            let mut spec = vec![0.0f32; n];
+            // Put a mid-band tone into block s only.
+            spec[b * (sb / 3) + s] = 1.0;
+            let mut synth = MdctSynthesis::new(n);
+            let mut out = vec![0.0f32; n];
+            assert!(synth.frame_short(&spec, &w, b, &mut out));
+            // Energy inside the block's emitted span [pad + s*sb, ...)
+            // clipped to the frame, vs total frame energy: everything
+            // outside the block's own 2*sb extent must be zero. Late
+            // blocks overhang into the carried tail, so clip both ends
+            // to the emitted frame.
+            let lo = (pad + s * sb).min(n);
+            let hi = (pad + s * sb + 2 * sb).min(n);
+            let inside: f64 = out[lo..hi].iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let total: f64 = out.iter().map(|&v| (v as f64) * (v as f64)).sum();
+            if lo < n {
+                assert!(total > 0.0, "block {s} produced no in-frame energy");
+            }
+            assert!(
+                (total - inside).abs() <= total.max(1e-12) * 1e-9,
+                "block {s} leaked outside its time span"
+            );
         }
     }
 }
