@@ -4,6 +4,20 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+* **Round-408 (2026-07-10) — §4.3.3 static-allocation dimensional
+  fix:** the RFC's `channels * N * alloc[band][q] << LM >> 2` takes
+  `N` at the 2.5 ms **base** frame size — the `<< LM` restores the
+  actual bin count (clean-room narrative, reallocation-walk chapter
+  §2). `combine_band_allocation` (and therefore the whole
+  `find_combined_alloc` → `derive_band_allocation` chain) was feeding
+  the evaluator the LM-scaled widths, double-applying the `2^LM`
+  factor and inflating the static allocation on every frame size
+  above 2.5 ms. The static term now evaluates on
+  `SHORT_FRAME_BAND_BINS`; trim offsets and caps keep the actual
+  frame-size widths the RFC defines them on.
+
 ### Added
 
 * **Round-406 (2026-07-10) — transient (short-block) frames decode

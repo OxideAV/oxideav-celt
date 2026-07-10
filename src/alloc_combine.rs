@@ -49,7 +49,7 @@
 //! [`StaticAllocSearch`]: crate::static_alloc::StaticAllocSearch
 
 use crate::band_cap::compute_band_caps;
-use crate::band_minimums::compute_trim_offsets;
+use crate::band_minimums::{compute_trim_offsets, SHORT_FRAME_BAND_BINS};
 use crate::static_alloc::{window_static_alloc_per_band_1_8th, INTERP_STEPS, NUM_Q};
 
 /// The per-band shape-allocation candidate assembled at a quality
@@ -94,7 +94,12 @@ pub struct CombinedAllocation {
 ///   at (0 for pure CELT, 17 for Hybrid).
 /// * `bins_per_band` — per-channel MDCT-bin count for each band in the
 ///   window, at the **actual** frame size (`BAND_BINS_LM[lm]` sliced to
-///   the window). `bins_per_band.len()` is the window length.
+///   the window). `bins_per_band.len()` is the window length. These
+///   widths drive the trim offsets and the caps; the static-allocation
+///   term internally uses the 2.5 ms **base** widths
+///   ([`SHORT_FRAME_BAND_BINS`]) because the RFC's `<< LM` factor
+///   already restores the actual bin count (clean-room narrative,
+///   reallocation-walk chapter §2).
 /// * `qlo` / `frac` — the quality-column grid position (typically a
 ///   [`crate::static_alloc::StaticAllocSearch`] outcome).
 /// * `boost` — per-coded-band boosts in 1/8 bits (from
@@ -131,10 +136,24 @@ pub fn combine_band_allocation(
     }
 
     // 1. Interpolated static allocation at (qlo, frac).
+    //
+    // Dimensional note (clean-room narrative, reallocation-walk chapter
+    // §2): the `N` in the RFC's `channels * N * alloc[band][q] << LM
+    // >> 2` is the band's MDCT-bin width at the 2.5 ms BASE frame size
+    // (LM = 0); the `<< LM` inside the evaluator restores the actual
+    // bin count. Feeding the evaluator the LM-scaled widths would
+    // double-apply the `2^LM` factor, inflating the static allocation
+    // on every frame size above 2.5 ms. The caller's `bins_per_band`
+    // (actual widths) still drives the trim offsets and caps below,
+    // which the RFC defines on the actual frame-size widths.
+    if coding_start + n > SHORT_FRAME_BAND_BINS.len() {
+        return None;
+    }
+    let base_bins = &SHORT_FRAME_BAND_BINS[coding_start..coding_start + n];
     let mut static_alloc = vec![0u32; n];
     if !window_static_alloc_per_band_1_8th(
         coding_start,
-        bins_per_band,
+        base_bins,
         qlo,
         frac,
         channels,
@@ -389,11 +408,13 @@ mod tests {
         // rather than asserting equality to static.
         let combined = combine_band_allocation(0, &bins, 3, 0, &boost, 5, 1, false, lm).unwrap();
 
-        // Reconstruct static + trim independently.
+        // Reconstruct static + trim independently. The static term is
+        // evaluated on the 2.5 ms base widths (the evaluator's `<< LM`
+        // restores the actual bin count — reallocation-walk chapter §2).
         let mut static_alloc = vec![0u32; n];
         assert!(window_static_alloc_per_band_1_8th(
             0,
-            &bins,
+            &SHORT_FRAME_BAND_BINS[..n],
             3,
             0,
             1,
