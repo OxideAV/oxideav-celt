@@ -55,7 +55,7 @@ use crate::band_cap::{compute_band_caps, encode_band_boosts};
 use crate::band_energy::{assemble_band_log_energy_f32, assemble_band_log_energy_q8};
 use crate::band_layout::{band_bins, coded_total_bins};
 use crate::band_split::band_needs_split;
-use crate::bit_allocation::{encode_band_allocation, BandAllocation};
+use crate::bit_allocation::{encode_alloc_trim, BandAllocation};
 use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS, NUM_BANDS};
 use crate::denormalization::denormalize_band_in_place_f32;
 use crate::fine_energy::{encode_fine_energy_band, fine_correction_q14, quantize_fine_energy_f32};
@@ -180,59 +180,51 @@ pub fn encode_frame_prefix(
         return Err(Error::InvalidParameter);
     }
 
-    // §4.3.3 setup: the initial reservation walk, read at the
-    // post-spread tell_frac — the identical position the decoder reads.
-    let tell_after_spread = enc.tell_frac();
-    let reservations = compute_initial_reservations(
-        frame_bytes,
-        tell_after_spread,
-        spec.header.transient,
-        lm,
-        stereo,
-        coded_bands,
-    );
-
     // Table 56 step 5: dynalloc band boosts (§4.3.3), gate-truncated.
+    // Per the §2.3 narrative the loop's `total_bits` initialises to
+    // the frame size in 1/8 bits — the raw wire budget.
+    let frame_8th = i32::try_from(u64::from(frame_bytes) * 64).unwrap_or(i32::MAX);
     let boosts = encode_band_boosts(
         enc,
         start as u32,
         end as u32,
         &bins,
         &caps,
-        reservations.total,
+        frame_8th,
         spec.target_boost,
     )?;
 
-    // Table 56 steps 6-9: trim / skip / intensity / dual (§4.3.3),
-    // gated against the post-boost tell_frac and total_boost.
+    // Table 56 step 6: alloc. trim (§4.3.3 / §2.4), gated on
+    // tell_frac + 48 <= frame_8th - total_boost. The Table-56 skip /
+    // intensity / dual symbols are written by the §4.3.3 reallocation
+    // walk (crate::realloc_walk), not here.
     let tell_after_boosts = enc.tell_frac();
-    let gates = reservations.gates_for_band_allocation(tell_after_boosts, boosts.total_boost);
-    encode_band_allocation(enc, gates, &spec.allocation)?;
+    let trim_gated = tell_after_boosts as i64 + 48 <= frame_8th as i64 - boosts.total_boost as i64;
+    encode_alloc_trim(enc, trim_gated, spec.allocation.alloc_trim)?;
 
-    // Normalize to the decoder's view: gated-off fields land on their
-    // §4.3.3 defaults.
+    // §4.3.3 / §2.5: the allocation-entry reservations, measured at
+    // the post-trim coder position — the identical spot the decoder
+    // reads.
+    let reservations = compute_initial_reservations(
+        frame_bytes,
+        enc.tell_frac(),
+        spec.header.transient,
+        lm,
+        stereo,
+        coded_bands,
+    );
+
+    // Normalize to the decoder's view: the gated-off trim lands on the
+    // §4.3.3 default; the walk-owned fields sit at their defaults
+    // until the frame driver overwrites them from the walk outcome.
     let defaults = BandAllocation::defaults();
     let allocation = BandAllocation {
-        alloc_trim: if gates.trim_gated {
+        alloc_trim: if trim_gated {
             spec.allocation.alloc_trim
         } else {
             defaults.alloc_trim
         },
-        skip: if gates.skip_gated {
-            spec.allocation.skip
-        } else {
-            defaults.skip
-        },
-        intensity_band_offset: if gates.intensity_gated {
-            spec.allocation.intensity_band_offset
-        } else {
-            defaults.intensity_band_offset
-        },
-        dual_stereo: if gates.dual_gated {
-            spec.allocation.dual_stereo
-        } else {
-            defaults.dual_stereo
-        },
+        ..defaults
     };
     let tf_gate = tf_select_matters(spec.header.transient, lm as u8, &spec.tf.tf_changes);
     let tf = TfParameters {
@@ -579,12 +571,37 @@ fn encode_celt_frame_impl(
         end,
     )?;
 
+    // §4.3.3 reallocation walk: writes the Table-56 skip / intensity /
+    // dual symbols (the encoder's choices: keep every band, no
+    // intensity, joint defaults for mono) and produces the per-band
+    // shape/fine split and finalize priorities the decoder will
+    // reconstruct from the identical symbols. A silence frame carries
+    // no walk symbols.
+    let walk = if header.silence {
+        None
+    } else {
+        let w = crate::derive_pulses::run_prefix_walk(
+            crate::realloc_walk::WalkIo::Encode {
+                enc: &mut enc,
+                coded_bands: end,
+                intensity: coded_bands as u32,
+                dual_stereo: false,
+            },
+            &prefix,
+            lm,
+            1,
+        )?;
+        prefix.allocation.skip = w.coded_bands < end;
+        prefix.allocation.intensity_band_offset = w.intensity_band;
+        prefix.allocation.dual_stereo = w.dual_stereo;
+        Some(w)
+    };
+
     // Resolve the per-band pulse counts: caller-supplied, zero for a
     // silence frame (no shape symbols — the decoder's silence branch
     // skips its own derivation identically), or derived from the
-    // just-encoded prefix via the documented §4.3.3 → §4.3.4.1 seam
-    // (the identical derivation the auto-decoder runs over the decoded
-    // prefix).
+    // just-written walk via the §4.3.4.1 bits-to-pulses inversion (the
+    // identical mapping the auto-decoder runs over the decoded walk).
     let derived_alloc;
     let zero_alloc;
     let (band_k, fine_bits): (&[u32], &[u32; NUM_BANDS]) = match (band_k, fine_bits) {
@@ -593,19 +610,17 @@ fn encode_celt_frame_impl(
             zero_alloc = (Vec::new(), [0u32; NUM_BANDS]);
             (k, &zero_alloc.1)
         }
-        (None, _) if header.silence => {
-            zero_alloc = (vec![0u32; coded_bands], [0u32; NUM_BANDS]);
-            (&zero_alloc.0, &zero_alloc.1)
-        }
-        (None, _) => {
-            // Derived allocation: pulse counts AND fine bits from the
-            // just-encoded prefix — the identical derivation the
-            // auto-decoder runs over the decoded (bit-identical)
-            // prefix, so both sides split fine from shape in lockstep.
-            derived_alloc = crate::derive_pulses::derive_band_allocation(&prefix, lm, 1, false)
-                .ok_or(Error::InvalidParameter)?;
-            (&derived_alloc.band_k, &derived_alloc.fine_bits)
-        }
+        (None, _) => match &walk {
+            None => {
+                zero_alloc = (vec![0u32; coded_bands], [0u32; NUM_BANDS]);
+                (&zero_alloc.0, &zero_alloc.1)
+            }
+            Some(w) => {
+                derived_alloc = crate::derive_pulses::pulses_from_walk(w, start, end, lm, 1, false)
+                    .ok_or(Error::InvalidParameter)?;
+                (&derived_alloc.band_k, &derived_alloc.fine_bits)
+            }
+        },
     };
 
     // §4.3.2.2 fine energy: quantize the residual left by the coarse
@@ -682,14 +697,14 @@ fn encode_celt_frame_impl(
     }
 
     // §4.3.2.2 finalize: spend the leftover raw bits, one extra
-    // fine-energy bit per band in priority order (funded bands first —
-    // the in-crate priority rule both sides derive from `band_k`),
-    // each bit chosen from the remaining envelope residual. Mirrors
-    // the decoder's walk exactly; skipped on silence frames.
+    // fine-energy bit per band in priority order — the priorities are
+    // the §4.3.3 walk's output, identical on both sides from the
+    // bit-identical walk. Mirrors the decoder's walk exactly; skipped
+    // on silence frames.
     let mut envelope_q8 = envelope_q8;
     let mut fin_corr_q14 = [0i32; NUM_BANDS];
-    if !header.silence {
-        let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+    if let Some(w) = &walk {
+        let priorities = &w.fine_priority;
         let leftover = (frame_bytes * 8).saturating_sub(enc.tell());
         let mut residual_f32 = [[0.0f32; NUM_BANDS]; 2];
         for band in start..end {
@@ -698,7 +713,7 @@ fn encode_celt_frame_impl(
         }
         let fin = crate::fine_energy::encode_finalize_extra_bits_depth(
             &mut enc,
-            &priorities,
+            priorities,
             fine_bits,
             start,
             end,
@@ -995,22 +1010,47 @@ fn encode_stereo_celt_frame_impl(
         end,
     )?;
 
-    // The budget gates must have carried the dual selector (and the
-    // intensity "never applies" offset): a gated-off field lands the
-    // decoder on the joint-coding defaults, whose §4.3.4.4 walk is the
-    // documented docs gap. A silence frame carries no shape symbols,
-    // so the selectors are moot there.
-    if !header.silence
-        && (!prefix.allocation.dual_stereo
-            || prefix.allocation.intensity_band_offset != coded_bands as u32)
-    {
-        return Err(Error::NotImplemented);
+    // §4.3.3 reallocation walk (stereo scaling): writes the Table-56
+    // skip / intensity / dual symbols — the encoder's choices: keep
+    // every band, intensity "never applies" (the post-skip window
+    // length), dual stereo on. A silence frame carries no walk
+    // symbols.
+    let walk = if header.silence {
+        None
+    } else {
+        let w = crate::derive_pulses::run_prefix_walk(
+            crate::realloc_walk::WalkIo::Encode {
+                enc: &mut enc,
+                coded_bands: end,
+                intensity: coded_bands as u32,
+                dual_stereo: true,
+            },
+            &prefix,
+            lm,
+            2,
+        )?;
+        prefix.allocation.skip = w.coded_bands < end;
+        prefix.allocation.intensity_band_offset = w.intensity_band;
+        prefix.allocation.dual_stereo = w.dual_stereo;
+        Some(w)
+    };
+
+    // The budget reservations must have carried the dual selector (and
+    // the intensity "never applies" offset): a gated-off field lands
+    // the decoder on the joint-coding defaults, whose §4.3.4.4 walk is
+    // the documented docs gap. A silence frame carries no shape
+    // symbols, so the selectors are moot there.
+    if let Some(w) = &walk {
+        let coded_window = (w.coded_bands - start) as u32;
+        if !w.dual_stereo || w.intensity_band != coded_window {
+            return Err(Error::NotImplemented);
+        }
     }
 
     // Shared per-band pulse counts + fine bits: caller-supplied,
-    // silence-zero, or derived from the just-encoded prefix (the
-    // identical derivation the auto-decoder runs over the decoded
-    // prefix, fine/shape split included).
+    // silence-zero, or derived from the just-written walk (the
+    // identical §4.3.4.1 inversion the auto-decoder runs over the
+    // decoded walk, dual halving included).
     let derived_alloc;
     let zero_alloc;
     let (band_k, fine_bits): (&[u32], &[u32; NUM_BANDS]) = match (band_k, fine_bits) {
@@ -1019,15 +1059,17 @@ fn encode_stereo_celt_frame_impl(
             zero_alloc = (Vec::new(), [0u32; NUM_BANDS]);
             (k, &zero_alloc.1)
         }
-        (None, _) if header.silence => {
-            zero_alloc = (vec![0u32; coded_bands], [0u32; NUM_BANDS]);
-            (&zero_alloc.0, &zero_alloc.1)
-        }
-        (None, _) => {
-            derived_alloc = crate::derive_pulses::derive_band_allocation_dual(&prefix, lm)
-                .ok_or(Error::InvalidParameter)?;
-            (&derived_alloc.band_k, &derived_alloc.fine_bits)
-        }
+        (None, _) => match &walk {
+            None => {
+                zero_alloc = (vec![0u32; coded_bands], [0u32; NUM_BANDS]);
+                (&zero_alloc.0, &zero_alloc.1)
+            }
+            Some(w) => {
+                derived_alloc = crate::derive_pulses::pulses_from_walk(w, start, end, lm, 2, true)
+                    .ok_or(Error::InvalidParameter)?;
+                (&derived_alloc.band_k, &derived_alloc.fine_bits)
+            }
+        },
     };
 
     // §4.3.2.2 fine energy: band-major, channel 0 then channel 1
@@ -1110,8 +1152,8 @@ fn encode_stereo_celt_frame_impl(
     // decoder's walk; skipped on silence frames.
     let (mut env_l, mut env_r) = (env_l, env_r);
     let mut fin_corr_q14 = [[0i32; NUM_BANDS]; 2];
-    if !header.silence {
-        let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+    if let Some(w) = &walk {
+        let priorities = &w.fine_priority;
         let leftover = (frame_bytes * 8).saturating_sub(enc.tell());
         let mut residual_f32 = [[0.0f32; NUM_BANDS]; 2];
         for band in start..end {
@@ -1122,7 +1164,7 @@ fn encode_stereo_celt_frame_impl(
         }
         let fin = crate::fine_energy::encode_finalize_extra_bits_depth(
             &mut enc,
-            &priorities,
+            priorities,
             fine_bits,
             start,
             end,
@@ -1297,7 +1339,11 @@ mod tests {
         assert_eq!(dec_prefix.boosts.boost[2], 64);
         // The requested trim landed (gate open at this budget).
         assert_eq!(dec_prefix.allocation.alloc_trim, 7);
-        assert!(dec_prefix.allocation.skip);
+        // The skip / intensity / dual fields are reallocation-walk
+        // outputs, not prefix symbols: the prefix carries their
+        // §4.3.3 defaults on both sides (the requested skip=true in
+        // the spec is not a prefix field).
+        assert!(!dec_prefix.allocation.skip);
     }
 
     /// A stereo inter prefix round-trips, including the stereo
@@ -1333,8 +1379,13 @@ mod tests {
         };
         let (enc_prefix, dec_prefix) = encode_and_decode(&spec, 1, true, 0, NUM_BANDS);
         assert_prefix_eq(&enc_prefix, &dec_prefix);
-        assert_eq!(dec_prefix.allocation.intensity_band_offset, 5);
-        assert!(dec_prefix.allocation.dual_stereo);
+        // Intensity / dual are reallocation-walk symbols now — the
+        // prefix carries their defaults; the stereo reservations that
+        // gate the walk's reads must have fired at this budget.
+        assert_eq!(dec_prefix.allocation.intensity_band_offset, 0);
+        assert!(!dec_prefix.allocation.dual_stereo);
+        assert!(dec_prefix.reservations.intensity_rsv > 0);
+        assert_eq!(dec_prefix.reservations.dual_stereo_rsv, 8);
     }
 
     /// A Hybrid-window (bands 17..21) prefix round-trips.
@@ -1704,14 +1755,18 @@ mod tests {
                 .unwrap();
                 assert_eq!(frame.bytes.len(), FRAME_BYTES as usize);
                 assert!(frame.prefix.allocation.dual_stereo, "lm={lm} frame {t}");
-                assert_eq!(
-                    frame.prefix.allocation.intensity_band_offset,
-                    NUM_BANDS as u32
-                );
+                // The walk pins intensity to the "never applies" edge
+                // of the post-skip window (== NUM_BANDS when nothing
+                // was skipped).
+                assert!(frame.prefix.allocation.intensity_band_offset <= NUM_BANDS as u32);
 
                 let decoded = dec_state
                     .decode_stereo_frame_auto(&frame.bytes, 0, NUM_BANDS)
                     .unwrap();
+                assert_eq!(
+                    frame.prefix.allocation, decoded.prefix.allocation,
+                    "lm={lm} frame {t}: walk outcome diverged"
+                );
                 assert_eq!(decoded.pcm.len(), 2 * (120usize << lm));
                 assert!(decoded.pcm.iter().all(|s| s.is_finite()));
                 assert_eq!(

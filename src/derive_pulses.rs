@@ -86,14 +86,15 @@
 
 use crate::alloc_combine::find_combined_alloc;
 use crate::band_minimums::compute_thresh;
+use crate::band_minimums::compute_trim_offsets;
 use crate::band_minimums::BAND_BINS_LM;
 use crate::bits_to_pulses::bits_to_pulses_band_loop_cached_thresh;
-use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
+use crate::coarse_energy::NUM_BANDS;
 use crate::fine_energy::MAX_FINE_BITS;
-use crate::frame_decode::{decode_frame_prefix, FramePrefix};
-use crate::frame_synthesis::{decode_celt_frame, CeltDecodeState, DecodedFrame};
+use crate::frame_decode::FramePrefix;
+use crate::frame_synthesis::{CeltDecodeState, DecodedFrame};
 use crate::pvq::{v_count, V_COUNT_SATURATION};
-use crate::range_decoder::RangeDecoder;
+use crate::realloc_walk::{realloc_walk, WalkAllocation, WalkBands, WalkBudget, WalkIo};
 use crate::Error;
 
 /// Largest `K' <= K` such that the PVQ codebook size `V(N, K')` does not
@@ -138,6 +139,135 @@ fn shape_budget_1_8th(prefix: &FramePrefix) -> i64 {
 /// symbols = budget`. Both sides derive the identical provision from
 /// the bit-identical prefix, so lockstep is preserved.
 const PER_SYMBOL_PROVISION_8TH: i64 = 1;
+
+/// Run the §4.3.3 reallocation walk ([`realloc_walk`]) over a decoded
+/// (or just-encoded) [`FramePrefix`], assembling every walk input the
+/// §2 setup derives from the prefix: the coded-window bin layout, the
+/// per-band caps, the decoded boosts, the trim offsets, the hard
+/// minimums, and the §2.5 reservation budget.
+///
+/// The range coder inside `io` must sit immediately after the Table-56
+/// `alloc. trim` symbol — exactly where
+/// [`decode_frame_prefix`] / [`encode_frame_prefix`] leave it — and is
+/// advanced through the walk's `skip` / `intensity` / `dual` symbols.
+///
+/// `channels` is 1 (mono) or 2 (stereo) and must match the `stereo`
+/// flag the prefix was produced with (the walk trusts the prefix's
+/// reservations, which already encode the stereo decision).
+///
+/// [`encode_frame_prefix`]: crate::frame_encode::encode_frame_prefix
+pub fn run_prefix_walk(
+    io: WalkIo<'_, '_>,
+    prefix: &FramePrefix,
+    lm: u32,
+    channels: u32,
+) -> Result<WalkAllocation, Error> {
+    let start = prefix.start;
+    let end = prefix.end;
+    if lm > 3 || start > end || end > NUM_BANDS || !(1..=2).contains(&channels) {
+        return Err(Error::InvalidParameter);
+    }
+    let n = end - start;
+    if prefix.boosts.boost.len() != n || prefix.caps.len() != n {
+        return Err(Error::InvalidParameter);
+    }
+    let bins: Vec<u32> = BAND_BINS_LM[lm as usize][start..end].to_vec();
+    let caps: Vec<i32> = prefix.caps.iter().map(|&c| i32::from(c)).collect();
+    let mut trim_offsets = vec![0i32; n];
+    if !compute_trim_offsets(
+        i32::from(prefix.allocation.alloc_trim),
+        lm,
+        channels,
+        start,
+        &bins,
+        &mut trim_offsets,
+    ) {
+        return Err(Error::InvalidParameter);
+    }
+    let mut thresh = vec![0i32; n];
+    if !compute_thresh(channels, &bins, &mut thresh) {
+        return Err(Error::InvalidParameter);
+    }
+    let bands = WalkBands {
+        start,
+        end,
+        bins: &bins,
+        caps: &caps,
+        boost: &prefix.boosts.boost,
+        trim_offsets: &trim_offsets,
+        thresh: &thresh,
+        channels,
+        lm,
+    };
+    let budget = WalkBudget {
+        total: prefix.reservations.total,
+        skip_rsv: prefix.reservations.skip_rsv,
+        intensity_rsv: prefix.reservations.intensity_rsv,
+        dual_rsv: prefix.reservations.dual_stereo_rsv,
+    };
+    realloc_walk(&bands, &budget, io)
+}
+
+/// Convert a [`WalkAllocation`]'s per-band **shape** budgets into PVQ
+/// pulse counts and an absolute-axis fine-bit array — the §4.3.4.1
+/// bits-to-pulses inversion over the walk's outputs.
+///
+/// For a dual-stereo frame (`dual = true`) each band's shape budget
+/// covers two PVQ indices at a shared `K`; the per-channel target is
+/// half the band budget (flooring the odd 1/8 bit) against half the
+/// 2-channel minimum, matching the dual residual walk's one-`K`-two-
+/// indices wire convention.
+///
+/// Returns `None` when the window / `lm` is out of range or the cached
+/// pulse walk rejects the inputs.
+pub fn pulses_from_walk(
+    walk: &WalkAllocation,
+    start: usize,
+    end: usize,
+    lm: u32,
+    channels: u32,
+    dual: bool,
+) -> Option<DerivedAllocation> {
+    if lm > 3 || start > end || end > NUM_BANDS {
+        return None;
+    }
+    let n = end - start;
+    if walk.shape_bits.len() != n || walk.fine_bits.len() != n {
+        return None;
+    }
+    let bins: Vec<u32> = BAND_BINS_LM[lm as usize][start..end].to_vec();
+
+    let div = if dual { 2u32 } else { 1 };
+    let targets: Vec<u32> = walk
+        .shape_bits
+        .iter()
+        .map(|&s| (s.max(0) as u32) / div)
+        .collect();
+    let mut thresh_i32 = vec![0i32; n];
+    if !compute_thresh(channels, &bins, &mut thresh_i32) {
+        return None;
+    }
+    let thresh: Vec<u32> = thresh_i32
+        .iter()
+        .map(|&t| (t.max(0) as u32) / div)
+        .collect();
+
+    let (per_band, _balance) =
+        bits_to_pulses_band_loop_cached_thresh(lm as usize, start, &bins, &targets, Some(&thresh))?;
+
+    let band_k: Vec<u32> = per_band
+        .iter()
+        .zip(bins.iter())
+        .map(|(r, &nn)| clamp_k_to_decodable(nn, r.k))
+        .collect();
+
+    let mut fine_bits = [0u32; NUM_BANDS];
+    for (i, &f) in walk.fine_bits.iter().enumerate() {
+        fine_bits[start + i] = f;
+    }
+
+    Some(DerivedAllocation { band_k, fine_bits })
+}
 
 /// Derive the per-band PVQ pulse counts `band_k` from a decoded
 /// [`FramePrefix`], using the documented §4.3.3 / §4.3.4.1 allocation
@@ -443,47 +573,22 @@ pub fn decode_celt_frame_auto(
     start: usize,
     end: usize,
 ) -> Result<DecodedFrame, Error> {
-    if start > end || end > NUM_BANDS {
-        return Err(Error::InvalidParameter);
-    }
-    let lm = state.lm();
-
-    // Decode the prefix on a throwaway coarse-energy state so the real
-    // streaming state is mutated exactly once, by decode_celt_frame
-    // below (which re-walks the prefix). Deriving band_k only needs the
-    // prefix's decoded boosts / trim / window, not the carried coarse
-    // prediction, so a fresh coarse state is sufficient here.
-    let mut probe_coarse = CoarseEnergyState::new();
-    let mut probe_dec = RangeDecoder::new(frame_bytes);
-    let prefix = decode_frame_prefix(
-        &mut probe_dec,
-        &mut probe_coarse,
-        lm,
-        frame_bytes.len() as u32,
-        false,
-        start,
-        end,
-    )?;
-
-    // A silence-flagged frame (§4.3 Table 56 `silence`) carries no
-    // shape symbols: the residual is the zero spectrum, so the
-    // synthesis plays out the overlap tail and the output decays to
-    // silence. The Table-56 walk (including coarse energy) still ran
-    // above, keeping the §4.3.2.1 prediction in encoder/decoder
-    // lockstep — the wire contract `encode_celt_frame_auto` writes.
-    let (band_k, fine_bits) = if prefix.header.silence {
-        (vec![0u32; end - start], [0u32; NUM_BANDS])
-    } else {
-        let alloc = derive_band_allocation(&prefix, lm, 1, false).ok_or(Error::InvalidParameter)?;
-        (alloc.band_k, alloc.fine_bits)
-    };
-
-    decode_celt_frame(state, frame_bytes, start, end, &fine_bits, &band_k)
+    // One single pass: the shared engine decodes the prefix, runs the
+    // §4.3.3 reallocation walk over the live decoder ([`run_prefix_walk`]),
+    // maps the walk's shape budgets to pulse counts
+    // ([`pulses_from_walk`]), and continues straight into fine energy /
+    // residual / finalize. A silence-flagged frame carries no walk or
+    // shape symbols and decays through the overlap tail.
+    crate::frame_synthesis::decode_celt_frame_inner(state, frame_bytes, start, end, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coarse_energy::CoarseEnergyState;
+    use crate::frame_decode::decode_frame_prefix;
+    use crate::frame_synthesis::decode_celt_frame;
+    use crate::range_decoder::RangeDecoder;
 
     /// Build a deterministic, well-formed CELT range-coded payload. The
     /// control-symbol decoders all have defined low-budget fallbacks, so
@@ -645,17 +750,34 @@ mod tests {
     }
 
     /// `decode_celt_frame_auto` matches the manual compose:
-    /// `decode_frame_prefix` → `derive_band_allocation` →
-    /// `decode_celt_frame` with the derived `band_k` **and** derived
-    /// `fine_bits` produces the same PCM the auto driver does.
+    /// `decode_frame_prefix` → [`run_prefix_walk`] →
+    /// [`pulses_from_walk`] → `decode_celt_frame` with the derived
+    /// `band_k` **and** derived `fine_bits` produces the same PCM the
+    /// auto driver does.
     #[test]
     fn auto_matches_manual_compose() {
         let lm = 3u32;
         let buf = decodable_payload(48, lm, 0, NUM_BANDS);
 
-        // Manual compose.
-        let pfx = prefix_of(&buf, lm, 0, NUM_BANDS);
-        let alloc = derive_band_allocation(&pfx, lm, 1, false).expect("derive");
+        // Manual compose: probe-decode the prefix, run the §4.3.3
+        // walk on the same probe decoder (positioned right after the
+        // trim), map the walk to pulse counts, then hand both to the
+        // explicit decoder.
+        let mut probe_coarse = CoarseEnergyState::new();
+        let mut probe_dec = RangeDecoder::new(&buf);
+        let pfx = decode_frame_prefix(
+            &mut probe_dec,
+            &mut probe_coarse,
+            lm,
+            buf.len() as u32,
+            false,
+            0,
+            NUM_BANDS,
+        )
+        .expect("prefix decode");
+        assert!(!pfx.header.silence, "decodable payload must be non-silent");
+        let walk = run_prefix_walk(WalkIo::Decode(&mut probe_dec), &pfx, lm, 1).expect("walk");
+        let alloc = pulses_from_walk(&walk, 0, NUM_BANDS, lm, 1, false).expect("pulses");
         let mut s_manual = CeltDecodeState::new(lm).expect("state");
         let manual = decode_celt_frame(
             &mut s_manual,

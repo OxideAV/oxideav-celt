@@ -4,6 +4,31 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+* **Round-408 — the §4.3.3 reallocation walk is wired into every
+  frame driver (wire-format change for in-crate streams):** the new
+  `realloc_walk` module implements the freshly staged behavioral spec
+  (bisection over the Table-57 quality codepoints, 1/64 interpolation
+  on the cap-clamped bracketing vectors, concurrent top-down skip
+  decoding, intensity/dual placement over the post-skip window, final
+  cap-bounded reallocation, fine/shape split, priority stamp,
+  balance). The Table-56 `skip` / `intensity` / `dual` symbols moved
+  out of `decode_frame_prefix` / `encode_frame_prefix` (which now end
+  at `alloc. trim`) into the walk, where the skip symbol can occur
+  once per viable band. Frame drivers (mono + stereo, explicit +
+  auto) run the walk on the live range coder; auto paths derive
+  `band_k` / `fine_bits` from the walk (`run_prefix_walk` +
+  `pulses_from_walk`), and the finalize step takes the walk's
+  priority-0/1 output on both sides. Budget threading fixed per the
+  §2 narrative: the boost loop's `total_bits` initialises to the
+  frame size in 1/8 bits (not a post-reservation value), the trim
+  gate compares against `frame_8th - total_boost`, and the §2.5
+  reservations are measured at the post-trim coder position.
+  `FramePrefix.allocation` carries walk defaults until the driver
+  overwrites it; `derive_band_allocation`/`_dual` remain as
+  arithmetic-only estimators and no longer describe the wire.
+
 ### Fixed
 
 * **Round-408 (2026-07-10) — §4.3.3 static-allocation dimensional

@@ -29,47 +29,34 @@
 //! 4. `spread` — the §4.3.4.3 spreading selector ([`decode_spread`]).
 //! 5. `dyn. alloc.` (band boosts) — the §4.3.3 dynalloc-logp loop
 //!    ([`decode_band_boosts`]), which first needs the per-band caps
-//!    ([`compute_band_caps`]) and the initial frame budget
-//!    ([`compute_initial_reservations`]).
-//! 6. `alloc. trim` + `skip` + `intensity` + `dual` — the §4.3.3
-//!    band-allocation scalar fields ([`decode_band_allocation`]),
-//!    gated by [`InitialReservations::gates_for_band_allocation`]
-//!    against the post-boost `ec_tell_frac()` and `total_boost`.
+//!    ([`compute_band_caps`]). Per the §2.3 narrative the loop's
+//!    `total_bits` initialises to the **frame size in 1/8 bits**.
+//! 6. `alloc. trim` — gated by
+//!    `ec_tell_frac() + 48 <= frame_8th - total_boost` (§2.4).
 //!
-//! The result is a [`FramePrefix`] carrier holding every decoded
-//! control parameter plus the running budget state (`reservations`,
-//! `boosts`) the §4.3.3 reallocation pass will consume. The range
-//! decoder is left positioned exactly at the start of the `fine energy`
-//! symbol (the next Table 56 entry), so a caller can continue the walk
-//! once the reallocation loop lands.
-//!
-//! ## What this module does NOT do
-//!
-//! Everything from the `fine energy` symbol onward in Table 56 — the
-//! fine-energy refinement allocation, the §4.3.3 reallocation pass with
-//! concurrent skip decoding, the fine-energy vs. shape split, the
-//! `residual` (per-band PVQ shape decode loop), the §4.3.5
-//! anti-collapse processing, and the `finalize` step — depends on the
-//! reallocation loop, whose precise per-band bisection and fine/shape
-//! split formula are deferred to the reference implementation by both
-//! RFC 6716 §4.3.3 ("implementers
-//! are free to implement the procedure in any way that produces
-//! identical results") and the clean-room narrative §2.7. Those remain
-//! documented docs gaps and are out of scope here. The driver stops at
-//! the boundary where they begin.
+//! The prefix ends there. The §2.5 allocation-entry reservations
+//! (anti-collapse / skip / intensity / dual) are computed from the
+//! post-trim `ec_tell_frac()` and carried in the returned
+//! [`FramePrefix`]; the Table-56 `skip` / `intensity` / `dual`
+//! **symbols** belong to the §4.3.3 reallocation walk
+//! ([`crate::realloc_walk`]), which reads them interleaved with its
+//! skip decisions. The range decoder is therefore left positioned at
+//! the walk's first symbol, and the frame drivers
+//! ([`crate::frame_synthesis::decode_celt_frame`] and friends) run the
+//! walk next.
 //!
 //! ## Budget threading (the part that needed care)
 //!
-//! The §4.3.3 reservation walk and the band-boost loop both consume the
-//! frame budget in 1/8-bit units, and the order in which they read the
-//! range decoder matters because every read advances `ec_tell_frac()`.
-//! The Table 56 order is: coarse energy and TF/spread are decoded
-//! first, *then* the reservations are computed from the post-spread
-//! `ec_tell_frac()`, *then* the band boosts are decoded (advancing the
-//! decoder further), *then* the trim gate is evaluated against the
-//! now-current `ec_tell_frac()` and the accumulated `total_boost`. This
-//! driver performs each `tell_frac()` read at exactly the point Table 56
-//! / §4.3.3 specify, so the gates fire identically to the reference.
+//! The band-boost loop, the trim gate, and the reservation walk each
+//! read the budget at a different decoder position, and every symbol
+//! read advances `ec_tell_frac()`. Per §4.3.3 / the §2 narrative: the
+//! boost loop runs against the raw frame budget (`frame_bytes * 64`)
+//! with its live `tell`; the trim gate compares the post-boost
+//! `ec_tell_frac()` against `frame_8th - total_boost`; and the §2.5
+//! reservations start from `frame_bytes * 64 - ec_tell_frac() - 1`
+//! measured **after** the trim. This driver performs each read at
+//! exactly the point the prose specifies, so both codec sides evaluate
+//! every gate identically.
 //!
 //! ## Clean-room provenance
 //!
@@ -83,13 +70,16 @@
 
 use crate::allocation_budget::{compute_initial_reservations, InitialReservations};
 use crate::band_cap::{compute_band_caps, decode_band_boosts, BoostResult};
-use crate::bit_allocation::{decode_band_allocation, BandAllocation};
+use crate::bit_allocation::{decode_alloc_trim, BandAllocation};
 use crate::coarse_energy::{decode_coarse_energy, CoarseEnergyState, NUM_BANDS};
 use crate::frame_header::CeltFrameHeader;
 use crate::range_decoder::RangeDecoder;
 use crate::spread::{decode_spread, Spread};
 use crate::tf_change::{decode_tf_parameters, TfParameters};
 use crate::Error;
+
+/// 1/8-bit units per whole coded bit (the §4.3.3 budget scale).
+const BITS_TO_8TH: u32 = 8;
 
 /// Per-band MDCT-bin layout for the coded band window
 /// `[start, end)` at frame-size shift `lm`.
@@ -131,9 +121,11 @@ pub struct FramePrefix {
     /// The §4.3.3 band-boost loop result (per-band boosts +
     /// `total_boost` + remaining budget).
     pub boosts: BoostResult,
-    /// The §4.3.3 band-allocation scalar fields (trim / skip /
-    /// intensity-band / dual-stereo), with §4.3.3 defaults filled in
-    /// for every gated-off field.
+    /// The §4.3.3 band-allocation scalar fields. Only `alloc_trim` is
+    /// a prefix symbol (Table 56); the `skip` / `intensity_band_offset`
+    /// / `dual_stereo` fields are **reallocation-walk outputs**
+    /// ([`crate::realloc_walk`]) and sit at their §4.3.3 defaults here —
+    /// the frame drivers overwrite them from the walk.
     pub allocation: BandAllocation,
     /// First coded band (0 for pure CELT, 17 for Hybrid mode).
     pub start: usize,
@@ -141,7 +133,8 @@ pub struct FramePrefix {
     /// bandwidth).
     pub end: usize,
     /// The §4.1.6/§5.1.6 `tell_frac()` coder position just after the
-    /// last prefix symbol (the Table-56 `dual` entry) — identical on
+    /// last prefix symbol (the Table-56 `alloc. trim` entry; the
+    /// walk's skip/intensity/dual symbols come after) — identical on
     /// the encode and decode side by the range-coder budget lockstep.
     /// Together with [`frame_bytes`](Self::frame_bytes) this
     /// re-measures the *true* remaining wire budget for the
@@ -167,7 +160,8 @@ pub struct FramePrefix {
 ///
 /// * `dec` — the range decoder, initialized over the CELT range-coded
 ///   segment for this frame. Advanced through every decoded symbol;
-///   left positioned at the `fine energy` Table 56 entry on success.
+///   left positioned at the reallocation walk's first symbol (the
+///   Table-56 `skip` entry) on success.
 /// * `coarse_state` — the inter-frame coarse-energy prediction state,
 ///   mutated in place by the §4.3.2.1 envelope walk. Pass a freshly
 ///   [`reset`](CoarseEnergyState::reset) state on a §4.5.2 decoder
@@ -230,41 +224,42 @@ pub fn decode_frame_prefix(
         return Err(Error::InvalidParameter);
     }
 
-    // §4.3.3 setup: the initial reservation walk. Per §4.3.3 the
-    // budget "decoded so far" is ec_tell_frac() taken AFTER the prefix
-    // + coarse energy + TF + spread have been decoded (the symbols
-    // that precede dynalloc in Table 56), which is exactly the decoder
-    // position right now.
-    let tell_after_spread = dec.tell_frac();
+    // Table 56 step 5: dynalloc band boosts (§4.3.3). Per the §2.3
+    // narrative the loop's `total_bits` initialises to "the frame size
+    // in 1/8 bits" — the raw wire budget, NOT a post-reservation
+    // value (the §2.5 reservations happen only at allocation entry,
+    // after the trim). The loop reads from the decoder.
+    let frame_8th =
+        i32::try_from(u64::from(frame_bytes) * u64::from(BITS_TO_8TH) * 8).unwrap_or(i32::MAX);
+    let boosts = decode_band_boosts(dec, start as u32, end as u32, &bins, &caps, frame_8th)
+        .ok_or(Error::InvalidParameter)?;
+
+    // Table 56 step 6: alloc. trim (§4.3.3 / §2.4). Gate:
+    // ec_tell_frac() + 48 <= frame size in 1/8 bits - total_boost.
+    let tell_after_boosts = dec.tell_frac();
+    let trim_gated = tell_after_boosts as i64 + 48 <= frame_8th as i64 - boosts.total_boost as i64;
+    let allocation = BandAllocation {
+        alloc_trim: decode_alloc_trim(dec, trim_gated)
+            .unwrap_or(BandAllocation::defaults().alloc_trim),
+        ..BandAllocation::defaults()
+    };
+
+    // §4.3.3 / §2.5: the allocation-entry reservations. `total` starts
+    // from the wire budget re-measured at THIS decoder position (after
+    // the trim), minus the conservative 1/8 bit; the anti-collapse /
+    // skip / intensity / dual reservations then come off in order. The
+    // Table-56 `skip` / `intensity` / `dual` symbols themselves are
+    // NOT part of the prefix: they are read by the §4.3.3 reallocation
+    // walk ([`crate::realloc_walk`]), interleaved with its skip
+    // decisions.
     let reservations = compute_initial_reservations(
         frame_bytes,
-        tell_after_spread,
+        dec.tell_frac(),
         header.transient,
         lm,
         stereo,
         coded_bands,
     );
-
-    // Table 56 step 5: dynalloc band boosts (§4.3.3). The §4.3.3 prose
-    // initialises the loop's `total_bits` to the frame size in 1/8
-    // bits; the running budget the boosts must respect is the
-    // post-reservation `total`. The loop reads from the decoder.
-    let boosts = decode_band_boosts(
-        dec,
-        start as u32,
-        end as u32,
-        &bins,
-        &caps,
-        reservations.total,
-    )
-    .ok_or(Error::InvalidParameter)?;
-
-    // Table 56 steps 6-9: trim / skip / intensity / dual (§4.3.3). The
-    // trim gate is evaluated against the post-boost ec_tell_frac() and
-    // the accumulated total_boost, per §4.3.3.
-    let tell_after_boosts = dec.tell_frac();
-    let gates = reservations.gates_for_band_allocation(tell_after_boosts, boosts.total_boost);
-    let allocation = decode_band_allocation(dec, gates);
 
     Ok(FramePrefix {
         header,

@@ -414,7 +414,8 @@ pub use denormalization::{
 };
 pub use derive_pulses::{
     decode_celt_frame_auto, derive_band_allocation, derive_band_allocation_dual,
-    derive_band_pulses, derive_band_pulses_dual, DerivedAllocation,
+    derive_band_pulses, derive_band_pulses_dual, pulses_from_walk, run_prefix_walk,
+    DerivedAllocation,
 };
 pub use e_prob_model::{
     prob_decay, ProbDecay, E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER,

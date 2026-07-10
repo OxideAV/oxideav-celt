@@ -17,8 +17,9 @@
 
 use oxideav_celt::{
     band_bins, coded_total_bins, decode_celt_frame, decode_celt_frame_auto, decode_fine_energy,
-    decode_frame_prefix, decode_residual_bands, encode_celt_frame, encode_celt_frame_auto, v_count,
-    CeltDecodeState, CeltFrameHeader, CoarseEnergyState, PostFilter, RangeDecoder, NUM_BANDS,
+    decode_frame_prefix, decode_residual_bands, encode_celt_frame, encode_celt_frame_auto,
+    pulses_from_walk, run_prefix_walk, v_count, CeltDecodeState, CeltFrameHeader,
+    CoarseEnergyState, PostFilter, RangeDecoder, WalkIo, NUM_BANDS,
 };
 
 const FRAME_BYTES: u32 = 160;
@@ -95,8 +96,15 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     assert!(prefix.header.intra);
     assert!(!prefix.header.transient);
     assert_eq!(prefix.spread, encoded.prefix.spread);
-    assert_eq!(prefix.allocation, encoded.prefix.allocation);
+    assert_eq!(
+        prefix.allocation.alloc_trim,
+        encoded.prefix.allocation.alloc_trim
+    );
     assert_eq!(prefix.boosts, encoded.prefix.boosts);
+
+    // §4.3.3 reallocation walk: consumes the Table-56 skip /
+    // intensity / dual symbols the encoder's walk wrote.
+    let walk = run_prefix_walk(WalkIo::Decode(&mut dec), &prefix, lm, 1).unwrap();
 
     let fine_q14 = decode_fine_energy(&mut dec, &fine_bits);
     let env_q8 =
@@ -119,8 +127,8 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     assert!(!dec.has_error());
 
     // §4.3.2.2 finalize (r406): the leftover raw bits refine the
-    // envelope; the manual walk mirrors the driver.
-    let priorities = oxideav_celt::finalize_priorities_from_k(&band_k);
+    // envelope; priorities are the §4.3.3 walk's output on both sides.
+    let priorities = walk.fine_priority.clone();
     let leftover = dec.storage_bits().saturating_sub(dec.tell());
     let fin = oxideav_celt::finalize_extra_bits_depth(
         &mut dec,
@@ -421,15 +429,17 @@ fn auto_encode_auto_decode_self_contained_loop() {
     // Encoder and decoder coarse prediction stay in lockstep.
     assert_eq!(enc_state.energy[0], state.coarse_energy().energy[0]);
 
-    // Bit-exact spectrum check: derive band_k AND fine_bits from the
-    // encoder's returned prefix (the same values the auto-decoder
-    // derives from its decoded copy) and walk the residual manually.
-    let alloc = oxideav_celt::derive_band_allocation(&encoded.prefix, lm, 1, false).unwrap();
-    let band_k = alloc.band_k;
+    // Bit-exact spectrum check: decode the prefix, run the §4.3.3
+    // reallocation walk on the live decoder, derive band_k AND
+    // fine_bits from the walk (the same mapping the auto-decoder
+    // runs), and walk the residual manually.
     let mut dec = RangeDecoder::new(&encoded.bytes);
     let mut dec_state = CoarseEnergyState::new();
     let prefix =
         decode_frame_prefix(&mut dec, &mut dec_state, lm, FRAME_BYTES, false, start, end).unwrap();
+    let walk = run_prefix_walk(WalkIo::Decode(&mut dec), &prefix, lm, 1).unwrap();
+    let alloc = pulses_from_walk(&walk, start, end, lm, 1, false).unwrap();
+    let band_k = alloc.band_k;
     let fine_q14 = decode_fine_energy(&mut dec, &alloc.fine_bits);
     let env_q8 =
         oxideav_celt::assemble_band_log_energy_q8(&dec_state, 0, Some(&fine_q14), None).unwrap();
@@ -447,8 +457,9 @@ fn auto_encode_auto_decode_self_contained_loop() {
         &window_energy,
     )
     .unwrap();
-    // The finalize step (r406): mirror the driver's leftover-bit walk.
-    let priorities = oxideav_celt::finalize_priorities_from_k(&band_k);
+    // The finalize step (r406): mirror the driver's leftover-bit walk,
+    // priorities from the §4.3.3 walk.
+    let priorities = walk.fine_priority.clone();
     let leftover = dec.storage_bits().saturating_sub(dec.tell());
     let fin = oxideav_celt::finalize_extra_bits_depth(
         &mut dec,

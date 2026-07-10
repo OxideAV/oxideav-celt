@@ -360,20 +360,39 @@ pub fn decode_celt_frame(
     fine_bits: &[u32; NUM_BANDS],
     band_k: &[u32],
 ) -> Result<DecodedFrame, Error> {
+    decode_celt_frame_inner(state, frame_bytes, start, end, Some((fine_bits, band_k)))
+}
+
+/// Shared mono decode engine: `overrides = Some((fine_bits, band_k))`
+/// is the explicit-allocation path ([`decode_celt_frame`]);
+/// `None` derives both from the §4.3.3 reallocation walk
+/// ([`decode_celt_frame_auto`](crate::derive_pulses::decode_celt_frame_auto)).
+/// The walk's `skip` / `intensity` / `dual` symbols are consumed from
+/// the wire in **both** modes — the wire layout does not depend on the
+/// mode; overrides only replace the values used downstream.
+pub(crate) fn decode_celt_frame_inner(
+    state: &mut CeltDecodeState,
+    frame_bytes: &[u8],
+    start: usize,
+    end: usize,
+    overrides: Option<(&[u32; NUM_BANDS], &[u32])>,
+) -> Result<DecodedFrame, Error> {
     if start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
     }
     let coded_bands = end - start;
-    if band_k.len() != coded_bands {
-        return Err(Error::InvalidParameter);
+    if let Some((_, k)) = overrides {
+        if k.len() != coded_bands {
+            return Err(Error::InvalidParameter);
+        }
     }
     let lm = state.lm;
 
     let mut dec = RangeDecoder::new(frame_bytes);
 
     // Table 56 prefix: silence / post-filter / transient / intra →
-    // coarse energy → TF / spread → caps → boosts → reservations →
-    // band allocation. Mutates the coarse-energy prediction state.
+    // coarse energy → TF / spread → caps → boosts → trim →
+    // reservations. Mutates the coarse-energy prediction state.
     let mut prefix = decode_frame_prefix(
         &mut dec,
         &mut state.coarse,
@@ -384,6 +403,46 @@ pub fn decode_celt_frame(
         end,
     )?;
     let transient = prefix.header.transient;
+
+    // §4.3.3 reallocation walk: reads the Table-56 skip / intensity /
+    // dual symbols and produces the per-band shape/fine split, the
+    // coded-band count, and the finalize priorities. A silence frame
+    // carries no walk symbols (the in-crate silence wire stops after
+    // the prefix).
+    let walk = if prefix.header.silence {
+        None
+    } else {
+        let walk = crate::derive_pulses::run_prefix_walk(
+            crate::realloc_walk::WalkIo::Decode(&mut dec),
+            &prefix,
+            lm,
+            1,
+        )?;
+        // Surface the walk's decisions through the prefix carrier (the
+        // decoder's view of the §4.3.3 outcome).
+        prefix.allocation.skip = walk.coded_bands < end;
+        prefix.allocation.intensity_band_offset = walk.intensity_band;
+        prefix.allocation.dual_stereo = walk.dual_stereo;
+        Some(walk)
+    };
+
+    // Resolve the effective allocation: caller overrides, walk-derived
+    // (auto), or the zero allocation on a silence frame.
+    let derived;
+    let zero_k;
+    let zero_fine = [0u32; NUM_BANDS];
+    let (fine_bits, band_k): (&[u32; NUM_BANDS], &[u32]) = match (overrides, &walk) {
+        (Some((fb, k)), _) => (fb, k),
+        (None, Some(w)) => {
+            derived = crate::derive_pulses::pulses_from_walk(w, start, end, lm, 1, false)
+                .ok_or(Error::InvalidParameter)?;
+            (&derived.fine_bits, &derived.band_k)
+        }
+        (None, None) => {
+            zero_k = vec![0u32; coded_bands];
+            (&zero_fine, &zero_k)
+        }
+    };
 
     // §4.3.2.2 fine-energy refinement for the allocator's per-band bit
     // counts. Reads raw bits from the back of the frame.
@@ -445,24 +504,17 @@ pub fn decode_celt_frame(
 
     // §4.3.2.2 finalize: the raw bits left after every other symbol are
     // spent one extra fine-energy bit per band (per channel) in
-    // priority order — priorities derived in-crate from the shape
-    // allocation (funded bands first; see
-    // [`finalize_priorities_from_k`](crate::fine_energy::finalize_priorities_from_k)).
-    // Skipped on silence frames (the in-crate silence wire stops after
-    // the fine-energy section).
+    // priority order — the priorities are the §4.3.3 walk's output
+    // (identical on both sides from the bit-identical walk, whatever
+    // allocation overrides are in play). Skipped on silence frames
+    // (the in-crate silence wire stops after the fine-energy section).
     let mut env_final_q8 = env_q8;
     let mut fin_corr_q14 = [0i32; NUM_BANDS];
-    if !prefix.header.silence {
-        let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+    if let Some(w) = &walk {
+        let priorities = &w.fine_priority;
         let leftover = dec.storage_bits().saturating_sub(dec.tell());
         let fin = crate::fine_energy::finalize_extra_bits_depth(
-            &mut dec,
-            &priorities,
-            fine_bits,
-            start,
-            end,
-            1,
-            leftover,
+            &mut dec, priorities, fine_bits, start, end, 1, leftover,
         );
         fin_corr_q14 = fin.corrections_q14[0];
         // The residual was denormalized against the pre-finalize
@@ -858,12 +910,31 @@ impl StereoCeltDecodeState {
         fine_bits: &[u32; NUM_BANDS],
         band_k: &[u32],
     ) -> Result<StereoDecodedFrame, Error> {
+        self.decode_stereo_frame_inner(frame_bytes, start, end, Some((fine_bits, band_k)))
+    }
+
+    /// Shared stereo decode engine: `overrides = Some((fine_bits,
+    /// band_k))` is the explicit path
+    /// ([`decode_stereo_frame_coded`](Self::decode_stereo_frame_coded));
+    /// `None` derives both from the §4.3.3 reallocation walk
+    /// ([`decode_stereo_frame_auto`](Self::decode_stereo_frame_auto)).
+    /// The walk's skip / intensity / dual symbols are consumed from
+    /// the wire in both modes.
+    fn decode_stereo_frame_inner(
+        &mut self,
+        frame_bytes: &[u8],
+        start: usize,
+        end: usize,
+        overrides: Option<(&[u32; NUM_BANDS], &[u32])>,
+    ) -> Result<StereoDecodedFrame, Error> {
         if start > end || end > NUM_BANDS {
             return Err(Error::InvalidParameter);
         }
         let coded_bands = end - start;
-        if band_k.len() != coded_bands {
-            return Err(Error::InvalidParameter);
+        if let Some((_, k)) = overrides {
+            if k.len() != coded_bands {
+                return Err(Error::InvalidParameter);
+            }
         }
         let lm = self.lm;
 
@@ -882,16 +953,54 @@ impl StereoCeltDecodeState {
         )?;
 
         let transient = prefix.header.transient;
+
+        // §4.3.3 reallocation walk (stereo scaling): reads the
+        // Table-56 skip / intensity / dual symbols. Silence frames
+        // carry no walk symbols.
+        let walk = if prefix.header.silence {
+            None
+        } else {
+            let w = crate::derive_pulses::run_prefix_walk(
+                crate::realloc_walk::WalkIo::Decode(&mut dec),
+                &prefix,
+                lm,
+                2,
+            )?;
+            prefix.allocation.skip = w.coded_bands < end;
+            prefix.allocation.intensity_band_offset = w.intensity_band;
+            prefix.allocation.dual_stereo = w.dual_stereo;
+            Some(w)
+        };
+
         // Only the dual (uncoupled) residual layout is documented; a
         // joint-coded or intensity-coded frame cannot be parsed past
         // this point (§4.3.4.4 docs gap). Silence frames carry no
         // shape symbols, so the selectors are moot there.
-        if !prefix.header.silence
-            && (!prefix.allocation.dual_stereo
-                || prefix.allocation.intensity_band_offset != coded_bands as u32)
-        {
-            return Err(Error::NotImplemented);
+        if let Some(w) = &walk {
+            let coded_window = (w.coded_bands - start) as u32;
+            if !w.dual_stereo || w.intensity_band != coded_window {
+                return Err(Error::NotImplemented);
+            }
         }
+
+        // Resolve the effective allocation: caller overrides,
+        // walk-derived (auto; shared K, per-channel half budgets), or
+        // the zero allocation on silence.
+        let derived;
+        let zero_k;
+        let zero_fine = [0u32; NUM_BANDS];
+        let (fine_bits, band_k): (&[u32; NUM_BANDS], &[u32]) = match (overrides, &walk) {
+            (Some((fb, k)), _) => (fb, k),
+            (None, Some(w)) => {
+                derived = crate::derive_pulses::pulses_from_walk(w, start, end, lm, 2, true)
+                    .ok_or(Error::InvalidParameter)?;
+                (&derived.fine_bits, &derived.band_k)
+            }
+            (None, None) => {
+                zero_k = vec![0u32; coded_bands];
+                (&zero_fine, &zero_k)
+            }
+        };
 
         // §4.3.2.2 fine energy: band-major, channel 0 then channel 1
         // within each band — the encoder's exact walk.
@@ -970,17 +1079,11 @@ impl StereoCeltDecodeState {
         // pass uses). Skipped on silence frames.
         let (mut env_l_final, mut env_r_final) = (env_l, env_r);
         let mut fin_corr_q14 = [[0i32; NUM_BANDS]; 2];
-        if !prefix.header.silence {
-            let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+        if let Some(w) = &walk {
+            let priorities = &w.fine_priority;
             let leftover = dec.storage_bits().saturating_sub(dec.tell());
             let fin = crate::fine_energy::finalize_extra_bits_depth(
-                &mut dec,
-                &priorities,
-                fine_bits,
-                start,
-                end,
-                2,
-                leftover,
+                &mut dec, priorities, fine_bits, start, end, 2, leftover,
             );
             fin_corr_q14 = fin.corrections_q14;
             for (samples, corr) in [
@@ -1068,36 +1171,11 @@ impl StereoCeltDecodeState {
         start: usize,
         end: usize,
     ) -> Result<StereoDecodedFrame, Error> {
-        if start > end || end > NUM_BANDS {
-            return Err(Error::InvalidParameter);
-        }
-        let lm = self.lm;
-
-        // Probe the prefix on a throwaway coarse state so the real
-        // streaming state is mutated exactly once, by the coded decode
-        // below (which re-walks the prefix) — the same pattern the mono
-        // auto-decoder uses.
-        let mut probe_coarse = CoarseEnergyState::new();
-        let mut probe_dec = RangeDecoder::new(frame_bytes);
-        let prefix = decode_frame_prefix(
-            &mut probe_dec,
-            &mut probe_coarse,
-            lm,
-            frame_bytes.len() as u32,
-            true,
-            start,
-            end,
-        )?;
-
-        let (band_k, fine_bits) = if prefix.header.silence {
-            (vec![0u32; end - start], [0u32; NUM_BANDS])
-        } else {
-            let alloc = crate::derive_pulses::derive_band_allocation_dual(&prefix, lm)
-                .ok_or(Error::InvalidParameter)?;
-            (alloc.band_k, alloc.fine_bits)
-        };
-
-        self.decode_stereo_frame_coded(frame_bytes, start, end, &fine_bits, &band_k)
+        // One single pass: the shared engine decodes the prefix, runs
+        // the §4.3.3 reallocation walk over the live decoder, maps the
+        // walk's shape budgets to the shared per-band K (dual halving),
+        // and continues into fine energy / residual / finalize.
+        self.decode_stereo_frame_inner(frame_bytes, start, end, None)
     }
 
     /// Synthesize one stereo frame from the two channels' **denormalized**
