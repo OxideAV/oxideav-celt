@@ -28,13 +28,19 @@
 //! the [`crate::residual::ResidualSpectrum`] layout — exactly what
 //! [`crate::frame_encode::encode_celt_frame`] consumes.
 //!
-//! ## Why long-MDCT only
+//! ## Transient (short-block) frames
 //!
-//! The transient (short-block) analysis needs the §4.3.1 per-frame
-//! short-MDCT geometry and the within-frame frequency-vector
-//! interleave, which RFC 6716 defers to the reference implementation —
-//! the same documented docs gap the synthesis spine keeps. This spine
-//! therefore handles only the single-long-MDCT case.
+//! [`LongMdctAnalysis::analyze_frame`] mirrors the decode side's
+//! transient handling: a transient frame is analyzed as `2^lm` short
+//! MDCTs with the full-overlap basic window
+//! ([`MdctAnalysis::frame_short`](crate::mdct::MdctAnalysis::frame_short)),
+//! interleaved into the same `spectrum[nb_blocks * f + s]` layout the
+//! decode side de-interleaves. The short-block placement inside the
+//! frame is derived from the \[PRINCEN86\] boundary-cancellation
+//! requirement (see
+//! [`short_block_geometry`](crate::mdct::short_block_geometry)), so
+//! long and transient frames may alternate freely on one streaming
+//! state and still reconstruct exactly through the synthesis spine.
 //!
 //! ## Clean-room provenance
 //!
@@ -106,6 +112,10 @@ pub struct LongMdctAnalysis {
     /// The `2 * mdct_size(lm)`-sample §4.3.7 window (fixed-overlap
     /// 120) — identical to the synthesis window.
     window: Vec<f32>,
+    /// The `2 * CELT_OVERLAP`-sample full-overlap basic window the
+    /// §4.3.1 transient short blocks use — identical to the synthesis
+    /// side's short window.
+    short_window: Vec<f32>,
     ana: MdctAnalysis,
 }
 
@@ -117,9 +127,11 @@ impl LongMdctAnalysis {
     pub fn new(lm: u32) -> Option<Self> {
         let n = mdct_size(lm)?;
         let window = build_low_overlap_window_f32(n, CELT_OVERLAP)?;
+        let short_window = build_low_overlap_window_f32(CELT_OVERLAP, CELT_OVERLAP)?;
         Some(Self {
             lm,
             window,
+            short_window,
             ana: MdctAnalysis::new(n),
         })
     }
@@ -173,11 +185,58 @@ impl LongMdctAnalysis {
     /// an out-of-range band window; the history advances only on
     /// success.
     pub fn analyze(&mut self, pcm: &[f32], start: usize, end: usize) -> Result<Vec<f32>, Error> {
+        self.analyze_frame(pcm, start, end, false)
+    }
+
+    /// Analyze one frame, long or transient (§4.3.1), and return the
+    /// **full** `120 << lm`-bin spectrum. A transient frame is analyzed
+    /// as `2^lm` interleaved short MDCTs
+    /// ([`MdctAnalysis::frame_short`](crate::mdct::MdctAnalysis::frame_short))
+    /// with the full-overlap basic window — the exact mirror of
+    /// [`LongMdctSynthesis::synthesize_frame`](crate::synthesis::LongMdctSynthesis::synthesize_frame).
+    ///
+    /// Returns [`Error::InvalidParameter`] when
+    /// `pcm.len() != mdct_size(lm)`. The history advances only on
+    /// success.
+    pub fn analyze_full_frame(&mut self, pcm: &[f32], transient: bool) -> Result<Vec<f32>, Error> {
+        let n = self.ana.frame_size();
+        if pcm.len() != n {
+            return Err(Error::InvalidParameter);
+        }
+        let mut spectrum = vec![0.0f32; n];
+        let ok = if transient {
+            let nb_blocks = 1usize << self.lm;
+            self.ana
+                .frame_short(pcm, &self.short_window, nb_blocks, &mut spectrum)
+        } else {
+            self.ana.frame(pcm, &self.window, &mut spectrum)
+        };
+        if !ok {
+            return Err(Error::InvalidParameter);
+        }
+        Ok(spectrum)
+    }
+
+    /// Analyze one frame, long or transient, and return the
+    /// **coded-window** spectrum for the band window `[start, end)` —
+    /// [`analyze_full_frame`](Self::analyze_full_frame) followed by
+    /// [`extract_coded_spectrum`].
+    ///
+    /// Returns [`Error::InvalidParameter`] on a PCM length mismatch or
+    /// an out-of-range band window; the history advances only on
+    /// success.
+    pub fn analyze_frame(
+        &mut self,
+        pcm: &[f32],
+        start: usize,
+        end: usize,
+        transient: bool,
+    ) -> Result<Vec<f32>, Error> {
         // Validate the window before advancing the streaming history.
         if start > end || end > NUM_BANDS {
             return Err(Error::InvalidParameter);
         }
-        let full = self.analyze_full(pcm)?;
+        let full = self.analyze_full_frame(pcm, transient)?;
         extract_coded_spectrum(&full, self.lm, start, end)
     }
 }
@@ -347,6 +406,55 @@ mod tests {
                         (recovered[t][k] - spectra[t - 1][k]).abs() <= 2e-4,
                         "lm={lm} frame {} bin {k}: {} vs {}",
                         t - 1,
+                        recovered[t][k],
+                        spectra[t - 1][k]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Transient (short-block) frames round-trip through the spine
+    /// pair at every `lm`, including mixed long/transient streams on
+    /// one shared streaming state: `synthesize_frame` →
+    /// `analyze_frame` recovers each frame's coded spectrum in steady
+    /// state regardless of the block-kind sequence.
+    #[test]
+    fn transient_and_mixed_frames_round_trip() {
+        for lm in 0..=3u32 {
+            let coded = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
+            // long, transient, transient, long, transient, long.
+            let kinds = [false, true, true, false, true, false];
+            let frames = kinds.len();
+            let spectra: Vec<Vec<f32>> = (0..frames)
+                .map(|t| test_signal(coded, 0x7A0 + lm * 17 + t as u32))
+                .collect();
+            let mut synth = LongMdctSynthesis::new(lm).unwrap();
+            let mut ana = LongMdctAnalysis::new(lm).unwrap();
+            let mut recovered: Vec<Vec<f32>> = Vec::new();
+            for (t, spec) in spectra.iter().enumerate() {
+                let pcm = synth
+                    .synthesize_frame(spec, 0, NUM_BANDS, kinds[t])
+                    .unwrap();
+                // Analysis call t spans the same 2N block synthesis
+                // call t-1 windowed, so it must transform with frame
+                // t-1's block kind to recover that frame's spectrum
+                // (the encoder direction — analysis first — matches
+                // kinds at equal call indices instead; see the PCM
+                // codec-loop tests).
+                let kind_of_recovered = kinds[t.saturating_sub(1)];
+                recovered.push(
+                    ana.analyze_frame(&pcm, 0, NUM_BANDS, kind_of_recovered)
+                        .unwrap(),
+                );
+            }
+            for t in 2..frames {
+                for k in 0..coded {
+                    assert!(
+                        (recovered[t][k] - spectra[t - 1][k]).abs() <= 2e-4,
+                        "lm={lm} frame {} (kind {}) bin {k}: {} vs {}",
+                        t - 1,
+                        kinds[t - 1],
                         recovered[t][k],
                         spectra[t - 1][k]
                     );

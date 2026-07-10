@@ -33,22 +33,26 @@
 //! input, so a caller chains [`crate::post_filter`] then
 //! [`crate::deemphasis`] onto this output to finish the §4.3.7 chain.
 //!
-//! ## Why long-MDCT only
+//! ## Transient (short-block) frames
 //!
 //! When the transient flag is set, the frame's spectrum represents
 //! several short MDCTs (§4.3.1), each transformed and overlap-added
-//! separately. The precise within-frame layout that maps the band-loop
-//! output to the per-short-block frequency vectors — and the
-//! inter-short-block overlap-add scheme — is delegated to the reference
-//! implementation by §4.3.1 ("defined in ... celt.c") and §4.3.7
-//! ("performed by mdct_backward (mdct.c)"); the RFC narrative does not
-//! pin it. This spine therefore handles only the unambiguous
-//! single-long-MDCT case (`nb_blocks == 1`), where the residual spectrum
-//! maps one-to-one onto the §4.3.7 inverse-MDCT input with no
-//! interleaving. The transient short-block reassembly remains a
-//! documented docs gap, the same boundary
-//! [`crate::residual::decode_residual_bands`] keeps for the
-//! per-short-block geometry.
+//! separately. [`LongMdctSynthesis::synthesize_frame`] handles both
+//! cases over one shared cross-frame overlap tail: the long path runs
+//! [`MdctSynthesis::frame`](crate::mdct::MdctSynthesis::frame) with the
+//! low-overlap window, the transient path runs
+//! [`MdctSynthesis::frame_short`](crate::mdct::MdctSynthesis::frame_short)
+//! with `2^lm` short blocks and the full-overlap 240-sample basic
+//! window. The short-block placement inside the frame is not a free
+//! choice — it is derived from the \[PRINCEN86\] cancellation
+//! requirement against the long window at frame boundaries (see
+//! [`short_block_geometry`](crate::mdct::short_block_geometry)), so
+//! long and transient frames interleave freely in one stream. The
+//! within-band block interleave of the residual spectrum
+//! (`samples[nb_blocks * f + s]`) is the same convention the §4.3.4.3
+//! spreading and §4.3.4.5 Hadamard stages use, and because every
+//! Table 55 band edge at shift `lm` is a multiple of `2^lm`, the
+//! per-band interleave and the whole-spectrum interleave coincide.
 //!
 //! ## Clean-room provenance
 //!
@@ -139,6 +143,10 @@ pub struct LongMdctSynthesis {
     /// The `2 * mdct_size(lm)`-sample §4.3.7 synthesis window
     /// (fixed-overlap 120).
     window: Vec<f32>,
+    /// The `2 * CELT_OVERLAP`-sample full-overlap basic window the
+    /// §4.3.1 transient short blocks use (every short block is
+    /// [`CELT_OVERLAP`] = 120 bins in the canonical geometry).
+    short_window: Vec<f32>,
     synth: MdctSynthesis,
 }
 
@@ -151,9 +159,11 @@ impl LongMdctSynthesis {
     pub fn new(lm: u32) -> Option<Self> {
         let n = mdct_size(lm)?;
         let window = build_low_overlap_window_f32(n, CELT_OVERLAP)?;
+        let short_window = build_low_overlap_window_f32(CELT_OVERLAP, CELT_OVERLAP)?;
         Some(Self {
             lm,
             window,
+            short_window,
             synth: MdctSynthesis::new(n),
         })
     }
@@ -198,12 +208,42 @@ impl LongMdctSynthesis {
         start: usize,
         end: usize,
     ) -> Result<Vec<f32>, Error> {
+        self.synthesize_frame(residual, start, end, false)
+    }
+
+    /// Synthesize one frame, long or transient (§4.3.1): place the
+    /// coded-window residual spectrum into the full MDCT spectrum, then
+    /// run either the single long inverse MDCT (`transient = false`) or
+    /// the `2^lm` interleaved short inverse MDCTs
+    /// ([`MdctSynthesis::frame_short`](crate::mdct::MdctSynthesis::frame_short),
+    /// `transient = true`) over the **shared** cross-frame overlap
+    /// tail, and return the `mdct_size(lm)` finished time-domain
+    /// samples. Long and transient frames may alternate freely on one
+    /// state; the short-block placement guarantees the boundary
+    /// overlap-add cancels across every transition (see the module
+    /// docs).
+    ///
+    /// Parameters and errors match [`synthesize`](Self::synthesize).
+    pub fn synthesize_frame(
+        &mut self,
+        residual: &[f32],
+        start: usize,
+        end: usize,
+        transient: bool,
+    ) -> Result<Vec<f32>, Error> {
         let spectrum = place_residual_spectrum(residual, self.lm, start, end)?;
         let n = self.synth.frame_size();
         let mut out = vec![0.0f32; n];
         // The window/spectrum lengths are guaranteed consistent (both
-        // derive from `self.lm`), so `frame` cannot reject them.
-        if !self.synth.frame(&spectrum, &self.window, &mut out) {
+        // derive from `self.lm`), so the frame calls cannot reject them.
+        let ok = if transient {
+            let nb_blocks = 1usize << self.lm;
+            self.synth
+                .frame_short(&spectrum, &self.short_window, nb_blocks, &mut out)
+        } else {
+            self.synth.frame(&spectrum, &self.window, &mut out)
+        };
+        if !ok {
             return Err(Error::InvalidParameter);
         }
         Ok(out)
@@ -329,6 +369,24 @@ impl StereoLongMdctSynthesis {
         start: usize,
         end: usize,
     ) -> Result<Vec<f32>, Error> {
+        self.synthesize_frame(left_residual, right_residual, start, end, false)
+    }
+
+    /// Synthesize one stereo frame, long or transient — the two-channel
+    /// counterpart of
+    /// [`LongMdctSynthesis::synthesize_frame`]. Both channels run the
+    /// same block kind (the transient flag is a per-frame Table 56
+    /// scalar shared by the channels).
+    ///
+    /// Parameters and errors match [`synthesize`](Self::synthesize).
+    pub fn synthesize_frame(
+        &mut self,
+        left_residual: &[f32],
+        right_residual: &[f32],
+        start: usize,
+        end: usize,
+        transient: bool,
+    ) -> Result<Vec<f32>, Error> {
         // Validate both channels' placements BEFORE mutating either
         // overlap tail, so a length mismatch on the second channel does
         // not leave the first channel's state advanced.
@@ -336,8 +394,12 @@ impl StereoLongMdctSynthesis {
         let _ = place_residual_spectrum(left_residual, lm, start, end)?;
         let _ = place_residual_spectrum(right_residual, lm, start, end)?;
 
-        let l = self.left.synthesize(left_residual, start, end)?;
-        let r = self.right.synthesize(right_residual, start, end)?;
+        let l = self
+            .left
+            .synthesize_frame(left_residual, start, end, transient)?;
+        let r = self
+            .right
+            .synthesize_frame(right_residual, start, end, transient)?;
 
         let n = l.len();
         let mut out = vec![0.0f32; 2 * n];
@@ -667,6 +729,32 @@ mod tests {
         let fresh_first = fresh.synthesize(&rl, &rr, 0, 21).unwrap();
         for (a, b) in after_bad.iter().zip(&fresh_first) {
             assert!((a - b).abs() <= 1e-7);
+        }
+    }
+
+    /// A transient stereo frame equals two independent mono transient
+    /// spines, and long/transient frames may alternate on one stereo
+    /// state.
+    #[test]
+    fn stereo_transient_matches_mono_spines() {
+        let lm = 2;
+        let n = mdct_size(lm).unwrap();
+        let coded = coded_total_bins(0, 21, lm).unwrap() as usize;
+        let rl: Vec<f32> = (0..coded).map(|i| ((i % 7) as f32) - 3.0).collect();
+        let rr: Vec<f32> = (0..coded).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut stereo = StereoLongMdctSynthesis::new(lm).unwrap();
+        let mut ml = LongMdctSynthesis::new(lm).unwrap();
+        let mut mr = LongMdctSynthesis::new(lm).unwrap();
+        // Alternate long → transient → long on the same states.
+        for &transient in &[false, true, false] {
+            let out = stereo.synthesize_frame(&rl, &rr, 0, 21, transient).unwrap();
+            let l = ml.synthesize_frame(&rl, 0, 21, transient).unwrap();
+            let r = mr.synthesize_frame(&rr, 0, 21, transient).unwrap();
+            for i in 0..n {
+                assert!((out[2 * i] - l[i]).abs() <= 1e-7, "left[{i}]");
+                assert!((out[2 * i + 1] - r[i]).abs() <= 1e-7, "right[{i}]");
+            }
         }
     }
 
