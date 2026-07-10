@@ -6,6 +6,45 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**§4.3.3 reallocation walk + wire-interop energy convention, r408.**
+The full bit-allocation walk of RFC 6716 §4.3.3 is implemented per the
+staged clean-room behavioral chapter
+(`docs/audio/celt/spec/celt-reallocation-walk.md`): the outer bisection
+over the 11 Table-57 quality codepoints, the 1/64-step interpolation on
+the cap-clamped bracketing vectors, the concurrent top-down **skip
+decoding** (one `{1,1}/2` symbol per viable candidate, silent folds
+below the §2.6 minimum, the lowest band never skipped), the intensity /
+dual-stereo placement over the post-skip window, the cap-bounded final
+reallocation, the fine-energy vs. shape split, the priority-0/1 stamp,
+and the balance. The Table-56 `skip`/`intensity`/`dual` symbols moved
+out of the frame prefix into the walk (the prefix ends at `alloc.
+trim`), the dynalloc/trim/reservation budget threading follows the §2
+narrative exactly, and every frame driver (mono + stereo, explicit +
+auto) runs the walk on the live range coder. The wire also carries the
+interop **absolute energy convention**: coarse targets are coded
+mean-removed against the staged `eMeans` table in 6 dB base-2
+log-amplitude steps on the reference spectral scale (calibrated
+black-box: the per-band offset between reference-encoder streams and
+this crate's analyzer is flat at `14.0 ± 0.2` log2 across all bands and
+the 5/10/20 ms sizes).
+
+**Black-box reference validation (r408).** Two runtime-gated harnesses
+measure interop against reference binaries run as opaque processes:
+`tests/blackbox_opusdec.rs` muxes this crate's frames into Ogg-Opus and
+decodes them with `opusdec` — the output **level** now lands within
+±1.4 dB of the encoder input at LM 1–3 (it was 40–100 dB off before the
+convention landed; asserted at ±6 dB), while the shape **SNR** still
+measures ≈ −3 dB: the per-band pulse counts diverge from the reference
+allocator's, which is exactly the behavioral chapter's §10 residual gap
+(the bit-exact fine-split constants, skip predicate composition, and
+priority predicate are pinned only by reference bit-exactness and need
+a captured single-frame allocation trace to close). The LM 0 level
+shows a further band-dependent offset the flat bridge does not model
+(open item). `tests/fixture_survey.rs` walks real reference streams
+through the prefix + walk: 51/51 frames of the staged mono fixture walk
+cleanly, with the 440 Hz fixture's energy decoding into band 2 and
+consistent inter-frame prediction.
+
 **Transient (short-block) frames + anti-collapse + finalize, r406.**
 The §4.3 walk now runs past the fine-energy boundary on **both** frame
 kinds: transient frames decode and encode end to end (the §4.3.1
