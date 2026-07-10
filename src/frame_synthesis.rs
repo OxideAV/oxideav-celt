@@ -741,6 +741,12 @@ impl StereoCeltDecodeState {
     /// synthesis stage; the prefix decode may have advanced the coarse
     /// prediction before a later validation failed, so callers that need
     /// strict atomicity should validate the residual lengths first.
+    ///
+    /// Unlike the full-bitstream drivers, this input-boundary variant
+    /// keeps **coarse-only** §4.3.2.1 inter-frame prediction: its fine
+    /// corrections are caller-supplied (not wire symbols), so the
+    /// §4.3.2.1 final-fine feedback fold the wire paths perform (r406)
+    /// has no wire-lockstep counterpart here.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_stereo_frame(
         &mut self,
