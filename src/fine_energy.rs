@@ -379,6 +379,231 @@ pub fn finalize_extra_bits(
     result
 }
 
+/// Outcome of one depth-aware finalize pass
+/// ([`finalize_extra_bits_depth`] / [`encode_finalize_extra_bits_depth`]).
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizeDepthResult {
+    /// Per-channel per-band Q14 corrections (absolute band axis; bands
+    /// that received no extra bit carry zero). Channel 1 is all-zero
+    /// for mono passes.
+    pub corrections_q14: [[i32; NUM_BANDS]; 2],
+    /// Raw bits consumed (≤ the supplied budget).
+    pub bits_consumed: u32,
+    /// Budget left unused ("If any bits are left after this, they are
+    /// left unused").
+    pub bits_unused: u32,
+}
+
+/// The Q14 correction contributed by one §4.3.2.2 **finalize** bit on a
+/// band that already carries `b_bits` fine bits: the extra bit refines
+/// the band's quantizer one level deeper, i.e. it is the second-level
+/// term of the §4.3.2.2 map at depth `b_bits + 1`:
+///
+/// ```text
+/// correction = (f - 1/2) / 2^(b_bits + 1)  =  ±2^-(b_bits + 2)
+/// ```
+///
+/// In Q14 that is `±(4096 >> b_bits)`. For `b_bits = 0` this equals
+/// [`fine_correction_q14`]`(f, 1)` (the `B = 1` first-level cell), so
+/// the depth-aware form reduces to the flat form exactly where the two
+/// readings coincide.
+#[inline]
+pub fn finalize_correction_q14(f: u32, b_bits: u32) -> i32 {
+    let magnitude = 4096i32 >> b_bits.min(MAX_FINE_BITS);
+    if f != 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+/// Decode the §4.3.2.2 finalize step with **depth-aware** corrections
+/// and per-channel accounting — the form the r406 frame drivers
+/// consume ([`finalize_extra_bits`] keeps the earlier flat-magnitude,
+/// summed-channel contract).
+///
+/// Walks priorities 0 then 1 in ascending band order over the coded
+/// window `[start, end)` (`priorities` is window-relative), spending
+/// at most one extra raw bit per band **per channel** (channel 0 then
+/// channel 1 within a band — the in-crate channel interleave every
+/// other per-band-per-channel field uses). Each consumed bit
+/// contributes [`finalize_correction_q14`]`(f, fine_bits[band])` to
+/// that channel's band correction.
+///
+/// Returns the per-channel corrections on the absolute band axis plus
+/// the bit accounting. Panics (debug) on inconsistent window/priority
+/// lengths; release builds saturate by walking the shorter of the two.
+pub fn finalize_extra_bits_depth(
+    dec: &mut RangeDecoder<'_>,
+    priorities: &[FinalizePriority],
+    fine_bits: &[u32; NUM_BANDS],
+    start: usize,
+    end: usize,
+    channels: u32,
+    budget: u32,
+) -> FinalizeDepthResult {
+    finalize_depth_impl(
+        priorities,
+        fine_bits,
+        start,
+        end,
+        channels,
+        budget,
+        &mut |_band, _ch| dec.dec_bits(1),
+    )
+}
+
+/// Encode the §4.3.2.2 finalize step — the exact inverse of
+/// [`finalize_extra_bits_depth`]. The extra bit for `(band, channel)`
+/// is chosen from the sign of that channel's remaining log-energy
+/// residual (`residual_f32[ch][band]`, the analysis target minus the
+/// coarse+fine reconstruction): `f = 1` when the reconstruction is
+/// still below the target, `f = 0` otherwise — the choice that always
+/// shrinks the cell error at depth `fine_bits[band] + 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_finalize_extra_bits_depth(
+    enc: &mut RangeEncoder,
+    priorities: &[FinalizePriority],
+    fine_bits: &[u32; NUM_BANDS],
+    start: usize,
+    end: usize,
+    channels: u32,
+    budget: u32,
+    residual_f32: &[[f32; NUM_BANDS]; 2],
+) -> Result<FinalizeDepthResult, Error> {
+    let mut err: Option<Error> = None;
+    let result = finalize_depth_impl(
+        priorities,
+        fine_bits,
+        start,
+        end,
+        channels,
+        budget,
+        &mut |band, ch| {
+            let f = u32::from(residual_f32[ch][band] > 0.0);
+            if let Err(e) = enc.enc_bits(f, 1) {
+                err = Some(e);
+            }
+            f
+        },
+    );
+    match err {
+        Some(e) => Err(e),
+        None => Ok(result),
+    }
+}
+
+/// Shared walk for the depth-aware finalize pair: the bit source is a
+/// closure so the decode (raw-bit read) and encode (sign choice +
+/// raw-bit write) directions share the priority/band/channel order and
+/// the budget accounting exactly.
+fn finalize_depth_impl(
+    priorities: &[FinalizePriority],
+    fine_bits: &[u32; NUM_BANDS],
+    start: usize,
+    end: usize,
+    channels: u32,
+    budget: u32,
+    bit: &mut dyn FnMut(usize, usize) -> u32,
+) -> FinalizeDepthResult {
+    debug_assert!(start <= end && end <= NUM_BANDS);
+    debug_assert_eq!(priorities.len(), end.saturating_sub(start));
+    debug_assert!(channels == 1 || channels == 2);
+    let coded = priorities.len().min(end.saturating_sub(start));
+    let channels = channels.clamp(1, 2) as usize;
+
+    let mut result = FinalizeDepthResult {
+        corrections_q14: [[0i32; NUM_BANDS]; 2],
+        bits_consumed: 0,
+        bits_unused: 0,
+    };
+    let mut remaining = budget;
+    'outer: for prio in [FinalizePriority::Zero, FinalizePriority::One] {
+        for (i, &p) in priorities.iter().enumerate().take(coded) {
+            if p != prio {
+                continue;
+            }
+            let band = start + i;
+            for ch in 0..channels {
+                if remaining == 0 {
+                    break 'outer;
+                }
+                let f = bit(band, ch);
+                result.corrections_q14[ch][band] = result.corrections_q14[ch][band]
+                    .saturating_add(finalize_correction_q14(f, fine_bits[band]));
+                result.bits_consumed += 1;
+                remaining -= 1;
+            }
+        }
+    }
+    result.bits_unused = remaining;
+    result
+}
+
+/// Derive the §4.3.2.2 finalize priorities from the per-band shape
+/// allocation — the in-crate reading of "The allocation process
+/// determines two 'priorities' for the final fine bits" (RFC 6716
+/// §4.3.2.2 states the two-priority walk but defers the assignment
+/// rule to the allocation): a band that received shape pulses
+/// (`K > 0`) is priority 0 — its envelope precision is audible in the
+/// rendered band — while a skipped band (`K = 0`, which renders as
+/// silence unless the §4.3.5 anti-collapse injection fills it from the
+/// envelope) is priority 1. Both codec sides derive the identical
+/// vector from the shared `band_k`, so the walk stays in lockstep.
+pub fn finalize_priorities_from_k(band_k: &[u32]) -> Vec<FinalizePriority> {
+    band_k
+        .iter()
+        .map(|&k| {
+            if k > 0 {
+                FinalizePriority::Zero
+            } else {
+                FinalizePriority::One
+            }
+        })
+        .collect()
+}
+
+/// Apply a finalize (or any post-denormalization) per-band log-energy
+/// correction to an already-denormalized coded-window residual, in
+/// place: band `b`'s samples are scaled by `2^(c/2)` where
+/// `c = corrections_q14[b] / 16384` log-2 steps — algebraically
+/// identical to having denormalized against the corrected envelope.
+///
+/// `samples` is the band-contiguous coded-window layout
+/// ([`ResidualSpectrum::samples`](crate::residual::ResidualSpectrum::samples));
+/// `corrections_q14` is on the absolute band axis. Returns `false`
+/// (samples untouched) when the geometry disagrees.
+pub fn apply_finalize_scale_f32(
+    samples: &mut [f32],
+    lm: u32,
+    start: usize,
+    end: usize,
+    corrections_q14: &[i32; NUM_BANDS],
+) -> bool {
+    if lm > 3 || start > end || end > NUM_BANDS {
+        return false;
+    }
+    match crate::band_layout::coded_total_bins(start, end, lm) {
+        Some(total) if total as usize == samples.len() => {}
+        _ => return false,
+    }
+    let mut offset = 0usize;
+    for (band, &c) in corrections_q14.iter().enumerate().take(end).skip(start) {
+        let Some(n) = crate::band_layout::band_bins(band, lm) else {
+            return false;
+        };
+        let n = n as usize;
+        if c != 0 {
+            let factor = (0.5 * c as f32 / 16384.0).exp2();
+            for x in &mut samples[offset..offset + n] {
+                *x *= factor;
+            }
+        }
+        offset += n;
+    }
+    true
+}
+
 // ---------------------------------------------------------------------
 // Encode direction (RFC 6716 §4.3.2.2, the inverse of the decode above).
 // ---------------------------------------------------------------------
@@ -1037,5 +1262,112 @@ mod tests {
             );
         }
         assert!(!dec.has_error());
+    }
+
+    /// The depth-aware finalize correction halves with each existing
+    /// fine bit and reduces to the flat `B = 1` cell at depth zero.
+    #[test]
+    fn finalize_correction_is_depth_aware() {
+        assert_eq!(finalize_correction_q14(1, 0), fine_correction_q14(1, 1));
+        assert_eq!(finalize_correction_q14(0, 0), fine_correction_q14(0, 1));
+        for b in 0..=MAX_FINE_BITS {
+            assert_eq!(finalize_correction_q14(1, b), 4096 >> b);
+            assert_eq!(finalize_correction_q14(0, b), -(4096 >> b));
+        }
+    }
+
+    /// Encode → decode round trip of the depth-aware finalize pass:
+    /// identical corrections, priority-0 bands served first, budget
+    /// accounting exact, sign follows the encoder's residuals.
+    #[test]
+    fn finalize_depth_round_trips() {
+        let (start, end) = (0usize, NUM_BANDS);
+        let mut fine_bits = [0u32; NUM_BANDS];
+        for (b, slot) in fine_bits.iter_mut().enumerate() {
+            *slot = (b as u32) % 4;
+        }
+        // Alternate priorities; budget covers priority 0 fully and
+        // priority 1 only partially.
+        let priorities: Vec<FinalizePriority> = (0..NUM_BANDS)
+            .map(|b| {
+                if b % 2 == 0 {
+                    FinalizePriority::Zero
+                } else {
+                    FinalizePriority::One
+                }
+            })
+            .collect();
+        let mut residual = [[0.0f32; NUM_BANDS]; 2];
+        for (b, r) in residual[0].iter_mut().enumerate() {
+            *r = if b % 3 == 0 { 0.2 } else { -0.2 };
+        }
+        for (b, r) in residual[1].iter_mut().enumerate() {
+            *r = if b % 5 == 0 { -0.1 } else { 0.1 };
+        }
+        let budget = 30u32; // 21 priority-0-ish slots at 2 channels…
+
+        let mut enc = RangeEncoder::new();
+        let encoded = encode_finalize_extra_bits_depth(
+            &mut enc,
+            &priorities,
+            &fine_bits,
+            start,
+            end,
+            2,
+            budget,
+            &residual,
+        )
+        .unwrap();
+        assert_eq!(encoded.bits_consumed + encoded.bits_unused, budget);
+        assert_eq!(encoded.bits_consumed, 30);
+        let frame = enc.finish();
+
+        let mut dec = RangeDecoder::new(&frame);
+        let decoded =
+            finalize_extra_bits_depth(&mut dec, &priorities, &fine_bits, start, end, 2, budget);
+        assert_eq!(decoded.bits_consumed, encoded.bits_consumed);
+        assert_eq!(decoded.bits_unused, encoded.bits_unused);
+        for ch in 0..2 {
+            for b in 0..NUM_BANDS {
+                assert_eq!(
+                    decoded.corrections_q14[ch][b], encoded.corrections_q14[ch][b],
+                    "ch {ch} band {b}"
+                );
+            }
+        }
+        // Every priority-0 band received both channels' bits; the
+        // correction sign tracks the residual sign at that band's
+        // depth-aware magnitude.
+        for b in (0..NUM_BANDS).step_by(2) {
+            for (ch, res) in residual.iter().enumerate() {
+                let expect = finalize_correction_q14(u32::from(res[b] > 0.0), fine_bits[b]);
+                assert_eq!(decoded.corrections_q14[ch][b], expect, "ch {ch} band {b}");
+            }
+        }
+        // 30 bits = 22 priority-0 slots (11 bands × 2ch) + 8 priority-1
+        // slots: the first 4 odd bands got both channels, the rest none.
+        let odd_served: Vec<usize> = (0..NUM_BANDS)
+            .filter(|b| b % 2 == 1 && decoded.corrections_q14[0][*b] != 0)
+            .collect();
+        assert_eq!(odd_served, vec![1, 3, 5, 7]);
+    }
+
+    /// A zero budget consumes nothing; an over-budget pass leaves the
+    /// surplus unused.
+    #[test]
+    fn finalize_depth_budget_edges() {
+        let priorities = vec![FinalizePriority::Zero; NUM_BANDS];
+        let fine_bits = [0u32; NUM_BANDS];
+        let buf = [0xA5u8; 16];
+
+        let mut dec = RangeDecoder::new(&buf);
+        let r = finalize_extra_bits_depth(&mut dec, &priorities, &fine_bits, 0, NUM_BANDS, 1, 0);
+        assert_eq!(r.bits_consumed, 0);
+        assert_eq!(r.bits_unused, 0);
+
+        let mut dec = RangeDecoder::new(&buf);
+        let r = finalize_extra_bits_depth(&mut dec, &priorities, &fine_bits, 0, NUM_BANDS, 1, 100);
+        assert_eq!(r.bits_consumed, NUM_BANDS as u32);
+        assert_eq!(r.bits_unused, 100 - NUM_BANDS as u32);
     }
 }

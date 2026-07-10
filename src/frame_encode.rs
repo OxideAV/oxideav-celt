@@ -681,6 +681,51 @@ fn encode_celt_frame_impl(
         prefix.header.anti_collapse_on = Some(anti_collapse_on);
     }
 
+    // §4.3.2.2 finalize: spend the leftover raw bits, one extra
+    // fine-energy bit per band in priority order (funded bands first —
+    // the in-crate priority rule both sides derive from `band_k`),
+    // each bit chosen from the remaining envelope residual. Mirrors
+    // the decoder's walk exactly; skipped on silence frames.
+    let mut envelope_q8 = envelope_q8;
+    if !header.silence {
+        let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+        let leftover = (frame_bytes * 8).saturating_sub(enc.tell());
+        let mut residual_f32 = [[0.0f32; NUM_BANDS]; 2];
+        for band in start..end {
+            residual_f32[0][band] = energy_target[0][band]
+                - (coarse_state.energy[0][band] + fine_q14[band] as f32 / 16384.0);
+        }
+        let fin = crate::fine_energy::encode_finalize_extra_bits_depth(
+            &mut enc,
+            &priorities,
+            fine_bits,
+            start,
+            end,
+            1,
+            leftover,
+            &residual_f32,
+        )?;
+        // Fold the finalize corrections into the returned envelope and
+        // the bit-exact reconstruction (scale = the corrected §4.3.6
+        // denormalization).
+        envelope_q8 = assemble_band_log_energy_q8(
+            coarse_state,
+            0,
+            Some(&fine_q14),
+            Some(&fin.corrections_q14[0]),
+        )
+        .ok_or(Error::InvalidParameter)?;
+        if !crate::fine_energy::apply_finalize_scale_f32(
+            &mut reconstructed,
+            lm,
+            start,
+            end,
+            &fin.corrections_q14[0],
+        ) {
+            return Err(Error::InvalidParameter);
+        }
+    }
+
     // §5.1.5 fixed-size assembly: range symbols from the front, raw
     // bits at the frame end, matching the decoder's storage_bits().
     let bytes = enc.finish_to_size(frame_bytes as usize)?;
@@ -1050,6 +1095,54 @@ fn encode_stereo_celt_frame_impl(
     if header.transient && !header.silence && prefix.reservations.anti_collapse_rsv != 0 {
         encode_anti_collapse_flag(&mut enc, true, anti_collapse_on)?;
         prefix.header.anti_collapse_on = Some(anti_collapse_on);
+    }
+
+    // §4.3.2.2 finalize (see the mono engine): leftover raw bits, one
+    // extra fine-energy bit per band per channel, mirroring the
+    // decoder's walk; skipped on silence frames.
+    let (mut env_l, mut env_r) = (env_l, env_r);
+    if !header.silence {
+        let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+        let leftover = (frame_bytes * 8).saturating_sub(enc.tell());
+        let mut residual_f32 = [[0.0f32; NUM_BANDS]; 2];
+        for band in start..end {
+            for (ch, res) in residual_f32.iter_mut().enumerate() {
+                res[band] = energy_target[ch][band]
+                    - (coarse_state.energy[ch][band] + fine_q14[ch][band] as f32 / 16384.0);
+            }
+        }
+        let fin = crate::fine_energy::encode_finalize_extra_bits_depth(
+            &mut enc,
+            &priorities,
+            fine_bits,
+            start,
+            end,
+            2,
+            leftover,
+            &residual_f32,
+        )?;
+        env_l = assemble_band_log_energy_q8(
+            coarse_state,
+            0,
+            Some(&fine_q14[0]),
+            Some(&fin.corrections_q14[0]),
+        )
+        .ok_or(Error::InvalidParameter)?;
+        env_r = assemble_band_log_energy_q8(
+            coarse_state,
+            1,
+            Some(&fine_q14[1]),
+            Some(&fin.corrections_q14[1]),
+        )
+        .ok_or(Error::InvalidParameter)?;
+        for (rec, corr) in [
+            (&mut rec_l, &fin.corrections_q14[0]),
+            (&mut rec_r, &fin.corrections_q14[1]),
+        ] {
+            if !crate::fine_energy::apply_finalize_scale_f32(rec, lm, start, end, corr) {
+                return Err(Error::InvalidParameter);
+            }
+        }
     }
 
     let bytes = enc.finish_to_size(frame_bytes as usize)?;

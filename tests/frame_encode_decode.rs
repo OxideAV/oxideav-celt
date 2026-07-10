@@ -105,10 +105,9 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     let fine_q14 = decode_fine_energy(&mut dec, &fine_bits);
     let env_q8 =
         oxideav_celt::assemble_band_log_energy_q8(&dec_state, 0, Some(&fine_q14), None).unwrap();
-    assert_eq!(env_q8, encoded.envelope_q8, "envelope diverged");
 
     let window_energy: Vec<i32> = env_q8[start..end].to_vec();
-    let residual = decode_residual_bands(
+    let mut residual = decode_residual_bands(
         &mut dec,
         lm,
         start,
@@ -122,6 +121,35 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     )
     .unwrap();
     assert!(!dec.has_error());
+
+    // §4.3.2.2 finalize (r406): the leftover raw bits refine the
+    // envelope; the manual walk mirrors the driver.
+    let priorities = oxideav_celt::finalize_priorities_from_k(&band_k);
+    let leftover = dec.storage_bits().saturating_sub(dec.tell());
+    let fin = oxideav_celt::finalize_extra_bits_depth(
+        &mut dec,
+        &priorities,
+        &fine_bits,
+        start,
+        end,
+        1,
+        leftover,
+    );
+    let env_final = oxideav_celt::assemble_band_log_energy_q8(
+        &dec_state,
+        0,
+        Some(&fine_q14),
+        Some(&fin.corrections_q14[0]),
+    )
+    .unwrap();
+    assert_eq!(env_final, encoded.envelope_q8, "envelope diverged");
+    assert!(oxideav_celt::apply_finalize_scale_f32(
+        &mut residual.samples,
+        lm,
+        start,
+        end,
+        &fin.corrections_q14[0],
+    ));
     assert_eq!(
         residual.samples, encoded.reconstructed_spectrum,
         "decoded residual spectrum != encoder reconstruction"
@@ -392,9 +420,8 @@ fn auto_encode_auto_decode_self_contained_loop() {
     let fine_q14 = decode_fine_energy(&mut dec, &alloc.fine_bits);
     let env_q8 =
         oxideav_celt::assemble_band_log_energy_q8(&dec_state, 0, Some(&fine_q14), None).unwrap();
-    assert_eq!(env_q8, encoded.envelope_q8);
     let window_energy: Vec<i32> = env_q8[start..end].to_vec();
-    let residual = decode_residual_bands(
+    let mut residual = decode_residual_bands(
         &mut dec,
         lm,
         start,
@@ -407,6 +434,33 @@ fn auto_encode_auto_decode_self_contained_loop() {
         &window_energy,
     )
     .unwrap();
+    // The finalize step (r406): mirror the driver's leftover-bit walk.
+    let priorities = oxideav_celt::finalize_priorities_from_k(&band_k);
+    let leftover = dec.storage_bits().saturating_sub(dec.tell());
+    let fin = oxideav_celt::finalize_extra_bits_depth(
+        &mut dec,
+        &priorities,
+        &alloc.fine_bits,
+        start,
+        end,
+        1,
+        leftover,
+    );
+    let env_final = oxideav_celt::assemble_band_log_energy_q8(
+        &dec_state,
+        0,
+        Some(&fine_q14),
+        Some(&fin.corrections_q14[0]),
+    )
+    .unwrap();
+    assert_eq!(env_final, encoded.envelope_q8);
+    assert!(oxideav_celt::apply_finalize_scale_f32(
+        &mut residual.samples,
+        lm,
+        start,
+        end,
+        &fin.corrections_q14[0],
+    ));
     assert_eq!(
         residual.samples, encoded.reconstructed_spectrum,
         "auto loop residual != encoder reconstruction"

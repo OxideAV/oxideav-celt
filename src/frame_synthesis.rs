@@ -443,12 +443,53 @@ pub fn decode_celt_frame(
         }
     }
 
+    // §4.3.2.2 finalize: the raw bits left after every other symbol are
+    // spent one extra fine-energy bit per band (per channel) in
+    // priority order — priorities derived in-crate from the shape
+    // allocation (funded bands first; see
+    // [`finalize_priorities_from_k`](crate::fine_energy::finalize_priorities_from_k)).
+    // Skipped on silence frames (the in-crate silence wire stops after
+    // the fine-energy section).
+    let mut env_final_q8 = env_q8;
+    if !prefix.header.silence {
+        let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+        let leftover = dec.storage_bits().saturating_sub(dec.tell());
+        let fin = crate::fine_energy::finalize_extra_bits_depth(
+            &mut dec,
+            &priorities,
+            fine_bits,
+            start,
+            end,
+            1,
+            leftover,
+        );
+        // The residual was denormalized against the pre-finalize
+        // envelope; scaling by 2^(c/2) per band is algebraically the
+        // corrected denormalization.
+        if !crate::fine_energy::apply_finalize_scale_f32(
+            &mut residual.samples,
+            lm,
+            start,
+            end,
+            &fin.corrections_q14[0],
+        ) {
+            return Err(Error::InvalidParameter);
+        }
+        env_final_q8 = assemble_band_log_energy_q8(
+            &state.coarse,
+            0,
+            Some(&fine_q14),
+            Some(&fin.corrections_q14[0]),
+        )
+        .ok_or(Error::InvalidParameter)?;
+    }
+
     // Shift this frame's final envelope into the two-frame §4.3.5
     // energy history for the following frames.
     push_energy_history(
         &mut state.energy_prev1,
         &mut state.energy_prev2,
-        &env_q8,
+        &env_final_q8,
         start,
         end,
     );
@@ -908,8 +949,49 @@ impl StereoCeltDecodeState {
             }
         }
 
+        // §4.3.2.2 finalize: leftover raw bits, one extra fine-energy
+        // bit per band per channel in priority order (channel 0 then 1
+        // within a band — the same in-crate interleave the main fine
+        // pass uses). Skipped on silence frames.
+        let (mut env_l_final, mut env_r_final) = (env_l, env_r);
+        if !prefix.header.silence {
+            let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
+            let leftover = dec.storage_bits().saturating_sub(dec.tell());
+            let fin = crate::fine_energy::finalize_extra_bits_depth(
+                &mut dec,
+                &priorities,
+                fine_bits,
+                start,
+                end,
+                2,
+                leftover,
+            );
+            for (samples, corr) in [
+                (&mut left, &fin.corrections_q14[0]),
+                (&mut right, &fin.corrections_q14[1]),
+            ] {
+                if !crate::fine_energy::apply_finalize_scale_f32(samples, lm, start, end, corr) {
+                    return Err(Error::InvalidParameter);
+                }
+            }
+            env_l_final = assemble_band_log_energy_q8(
+                &self.coarse,
+                0,
+                Some(&fine_q14[0]),
+                Some(&fin.corrections_q14[0]),
+            )
+            .ok_or(Error::InvalidParameter)?;
+            env_r_final = assemble_band_log_energy_q8(
+                &self.coarse,
+                1,
+                Some(&fine_q14[1]),
+                Some(&fin.corrections_q14[1]),
+            )
+            .ok_or(Error::InvalidParameter)?;
+        }
+
         // Shift the per-channel §4.3.5 energy history.
-        for (ch, env) in [env_l, env_r].iter().enumerate() {
+        for (ch, env) in [env_l_final, env_r_final].iter().enumerate() {
             push_energy_history(
                 &mut self.energy_prev1[ch],
                 &mut self.energy_prev2[ch],
@@ -933,7 +1015,7 @@ impl StereoCeltDecodeState {
         Ok(StereoDecodedFrame {
             pcm,
             prefix,
-            envelope_q8: [env_l, env_r],
+            envelope_q8: [env_l_final, env_r_final],
         })
     }
 

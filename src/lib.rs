@@ -399,9 +399,12 @@ pub use encoder_decisions::{
     spectral_tilt_slope, MID_SIDE_DECISION_BANDS, TRIM_TILT_GAIN,
 };
 pub use fine_energy::{
-    decode_fine_energy, decode_fine_energy_band, encode_fine_energy, encode_fine_energy_band,
-    finalize_extra_bits, fine_correction_q14, fine_correction_qn, quantize_fine_energy_band,
-    quantize_fine_energy_f32, FinalizePriority, FinalizeResult, FINE_Q14_ONE, MAX_FINE_BITS,
+    apply_finalize_scale_f32, decode_fine_energy, decode_fine_energy_band,
+    encode_finalize_extra_bits_depth, encode_fine_energy, encode_fine_energy_band,
+    finalize_correction_q14, finalize_extra_bits, finalize_extra_bits_depth,
+    finalize_priorities_from_k, fine_correction_q14, fine_correction_qn, quantize_fine_energy_band,
+    quantize_fine_energy_f32, FinalizeDepthResult, FinalizePriority, FinalizeResult, FINE_Q14_ONE,
+    MAX_FINE_BITS,
 };
 pub use frame_decode::{decode_frame_prefix, FramePrefix};
 pub use frame_encode::{
