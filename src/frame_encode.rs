@@ -60,11 +60,11 @@ use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS
 use crate::denormalization::denormalize_band_in_place_f32;
 use crate::fine_energy::{encode_fine_energy_band, fine_correction_q14, quantize_fine_energy_f32};
 use crate::frame_decode::FramePrefix;
-use crate::frame_header::CeltFrameHeader;
+use crate::frame_header::{encode_anti_collapse_flag, CeltFrameHeader};
 use crate::pvq::{encode_pulses, normalize_to_unit_l2, pvq_search};
 use crate::range_encoder::RangeEncoder;
 use crate::spread::{encode_spread, Spread};
-use crate::tf_change::{encode_tf_parameters, tf_select_matters, TfParameters};
+use crate::tf_change::{encode_tf_parameters, tf_adjustment, tf_select_matters, TfParameters};
 use crate::Error;
 
 /// Per-band MDCT-bin layout for the coded band window (same helper the
@@ -465,9 +465,6 @@ fn encode_celt_frame_impl(
     if lm > 3 || start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
     }
-    if header.transient {
-        return Err(Error::NotImplemented);
-    }
     // A silence frame carries no shape symbols (the residual is the
     // zero spectrum) — meaningful only in auto mode, where the decoder
     // skips its own derivation on the silence flag. A caller-supplied
@@ -475,6 +472,12 @@ fn encode_celt_frame_impl(
     if header.silence && band_k.is_some() {
         return Err(Error::NotImplemented);
     }
+    // §4.3.1 short-block geometry + the fixed §4.3.4.5 TF adjustment
+    // the decoder will apply to every band (the encoder pins
+    // tf_change = 0 / tf_select = 0; on a transient frame that still
+    // maps to a nonzero across-blocks adjustment).
+    let nb_blocks: usize = if header.transient { 1usize << lm } else { 1 };
+    let tf_adj = tf_adjustment(header.transient, 0, lm as u8, false);
     let coded_bands = end - start;
     if let Some(k) = band_k {
         if k.len() != coded_bands {
@@ -565,7 +568,7 @@ fn encode_celt_frame_impl(
             ..BandAllocation::defaults()
         },
     };
-    let prefix = encode_frame_prefix(
+    let mut prefix = encode_frame_prefix(
         &mut enc,
         coarse_state,
         &spec,
@@ -642,13 +645,40 @@ fn encode_celt_frame_impl(
             reconstructed.resize(reconstructed.len() + n as usize, 0.0f32);
             continue;
         }
-        let pulses = pvq_search(&shapes[i], n, k).ok_or(Error::InvalidParameter)?;
+        // The decoder applies the §4.3.4.5 TF transform after the PVQ
+        // decode; the encoder therefore searches against the
+        // inverse-transformed target (§5.3: the encoder is the inverse
+        // of the decoder).
+        let mut target = shapes[i].clone();
+        if tf_adj != 0
+            && !crate::hadamard::apply_tf_resolution_change_inverse(&mut target, tf_adj, nb_blocks)
+        {
+            return Err(Error::NotImplemented);
+        }
+        let pulses = pvq_search(&target, n, k).ok_or(Error::InvalidParameter)?;
         encode_pulses(&mut enc, &pulses, n, k)?;
         // The decoder's exact reconstruction arithmetic: unit-normalize
-        // the integer pulses, then scale by the quantized envelope.
+        // the integer pulses, apply the forward TF transform, then
+        // scale by the quantized envelope.
         let mut band_samples = normalize_to_unit_l2(&pulses);
+        if tf_adj != 0
+            && !crate::hadamard::apply_tf_resolution_change(&mut band_samples, tf_adj, nb_blocks)
+        {
+            return Err(Error::NotImplemented);
+        }
         denormalize_band_in_place_f32(&mut band_samples, envelope_q8[band]);
         reconstructed.extend_from_slice(&band_samples);
+    }
+
+    // §4.3.5 anti-collapse bit at its Table-56 position (after the
+    // band shapes), written only when the §4.3.3 reservation was made
+    // on a non-silent transient frame — the exact condition the
+    // decoder reads it under. The value is the caller's decision
+    // (`header.anti_collapse_on`), defaulting to off.
+    let anti_collapse_on = header.anti_collapse_on.unwrap_or(false);
+    if header.transient && !header.silence && prefix.reservations.anti_collapse_rsv != 0 {
+        encode_anti_collapse_flag(&mut enc, true, anti_collapse_on)?;
+        prefix.header.anti_collapse_on = Some(anti_collapse_on);
     }
 
     // §5.1.5 fixed-size assembly: range symbols from the front, raw
@@ -804,12 +834,13 @@ fn encode_stereo_celt_frame_impl(
     if lm > 3 || start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
     }
-    if header.transient {
-        return Err(Error::NotImplemented);
-    }
     if header.silence && band_k.is_some() {
         return Err(Error::NotImplemented);
     }
+    // §4.3.1 short-block geometry + fixed TF adjustment (see the mono
+    // engine).
+    let nb_blocks: usize = if header.transient { 1usize << lm } else { 1 };
+    let tf_adj = tf_adjustment(header.transient, 0, lm as u8, false);
     let coded_bands = end - start;
     if let Some(k) = band_k {
         if k.len() != coded_bands {
@@ -900,7 +931,7 @@ fn encode_stereo_celt_frame_impl(
             ..BandAllocation::defaults()
         },
     };
-    let prefix = encode_frame_prefix(
+    let mut prefix = encode_frame_prefix(
         &mut enc,
         coarse_state,
         &spec,
@@ -986,13 +1017,39 @@ fn encode_stereo_celt_frame_impl(
             continue;
         }
         for (ch, rec) in [&mut rec_l, &mut rec_r].into_iter().enumerate() {
-            let pulses = pvq_search(&shapes[ch][i], n, k).ok_or(Error::InvalidParameter)?;
+            let mut target = shapes[ch][i].clone();
+            if tf_adj != 0
+                && !crate::hadamard::apply_tf_resolution_change_inverse(
+                    &mut target,
+                    tf_adj,
+                    nb_blocks,
+                )
+            {
+                return Err(Error::NotImplemented);
+            }
+            let pulses = pvq_search(&target, n, k).ok_or(Error::InvalidParameter)?;
             encode_pulses(&mut enc, &pulses, n, k)?;
             let mut band_samples = normalize_to_unit_l2(&pulses);
+            if tf_adj != 0
+                && !crate::hadamard::apply_tf_resolution_change(
+                    &mut band_samples,
+                    tf_adj,
+                    nb_blocks,
+                )
+            {
+                return Err(Error::NotImplemented);
+            }
             let env = if ch == 0 { &env_l } else { &env_r };
             denormalize_band_in_place_f32(&mut band_samples, env[band]);
             rec.extend_from_slice(&band_samples);
         }
+    }
+
+    // §4.3.5 anti-collapse bit (see the mono engine).
+    let anti_collapse_on = header.anti_collapse_on.unwrap_or(false);
+    if header.transient && !header.silence && prefix.reservations.anti_collapse_rsv != 0 {
+        encode_anti_collapse_flag(&mut enc, true, anti_collapse_on)?;
+        prefix.header.anti_collapse_on = Some(anti_collapse_on);
     }
 
     let bytes = enc.finish_to_size(frame_bytes as usize)?;
@@ -1702,24 +1759,24 @@ mod tests {
         };
         let mut state = CoarseEnergyState::new();
 
-        // Transient header.
+        // A transient header encodes (r406 short-block support) — on a
+        // scratch state so the rejection checks below start clean.
         let transient = CeltFrameHeader {
             transient: true,
             ..good
         };
-        assert!(matches!(
-            encode_stereo_celt_frame_auto(
-                &mut state,
-                &spec,
-                &spec,
-                &transient,
-                lm,
-                FRAME_BYTES,
-                0,
-                NUM_BANDS
-            ),
-            Err(Error::NotImplemented)
-        ));
+        let mut scratch = CoarseEnergyState::new();
+        encode_stereo_celt_frame_auto(
+            &mut scratch,
+            &spec,
+            &spec,
+            &transient,
+            lm,
+            FRAME_BYTES,
+            0,
+            NUM_BANDS,
+        )
+        .expect("transient stereo encode");
         // Right spectrum length mismatch.
         assert!(matches!(
             encode_stereo_celt_frame_auto(

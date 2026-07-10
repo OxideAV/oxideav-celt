@@ -167,15 +167,13 @@ fn encode_pcm_impl(
     if pcm.len() != n || start > end || end > NUM_BANDS {
         return Err(Error::InvalidParameter);
     }
-    // The spectrum encoder itself rejects transient headers; reject
-    // them (and a signalled post-filter, whose §5.3.1 pre-filter is
-    // not applied — see the module docs) before the streaming
-    // front-end state is touched. A silence header is allowed in auto
-    // mode only (a caller-supplied allocation contradicts the flag —
-    // the same rule the spectrum encoder applies); the front end still
-    // runs so the analysis history and coarse targets keep tracking
-    // the real (silent) input across the silence run.
-    if header.transient || (header.silence && fine_bits.is_some()) {
+    // A silence header is allowed in auto mode only (a caller-supplied
+    // allocation contradicts the flag — the same rule the spectrum
+    // encoder applies); the front end still runs so the analysis
+    // history and coarse targets keep tracking the real (silent) input
+    // across the silence run. A transient header routes the front end
+    // through the §4.3.1 short-block analysis (r406).
+    if header.silence && fine_bits.is_some() {
         return Err(Error::NotImplemented);
     }
 
@@ -215,8 +213,12 @@ fn encode_pcm_impl(
         );
     }
 
-    // §4.3.7 windowed forward MDCT → coded-window spectrum.
-    let spectrum = match state.analysis.analyze(&emphasized, start, end) {
+    // §4.3.7 windowed forward MDCT → coded-window spectrum (short
+    // blocks on a transient frame).
+    let spectrum = match state
+        .analysis
+        .analyze_frame(&emphasized, start, end, header.transient)
+    {
         Ok(s) => s,
         Err(e) => {
             state.preemph = preemph_snapshot;
@@ -408,11 +410,12 @@ fn encode_stereo_pcm_impl(
         return Err(Error::InvalidParameter);
     }
     // Same driver-level constraints as the mono PCM encoders: no
-    // transients, no silence+explicit-allocation contradiction, and no
-    // signalled post-filter (the stereo front end fuses pre-emphasis
-    // and analysis per channel; the per-channel §5.3.1 pre-filter
-    // insertion is deferred wiring).
-    if header.transient || (header.silence && fine_bits.is_some()) {
+    // silence+explicit-allocation contradiction, and no signalled
+    // post-filter (the stereo front end fuses pre-emphasis and
+    // analysis per channel; the per-channel §5.3.1 pre-filter
+    // insertion is deferred wiring). A transient header routes the
+    // per-channel front end through the §4.3.1 short-block analysis.
+    if header.silence && fine_bits.is_some() {
         return Err(Error::NotImplemented);
     }
     if header.post_filter.is_some() {
@@ -425,7 +428,9 @@ fn encode_stereo_pcm_impl(
 
     // Per-channel §4.3.7.2 pre-emphasis + §4.3.7 forward MDCT (both
     // channels validated up front inside the stereo front end).
-    let (left, right) = state.analysis.analyze(interleaved, start, end)?;
+    let (left, right) = state
+        .analysis
+        .analyze_frame(interleaved, start, end, header.transient)?;
 
     let result = match (fine_bits, band_k) {
         (Some(fb), Some(k)) => encode_stereo_celt_frame(
@@ -668,15 +673,6 @@ mod tests {
         assert!(matches!(
             encode_celt_frame_pcm_auto(&mut state, &pcm[..n - 1], &good, FRAME_BYTES, 0, 21),
             Err(Error::InvalidParameter)
-        ));
-        // Transient header.
-        let transient = CeltFrameHeader {
-            transient: true,
-            ..good
-        };
-        assert!(matches!(
-            encode_celt_frame_pcm_auto(&mut state, &pcm, &transient, FRAME_BYTES, 0, 21),
-            Err(Error::NotImplemented)
         ));
         // Silence header with an explicit allocation contradicts the
         // flag (the auto path accepts silence — see the silence test).

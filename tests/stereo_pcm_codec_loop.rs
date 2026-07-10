@@ -344,15 +344,15 @@ fn stereo_pcm_rejections_and_explicit_variant() {
         21
     )
     .is_err());
-    // Transient header.
+    // A transient header encodes (r406 short-block support) — on a
+    // scratch state so the rejection checks below start clean.
     let transient = CeltFrameHeader {
         transient: true,
         ..good
     };
-    assert!(
-        encode_stereo_celt_frame_pcm_auto(&mut state, &pcm, &transient, frame_bytes, 0, 21)
-            .is_err()
-    );
+    let mut scratch = StereoCeltEncodeState::new(state.lm()).unwrap();
+    encode_stereo_celt_frame_pcm_auto(&mut scratch, &pcm, &transient, frame_bytes, 0, 21)
+        .expect("transient stereo PCM encode");
     // Post-filter signalled.
     let post_filter = CeltFrameHeader {
         post_filter: Some(oxideav_celt::frame_header::PostFilter {

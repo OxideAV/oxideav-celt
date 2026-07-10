@@ -296,12 +296,15 @@ fn encoder_rejects_out_of_scope_frames() {
     let fine_bits = [0u32; NUM_BANDS];
     let mut state = CoarseEnergyState::new();
 
+    // A transient header encodes (r406 short-block support) — on a
+    // scratch state so the rejection checks below start clean.
     let transient = CeltFrameHeader {
         transient: true,
         ..default_header()
     };
-    assert!(encode_celt_frame(
-        &mut state,
+    let mut scratch = CoarseEnergyState::new();
+    encode_celt_frame(
+        &mut scratch,
         &spectrum,
         &transient,
         lm,
@@ -309,9 +312,9 @@ fn encoder_rejects_out_of_scope_frames() {
         start,
         end,
         &fine_bits,
-        &band_k
+        &band_k,
     )
-    .is_err());
+    .expect("transient mono encode");
 
     // Spectrum length mismatch.
     assert!(encode_celt_frame(

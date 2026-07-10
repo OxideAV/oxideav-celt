@@ -312,6 +312,20 @@ impl StereoPcmAnalysis {
         start: usize,
         end: usize,
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
+        self.analyze_frame(interleaved, start, end, false)
+    }
+
+    /// [`analyze`](Self::analyze) with an explicit block kind:
+    /// `transient = true` runs the §4.3.1 short-block analysis
+    /// ([`LongMdctAnalysis::analyze_frame`]) per channel over the same
+    /// streaming state, so long and transient frames may alternate.
+    pub fn analyze_frame(
+        &mut self,
+        interleaved: &[f32],
+        start: usize,
+        end: usize,
+        transient: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>), Error> {
         let n = self.frame_size();
         if interleaved.len() != 2 * n || start > end || end > NUM_BANDS {
             return Err(Error::InvalidParameter);
@@ -326,8 +340,8 @@ impl StereoPcmAnalysis {
         self.preemph[1].apply_in_place(&mut right);
         // All shape conditions were validated above, so neither
         // channel's analyze can fail after the other advanced.
-        let left_spec = self.channels[0].analyze(&left, start, end)?;
-        let right_spec = self.channels[1].analyze(&right, start, end)?;
+        let left_spec = self.channels[0].analyze_frame(&left, start, end, transient)?;
+        let right_spec = self.channels[1].analyze_frame(&right, start, end, transient)?;
         Ok((left_spec, right_spec))
     }
 }

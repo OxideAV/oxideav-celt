@@ -439,3 +439,177 @@ fn quantized_loop_with_pitch_postfilter() {
         "post-filtered loop correlation too low: {corr}"
     );
 }
+
+/// **Transient (short-block) codec loop, bit-exact.** Mixed
+/// long/transient multi-frame streams at every `LM`: the decoder's PCM
+/// equals the decode-side chain run on the encoder's own bit-exact
+/// residual reconstruction (the §4.3.1 short-block synthesis, §4.3.4.5
+/// TF transform, and §4.3.5 anti-collapse bit all in lockstep), and
+/// the coarse states match after every frame.
+#[test]
+fn transient_codec_loop_decoder_matches_encoder_reconstruction() {
+    for lm in 0..=3u32 {
+        let n = 120usize << lm;
+        let frame_bytes = 60 + 30 * lm;
+        let kinds = [false, true, true, false, true];
+        let frames = kinds.len();
+
+        let mut enc = CeltEncodeState::new(lm).unwrap();
+        let mut dec = CeltDecodeState::new(lm).unwrap();
+        let mut ref_synth = LongMdctSynthesis::new(lm).unwrap();
+        let mut ref_deemph = Deemphasis::new();
+
+        let input = test_signal(frames * n, 0x7A9 + lm);
+        for (t, &transient) in kinds.iter().enumerate() {
+            let header = CeltFrameHeader {
+                transient,
+                ..plain_header(t == 0)
+            };
+            let frame = encode_celt_frame_pcm_auto(
+                &mut enc,
+                &input[t * n..(t + 1) * n],
+                &header,
+                frame_bytes,
+                0,
+                NUM_BANDS,
+            )
+            .unwrap();
+            let decoded = decode_celt_frame_auto(&mut dec, &frame.bytes, 0, NUM_BANDS).unwrap();
+            assert_eq!(decoded.prefix.header.transient, transient, "lm={lm} t={t}");
+            assert!(decoded.pcm.iter().all(|s| s.is_finite()));
+
+            // Decoder PCM ≡ decode chain over the encoder's bit-exact
+            // reconstruction (anti-collapse defaults off, so no
+            // injection perturbs the identity).
+            let mut expected = ref_synth
+                .synthesize_frame(&frame.reconstructed_spectrum, 0, NUM_BANDS, transient)
+                .unwrap();
+            ref_deemph.apply_in_place(&mut expected);
+            for (i, (e, d)) in expected.iter().zip(&decoded.pcm).enumerate() {
+                assert!(
+                    (e - d).abs() <= 1e-5,
+                    "lm={lm} frame {t} (transient={transient}) sample {i}: {d} vs {e}"
+                );
+            }
+            assert_eq!(
+                enc.coarse_energy().energy,
+                dec.coarse_energy().energy,
+                "lm={lm} frame {t}: coarse lockstep broken"
+            );
+        }
+    }
+}
+
+/// **Transient loop fidelity.** An all-transient tonal stream still
+/// tracks the delayed input through the short-block analysis/synthesis
+/// pair and the §4.3.4.5 TF transform round trip.
+#[test]
+fn transient_codec_loop_tracks_tonal_input() {
+    let lm = 3u32;
+    let n = 120usize << lm;
+    let frame_bytes = 160u32;
+    let frames = 6usize;
+
+    let input: Vec<f32> = (0..frames * n)
+        .map(|i| {
+            let t = i as f32;
+            0.6 * (0.02 * t).sin() + 0.25 * (0.055 * t + 0.7).sin()
+        })
+        .collect();
+
+    let mut enc = CeltEncodeState::new(lm).unwrap();
+    let mut dec = CeltDecodeState::new(lm).unwrap();
+    let mut output = Vec::with_capacity(frames * n);
+    for t in 0..frames {
+        let header = CeltFrameHeader {
+            transient: true,
+            ..plain_header(t == 0)
+        };
+        let frame = encode_celt_frame_pcm_auto(
+            &mut enc,
+            &input[t * n..(t + 1) * n],
+            &header,
+            frame_bytes,
+            0,
+            NUM_BANDS,
+        )
+        .unwrap();
+        let decoded = decode_celt_frame_auto(&mut dec, &frame.bytes, 0, NUM_BANDS).unwrap();
+        output.extend_from_slice(&decoded.pcm);
+    }
+
+    let lo = 2 * n;
+    let hi = (frames - 1) * n;
+    let mut err2 = 0.0f64;
+    let mut sig2 = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut out2 = 0.0f64;
+    for i in lo..hi {
+        let want = input[i] as f64;
+        let got = output[n + i] as f64;
+        err2 += (got - want) * (got - want);
+        sig2 += want * want;
+        dot += got * want;
+        out2 += got * got;
+    }
+    let rel = (err2 / sig2).sqrt();
+    let corr = dot / (sig2.sqrt() * out2.sqrt());
+    // Measured at lm=3/160B: rel ~0.044, corr ~0.9990 — on par with
+    // the long-MDCT loop (~0.039); ~2x headroom retained.
+    assert!(
+        rel < 0.1,
+        "transient steady-state relative L2 error too high: {rel}"
+    );
+    assert!(
+        corr > 0.99,
+        "transient normalized correlation too low: {corr}"
+    );
+}
+
+/// **Anti-collapse wire round trip.** With `anti_collapse_on =
+/// Some(true)` on transient frames the bit crosses the wire (the
+/// decoded prefix reports it), the loop stays in coarse lockstep (the
+/// bit is read exactly once at its Table-56 position), and the decoded
+/// PCM stays finite whether or not any band actually collapsed.
+#[test]
+fn transient_codec_loop_carries_anti_collapse_bit() {
+    let lm = 2u32; // LM > 1 so the §4.3.3 reservation is made
+    let n = 120usize << lm;
+    let frame_bytes = 100u32;
+    let frames = 4usize;
+
+    let input = test_signal(frames * n, 0xAC0);
+    for on in [false, true] {
+        let mut enc = CeltEncodeState::new(lm).unwrap();
+        let mut dec = CeltDecodeState::new(lm).unwrap();
+        for t in 0..frames {
+            let header = CeltFrameHeader {
+                transient: true,
+                anti_collapse_on: Some(on),
+                ..plain_header(t == 0)
+            };
+            let frame = encode_celt_frame_pcm_auto(
+                &mut enc,
+                &input[t * n..(t + 1) * n],
+                &header,
+                frame_bytes,
+                0,
+                NUM_BANDS,
+            )
+            .unwrap();
+            assert_eq!(frame.prefix.header.anti_collapse_on, Some(on));
+            let decoded = decode_celt_frame_auto(&mut dec, &frame.bytes, 0, NUM_BANDS).unwrap();
+            assert_eq!(
+                decoded.prefix.header.anti_collapse_on,
+                Some(on),
+                "on={on} frame {t}: anti-collapse bit did not round-trip"
+            );
+            assert!(decoded.pcm.iter().all(|s| s.is_finite()));
+            assert_eq!(
+                enc.coarse_energy().energy,
+                dec.coarse_energy().energy,
+                "on={on} frame {t}: coarse lockstep broken"
+            );
+        }
+    }
+}
