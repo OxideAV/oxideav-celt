@@ -77,6 +77,24 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Fixed
 
+* **Round-406 — §4.3.2.1 inter-frame prediction now uses the final
+  fine-quantized energy:** RFC 6716 §4.3.2.1 states "The time-domain
+  prediction is based on the final fine quantization of the previous
+  frame", but the prediction state carried coarse-only values. All
+  four wire paths (mono/stereo × encode/decode) now fold the fine +
+  finalize corrections back into `CoarseEnergyState` after each frame
+  (identical f32 arithmetic from the wire-identical corrections, so
+  the coarse lockstep is preserved — the loop lockstep assertions
+  pass unchanged). The input-boundary
+  `decode_stereo_frame` (caller-supplied fine) keeps coarse-only
+  prediction, documented at the API.
+
+* **Round-406 — RFC 8251 sec 8 cap on band energy:**
+  `log_energy_q8_to_amplitude_f32` caps the log-domain band energy at
+  32.0 base-2 log steps (`MAX_LOG_ENERGY_Q8`) before the linear
+  conversion, per the Opus update: extreme bitstreams could otherwise
+  overflow single-precision range and poison the PCM with NaNs.
+
 * **Round-393:** the mono and stereo decoders stored the §4.3.7.1
   cross-frame post-filter history in **forward order** while the
   transition function's contract is most-recent-first, and its depth

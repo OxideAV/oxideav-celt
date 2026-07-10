@@ -409,7 +409,7 @@ pub use deemphasis::{
 pub use denormalization::{
     denormalize_band_f32, denormalize_band_in_place_f32, denormalize_bands_f32,
     denormalize_bands_in_place_f32, log_energy_q8_to_amplitude_f32, scale_band_f32,
-    scale_band_in_place_f32, Q8_DENOM, SQRT_Q8_DENOM,
+    scale_band_in_place_f32, MAX_LOG_ENERGY_Q8, Q8_DENOM, SQRT_Q8_DENOM,
 };
 pub use derive_pulses::{
     decode_celt_frame_auto, derive_band_allocation, derive_band_allocation_dual,

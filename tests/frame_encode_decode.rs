@@ -97,10 +97,6 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     assert_eq!(prefix.spread, encoded.prefix.spread);
     assert_eq!(prefix.allocation, encoded.prefix.allocation);
     assert_eq!(prefix.boosts, encoded.prefix.boosts);
-    assert_eq!(
-        enc_state.energy[0], dec_state.energy[0],
-        "coarse state diverged"
-    );
 
     let fine_q14 = decode_fine_energy(&mut dec, &fine_bits);
     let env_q8 =
@@ -153,6 +149,23 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     assert_eq!(
         residual.samples, encoded.reconstructed_spectrum,
         "decoded residual spectrum != encoder reconstruction"
+    );
+
+    // §4.3.2.1 fine feedback (r406): the encoder's prediction state
+    // now carries the final (coarse + fine + finalize) envelope; the
+    // manual decode side performs the identical fold and lands on the
+    // same state.
+    let env_f32 = oxideav_celt::assemble_band_log_energy_f32(
+        &dec_state,
+        0,
+        Some(&fine_q14),
+        Some(&fin.corrections_q14[0]),
+    )
+    .unwrap();
+    dec_state.energy[0][start..end].copy_from_slice(&env_f32[start..end]);
+    assert_eq!(
+        enc_state.energy[0], dec_state.energy[0],
+        "coarse state diverged after the fine feedback fold"
     );
 
     // --- full decode_celt_frame to PCM over the same bytes ---

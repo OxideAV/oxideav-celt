@@ -56,6 +56,12 @@ pub const Q8_DENOM: f32 = 256.0;
 /// `256` fractional units per integer log-2 step.
 pub const SQRT_Q8_DENOM: f32 = 512.0;
 
+/// RFC 8251 sec 8 cap on the log-domain band energy, on the Q8 axis:
+/// `32.0` base-2 log steps (`32 * 256 = 8192` Q8). Applied before the
+/// linear conversion so extreme bitstreams cannot drive the amplitude
+/// past single-precision range and poison the PCM with NaNs.
+pub const MAX_LOG_ENERGY_Q8: i32 = 32 * 256;
+
 /// Convert a Q8 base-2 log-energy value into the equivalent linear
 /// amplitude (= sqrt of the linear energy). `A = 2^(E_q8 / 512)`.
 ///
@@ -67,10 +73,17 @@ pub const SQRT_Q8_DENOM: f32 = 512.0;
 /// reconstructed log-energy so the exponent stays in finite f32 range.
 #[inline]
 pub fn log_energy_q8_to_amplitude_f32(log_energy_q8: i32) -> f32 {
+    // RFC 8251 (Opus update) sec 8 "Cap on Band Energy": on extreme
+    // bitstreams the log-domain band energy can exceed what a
+    // single-precision float represents once converted to a linear
+    // scale, later producing NaNs; the update caps the log-domain
+    // value at 32.0 (base-2 log steps) before the exp2 conversion.
+    // Q8: 32.0 * 256 = 8192.
+    let capped = log_energy_q8.min(MAX_LOG_ENERGY_Q8);
     // f32::exp2 takes a fractional exponent directly. Dividing in f32
     // up-front (rather than computing `log_energy_q8 as f32 / 512.0`
     // inside the call) keeps the inline expansion small.
-    f32::exp2(log_energy_q8 as f32 / SQRT_Q8_DENOM)
+    f32::exp2(capped as f32 / SQRT_Q8_DENOM)
 }
 
 /// Multiply each sample in `shape` by `amplitude` and write the
@@ -193,6 +206,23 @@ pub fn denormalize_bands_in_place_f32(
 #[cfg(test)]
 #[allow(clippy::excessive_precision)]
 mod tests {
+    /// RFC 8251 sec 8: the log-domain energy is capped at 32.0 before
+    /// the linear conversion, so an extreme envelope stays finite (and
+    /// a capped value equals the amplitude at exactly 32.0).
+    #[test]
+    fn rfc8251_energy_cap_keeps_amplitude_finite() {
+        use super::{log_energy_q8_to_amplitude_f32, MAX_LOG_ENERGY_Q8};
+        let extreme = log_energy_q8_to_amplitude_f32(i32::MAX);
+        assert!(extreme.is_finite());
+        assert_eq!(extreme, log_energy_q8_to_amplitude_f32(MAX_LOG_ENERGY_Q8));
+        // Below the cap the conversion is untouched.
+        let below = log_energy_q8_to_amplitude_f32(MAX_LOG_ENERGY_Q8 - 256);
+        assert!(below < extreme);
+        // The amplitude is 2^(E_q8/512), so one 256-Q8 step below the
+        // cap is a factor sqrt(2) in amplitude.
+        assert!((below * core::f32::consts::SQRT_2 - extreme).abs() <= extreme * 1e-6);
+    }
+
     use super::*;
     use crate::BAND_BINS_LM;
 

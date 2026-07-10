@@ -118,7 +118,7 @@
 //! recorded in that module. No external library source was consulted.
 
 use crate::anti_collapse::{apply_anti_collapse, ENERGY_HISTORY_FLOOR_LOG2};
-use crate::band_energy::assemble_band_log_energy_q8;
+use crate::band_energy::{assemble_band_log_energy_f32, assemble_band_log_energy_q8};
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::deemphasis::Deemphasis;
 use crate::fine_energy::decode_fine_energy;
@@ -451,6 +451,7 @@ pub fn decode_celt_frame(
     // Skipped on silence frames (the in-crate silence wire stops after
     // the fine-energy section).
     let mut env_final_q8 = env_q8;
+    let mut fin_corr_q14 = [0i32; NUM_BANDS];
     if !prefix.header.silence {
         let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
         let leftover = dec.storage_bits().saturating_sub(dec.tell());
@@ -463,6 +464,7 @@ pub fn decode_celt_frame(
             1,
             leftover,
         );
+        fin_corr_q14 = fin.corrections_q14[0];
         // The residual was denormalized against the pre-finalize
         // envelope; scaling by 2^(c/2) per band is algebraically the
         // corrected denormalization.
@@ -471,18 +473,25 @@ pub fn decode_celt_frame(
             lm,
             start,
             end,
-            &fin.corrections_q14[0],
+            &fin_corr_q14,
         ) {
             return Err(Error::InvalidParameter);
         }
-        env_final_q8 = assemble_band_log_energy_q8(
-            &state.coarse,
-            0,
-            Some(&fine_q14),
-            Some(&fin.corrections_q14[0]),
-        )
-        .ok_or(Error::InvalidParameter)?;
+        env_final_q8 =
+            assemble_band_log_energy_q8(&state.coarse, 0, Some(&fine_q14), Some(&fin_corr_q14))
+                .ok_or(Error::InvalidParameter)?;
     }
+
+    // §4.3.2.1: "The time-domain prediction is based on the final fine
+    // quantization of the previous frame" — fold the fine (+ finalize)
+    // corrections back into the inter-frame prediction state so the
+    // next frame predicts from the final quantized envelope. The
+    // encoder performs the identical fold from the wire-identical
+    // corrections, so the coarse lockstep is preserved.
+    let env_f32 =
+        assemble_band_log_energy_f32(&state.coarse, 0, Some(&fine_q14), Some(&fin_corr_q14))
+            .ok_or(Error::InvalidParameter)?;
+    state.coarse.energy[0][start..end].copy_from_slice(&env_f32[start..end]);
 
     // Shift this frame's final envelope into the two-frame §4.3.5
     // energy history for the following frames.
@@ -954,6 +963,7 @@ impl StereoCeltDecodeState {
         // within a band — the same in-crate interleave the main fine
         // pass uses). Skipped on silence frames.
         let (mut env_l_final, mut env_r_final) = (env_l, env_r);
+        let mut fin_corr_q14 = [[0i32; NUM_BANDS]; 2];
         if !prefix.header.silence {
             let priorities = crate::fine_energy::finalize_priorities_from_k(band_k);
             let leftover = dec.storage_bits().saturating_sub(dec.tell());
@@ -966,9 +976,10 @@ impl StereoCeltDecodeState {
                 2,
                 leftover,
             );
+            fin_corr_q14 = fin.corrections_q14;
             for (samples, corr) in [
-                (&mut left, &fin.corrections_q14[0]),
-                (&mut right, &fin.corrections_q14[1]),
+                (&mut left, &fin_corr_q14[0]),
+                (&mut right, &fin_corr_q14[1]),
             ] {
                 if !crate::fine_energy::apply_finalize_scale_f32(samples, lm, start, end, corr) {
                     return Err(Error::InvalidParameter);
@@ -978,16 +989,30 @@ impl StereoCeltDecodeState {
                 &self.coarse,
                 0,
                 Some(&fine_q14[0]),
-                Some(&fin.corrections_q14[0]),
+                Some(&fin_corr_q14[0]),
             )
             .ok_or(Error::InvalidParameter)?;
             env_r_final = assemble_band_log_energy_q8(
                 &self.coarse,
                 1,
                 Some(&fine_q14[1]),
-                Some(&fin.corrections_q14[1]),
+                Some(&fin_corr_q14[1]),
             )
             .ok_or(Error::InvalidParameter)?;
+        }
+
+        // §4.3.2.1 fine feedback (see the mono driver): fold each
+        // channel's final quantized envelope into the shared
+        // inter-frame prediction state.
+        for ch in 0..2usize {
+            let env_f32 = assemble_band_log_energy_f32(
+                &self.coarse,
+                ch,
+                Some(&fine_q14[ch]),
+                Some(&fin_corr_q14[ch]),
+            )
+            .ok_or(Error::InvalidParameter)?;
+            self.coarse.energy[ch][start..end].copy_from_slice(&env_f32[start..end]);
         }
 
         // Shift the per-channel §4.3.5 energy history.
