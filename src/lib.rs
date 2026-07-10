@@ -292,6 +292,7 @@ use oxideav_core::RuntimeContext;
 pub mod alloc_combine;
 pub mod allocation_budget;
 pub mod analysis;
+pub mod anti_collapse;
 pub mod band_analysis;
 pub mod band_cap;
 pub mod band_decode;
@@ -336,6 +337,7 @@ pub use allocation_budget::{
     compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
 };
 pub use analysis::{extract_coded_spectrum, LongMdctAnalysis, StereoPcmAnalysis};
+pub use anti_collapse::{apply_anti_collapse, ENERGY_HISTORY_FLOOR_LOG2};
 pub use band_analysis::{
     analyze_band_f32, analyze_bands_f32, band_energy_f32, band_log_energy_f32, BandAnalysis,
     SILENCE_LOG_ENERGY,
@@ -415,15 +417,16 @@ pub use frame_synthesis::{
     StereoDecodedFrame,
 };
 pub use hadamard::{
-    apply_tf_resolution_change, walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
-    HADAMARD_LEVEL_SCALE,
+    apply_tf_resolution_change, apply_tf_resolution_change_inverse, walsh_hadamard_inplace,
+    walsh_hadamard_sequency_inplace, walsh_hadamard_sequency_inverse_inplace, HADAMARD_LEVEL_SCALE,
 };
 pub use laplace::{
     ec_laplace_decode, ec_laplace_encode, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN,
 };
 pub use mdct::{
     build_low_overlap_window_f32, build_window_half_f32, celt_window_f32, imdct_naive_f32,
-    mdct_naive_f32, MdctAnalysis, MdctSynthesis, BASIC_WINDOW_HALF, BASIC_WINDOW_LEN,
+    mdct_naive_f32, short_block_geometry, MdctAnalysis, MdctSynthesis, BASIC_WINDOW_HALF,
+    BASIC_WINDOW_LEN,
 };
 pub use pcm_encode::{
     encode_celt_frame_pcm, encode_celt_frame_pcm_auto, encode_stereo_celt_frame_pcm,
