@@ -29,6 +29,31 @@ All notable changes to `oxideav-celt` are recorded here.
   overwrites it; `derive_band_allocation`/`_dual` remain as
   arithmetic-only estimators and no longer describe the wire.
 
+### Added
+
+* **Round-408 — wire-interop absolute energy convention +
+  black-box reference validation:** coarse-energy targets are now
+  coded **mean-removed** against the staged `eMeans` table
+  (`E_MEANS_Q4`, `docs/audio/opus/tables/e-means.csv`) in base-2
+  log-amplitude units (one coarse step = 6 dB, matching RFC 6716
+  §4.3.2.1), on the reference spectral scale
+  (`SPECTRUM_SCALE_LOG2_Q8` — calibrated black-box by regressing
+  per-band wire energies of reference-encoder streams against this
+  crate's analyzer: the offset is flat at `14.0 ± 0.2` log2 across
+  all 21 bands and the 5/10/20 ms sizes). Rendering converts back
+  through `render_band_energy_q8` at the denormalization /
+  anti-collapse / energy-history boundary, so the in-crate codec
+  loop is unchanged while the wire becomes interop-meaningful.
+  Two black-box harnesses land: `tests/blackbox_opusdec.rs` muxes
+  this crate's frames into Ogg-Opus and measures a reference
+  decoder's output (level now within ±1.4 dB at LM 1–3; shape SNR
+  reported and tracked against the reallocation chapter's §10
+  residual predicates; LM 0 level is a documented open item), and
+  `tests/fixture_survey.rs` walks real reference streams through
+  the prefix + reallocation walk (51/51 frames of the staged mono
+  fixture walk cleanly, 440 Hz energy lands in band 2). Both are
+  runtime-gated for CI.
+
 ### Fixed
 
 * **Round-408 (2026-07-10) — §4.3.3 static-allocation dimensional

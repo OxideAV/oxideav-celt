@@ -185,6 +185,68 @@ pub fn log_energy_f32_to_q8(log_energy_f32: f32) -> i32 {
     (log_energy_f32 * Q8_DENOM).round() as i32
 }
 
+// ---------------------------------------------------------------------
+// Interop energy convention (the wire's absolute energy scale).
+// ---------------------------------------------------------------------
+
+/// Per-band mean energy `eMeans`, quantized in Q4 (units of the coarse
+/// base-2 log step). The coarse/fine energy on the wire is coded
+/// **relative to this mean**: the encoder subtracts `eMeans[band]`
+/// from the absolute band log-energy, and the decoder adds it back
+/// before denormalization.
+///
+/// Values are the staged normative numeric table
+/// `docs/audio/opus/tables/e-means.csv` (21 coded-band entries of the
+/// 25-entry table; the 4 trailing entries pad unused bands). Numeric
+/// data extraction per the staging area's Feist doctrine.
+pub const E_MEANS_Q4: [i16; NUM_BANDS] = [
+    103, 100, 92, 85, 81, 77, 72, 70, 78, 75, 73, 71, 78, 74, 69, 72, 70, 74, 76, 71, 60,
+];
+
+/// Per-`LM` spectral-scale bridge between this crate's MDCT-domain
+/// band amplitudes and the wire's absolute convention, in Q8 base-2
+/// log units.
+///
+/// RFC 6716 pins the inverse-MDCT scaling ("scaling by 1/2", §4.3.7)
+/// but leaves the wire's absolute energy scale to the bit-exactness
+/// requirement. The constant was **calibrated black-box**: per-band
+/// wire energies decoded from reference-encoder streams (produced by
+/// `opusenc` run as an opaque process over a known noise signal) were
+/// regressed against this crate's analyzer for the same signal — the
+/// offset `wire + eMeans - log2(band amplitude)` is flat across all
+/// 21 bands and across the 5/10/20 ms frame sizes at `14.0 ± 0.2`
+/// base-2 log units (Q8 `3584`), i.e. band- and LM-independent.
+pub const SPECTRUM_SCALE_LOG2_Q8: [i32; 4] = [3584, 3584, 3584, 3584];
+
+/// The Q8 bias between a band's **absolute** log2 amplitude in this
+/// crate's spectrum scale and the **wire** energy value:
+/// `wire_q8 = 512 * al2_ours_q8ish ... ` — concretely,
+/// `wire = al2_ours + scale(lm) - eMeans[band]` in base-2 log
+/// amplitude units, and this helper returns
+/// `Q8(scale(lm) - eMeans[band])`.
+#[inline]
+pub fn interop_wire_bias_q8(band: usize, lm: u32) -> i32 {
+    SPECTRUM_SCALE_LOG2_Q8[lm.min(3) as usize] - 16 * i32::from(E_MEANS_Q4[band.min(NUM_BANDS - 1)])
+}
+
+/// f32 variant of [`interop_wire_bias_q8`] for the encoder's coarse
+/// targets (which live on the f32 log-2 axis, `1.0` = one wire step).
+#[inline]
+pub fn interop_wire_bias_f32(band: usize, lm: u32) -> f32 {
+    interop_wire_bias_q8(band, lm) as f32 / Q8_DENOM
+}
+
+/// Convert a **wire-domain** Q8 envelope value (coarse + fine +
+/// finalize as coded) into the **rendering** Q8 log-energy this
+/// crate's §4.3.6 denormalization (`amplitude = 2^(q8/512)`) consumes:
+/// remove the wire bias and double (one wire step = 6 dB = one full
+/// base-2 log-amplitude step, while the rendering axis carries
+/// base-2 log **energy**).
+#[inline]
+pub fn render_band_energy_q8(wire_env_q8: i32, band: usize, lm: u32) -> i32 {
+    2 * (wire_env_q8 - interop_wire_bias_q8(band, lm))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

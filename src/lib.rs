@@ -2,7 +2,31 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-07-10):** round-406. The §4.3 walk runs past the
+//! **Status (2026-07-10):** round-408. The **§4.3.3 reallocation
+//! walk** is implemented per the freshly staged behavioral chapter
+//! ([`realloc_walk`]): outer bisection over the Table-57 quality
+//! codepoints, 1/64 interpolation on the cap-clamped bracketing
+//! vectors, concurrent top-down skip decoding, intensity / dual
+//! placement, cap-bounded final reallocation, fine/shape split,
+//! priority stamp, and balance — wired into every frame driver, with
+//! the Table-56 `skip`/`intensity`/`dual` symbols moved out of the
+//! prefix into the walk. The §2-narrative budget threading landed
+//! (boost loop on the raw frame budget, trim gate on
+//! `frame_8th - total_boost`, §2.5 reservations at the post-trim
+//! position), along with the fresh-docs static-allocation
+//! dimensional fix (base-width `N`). The wire now carries the
+//! interop **absolute energy convention**: coarse targets are coded
+//! mean-removed ([`E_MEANS_Q4`]) on the reference spectral scale
+//! ([`SPECTRUM_SCALE_LOG2_Q8`], calibrated black-box against
+//! reference-encoder streams), landing reference decodes of this
+//! crate's streams within ~±1.4 dB of the encoder input level at
+//! 5/10/20 ms. Shape-level bit-exactness against the reference
+//! allocator remains gated on the chapter's §10 residual predicates
+//! (fine-split constants, exact skip predicate, priority predicate) —
+//! measured and tracked via the black-box `opusdec` harness
+//! (`tests/blackbox_opusdec.rs`).
+//!
+//! **Status (2026-07-10, earlier):** round-406. The §4.3 walk runs past the
 //! fine-energy boundary on both frame kinds. **Transient (short-block)
 //! frames decode and encode end to end**: the §4.3.1 short-block WOLA
 //! placement is derived from the \[PRINCEN86\] aliasing-cancellation
@@ -374,8 +398,9 @@ pub use band_cap::{
 };
 pub use band_decode::{decode_band_shape, BandShape};
 pub use band_energy::{
-    assemble_band_log_energy_f32, assemble_band_log_energy_q8, log_energy_f32_to_q8,
-    FINE_Q14_DENOM, Q14_TO_Q8_SHIFT,
+    assemble_band_log_energy_f32, assemble_band_log_energy_q8, interop_wire_bias_f32,
+    interop_wire_bias_q8, log_energy_f32_to_q8, render_band_energy_q8, E_MEANS_Q4, FINE_Q14_DENOM,
+    Q14_TO_Q8_SHIFT, SPECTRUM_SCALE_LOG2_Q8,
 };
 pub use band_layout::{
     band_bin_range, band_bins, band_edge, coded_total_bins, EBAND_EDGES_5MS, NUM_BAND_EDGES,

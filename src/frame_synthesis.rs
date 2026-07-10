@@ -454,9 +454,12 @@ pub(crate) fn decode_celt_frame_inner(
     let env_q8 = assemble_band_log_energy_q8(&state.coarse, 0, Some(&fine_q14), None)
         .ok_or(Error::InvalidParameter)?;
 
-    // Slice the absolute-band envelope to the coded window for the
-    // residual loop, which indexes per-coded-band.
-    let window_energy: Vec<i32> = env_q8[start..end].to_vec();
+    // Slice the envelope to the coded window for the residual loop,
+    // converting the wire-domain values (eMeans-relative, 6 dB steps)
+    // onto the rendering axis this crate's denormalization consumes.
+    let window_energy: Vec<i32> = (start..end)
+        .map(|b| crate::band_energy::render_band_energy_q8(env_q8[b], b, lm))
+        .collect();
 
     // §4.3.4 residual (shape) decode → denormalized MDCT-domain spectrum
     // (a transient frame decodes `2^lm` interleaved short blocks per
@@ -518,14 +521,19 @@ pub(crate) fn decode_celt_frame_inner(
         );
         fin_corr_q14 = fin.corrections_q14[0];
         // The residual was denormalized against the pre-finalize
-        // envelope; scaling by 2^(c/2) per band is algebraically the
-        // corrected denormalization.
+        // envelope; the corrections live on the wire axis (one unit =
+        // 6 dB of amplitude), so the half-exponent sample scaler takes
+        // the doubled values.
+        let mut fin_corr_render = fin_corr_q14;
+        for c in &mut fin_corr_render {
+            *c *= 2;
+        }
         if !crate::fine_energy::apply_finalize_scale_f32(
             &mut residual.samples,
             lm,
             start,
             end,
-            &fin_corr_q14,
+            &fin_corr_render,
         ) {
             return Err(Error::InvalidParameter);
         }
@@ -546,11 +554,16 @@ pub(crate) fn decode_celt_frame_inner(
     state.coarse.energy[0][start..end].copy_from_slice(&env_f32[start..end]);
 
     // Shift this frame's final envelope into the two-frame §4.3.5
-    // energy history for the following frames.
+    // energy history for the following frames — on the rendering axis,
+    // the same domain the anti-collapse comparisons read.
+    let mut env_render_q8 = env_final_q8;
+    for (b, e) in env_render_q8.iter_mut().enumerate() {
+        *e = crate::band_energy::render_band_energy_q8(*e, b, lm);
+    }
     push_energy_history(
         &mut state.energy_prev1,
         &mut state.energy_prev2,
-        &env_final_q8,
+        &env_render_q8,
         start,
         end,
     );
@@ -836,12 +849,17 @@ impl StereoCeltDecodeState {
         let env_r = assemble_band_log_energy_q8(&self.coarse, 1, Some(&fine_q14[1]), None)
             .ok_or(Error::InvalidParameter)?;
 
-        // Shift the per-channel §4.3.5 energy history.
+        // Shift the per-channel §4.3.5 energy history (rendering
+        // axis, the domain the anti-collapse comparisons read).
         for (ch, env) in [env_l, env_r].iter().enumerate() {
+            let mut env_render = *env;
+            for (b, e) in env_render.iter_mut().enumerate() {
+                *e = crate::band_energy::render_band_energy_q8(*e, b, lm);
+            }
             push_energy_history(
                 &mut self.energy_prev1[ch],
                 &mut self.energy_prev2[ch],
-                env,
+                &env_render,
                 start,
                 end,
             );
@@ -1026,8 +1044,14 @@ impl StereoCeltDecodeState {
                 .ok_or(Error::InvalidParameter)? as usize;
             (vec![0.0f32; total], vec![0.0f32; total])
         } else {
-            let window_l: Vec<i32> = env_l[start..end].to_vec();
-            let window_r: Vec<i32> = env_r[start..end].to_vec();
+            // Wire-domain envelopes → the rendering axis the
+            // denormalization consumes (see the mono driver).
+            let window_l: Vec<i32> = (start..end)
+                .map(|b| crate::band_energy::render_band_energy_q8(env_l[b], b, lm))
+                .collect();
+            let window_r: Vec<i32> = (start..end)
+                .map(|b| crate::band_energy::render_band_energy_q8(env_r[b], b, lm))
+                .collect();
             let residual = crate::residual::decode_stereo_residual_bands(
                 &mut dec,
                 lm,
@@ -1056,7 +1080,9 @@ impl StereoCeltDecodeState {
                     .into_iter()
                     .enumerate()
                 {
-                    let window_env: Vec<i32> = env[start..end].to_vec();
+                    let window_env: Vec<i32> = (start..end)
+                        .map(|b| crate::band_energy::render_band_energy_q8(env[b], b, lm))
+                        .collect();
                     if !apply_anti_collapse(
                         samples,
                         lm,
@@ -1090,7 +1116,19 @@ impl StereoCeltDecodeState {
                 (&mut left, &fin_corr_q14[0]),
                 (&mut right, &fin_corr_q14[1]),
             ] {
-                if !crate::fine_energy::apply_finalize_scale_f32(samples, lm, start, end, corr) {
+                // Wire-axis corrections → doubled for the
+                // half-exponent sample scaler (see the mono driver).
+                let mut corr_render = *corr;
+                for c in &mut corr_render {
+                    *c *= 2;
+                }
+                if !crate::fine_energy::apply_finalize_scale_f32(
+                    samples,
+                    lm,
+                    start,
+                    end,
+                    &corr_render,
+                ) {
                     return Err(Error::InvalidParameter);
                 }
             }
@@ -1124,12 +1162,17 @@ impl StereoCeltDecodeState {
             self.coarse.energy[ch][start..end].copy_from_slice(&env_f32[start..end]);
         }
 
-        // Shift the per-channel §4.3.5 energy history.
+        // Shift the per-channel §4.3.5 energy history (rendering
+        // axis — see the mono driver).
         for (ch, env) in [env_l_final, env_r_final].iter().enumerate() {
+            let mut env_render = *env;
+            for (b, e) in env_render.iter_mut().enumerate() {
+                *e = crate::band_energy::render_band_energy_q8(*e, b, lm);
+            }
             push_energy_history(
                 &mut self.energy_prev1[ch],
                 &mut self.energy_prev2[ch],
-                env,
+                &env_render,
                 start,
                 end,
             );

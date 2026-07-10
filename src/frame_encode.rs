@@ -495,7 +495,13 @@ fn encode_celt_frame_impl(
         {
             let n = band_bins(band, lm).ok_or(Error::InvalidParameter)? as usize;
             let analysis = analyze_band_f32(&spectrum[offset..offset + n]);
-            *slot = analysis.log_energy;
+            // Wire-domain coarse target: the wire carries base-2 log
+            // AMPLITUDE (one coarse step = 6 dB), relative to the
+            // eMeans[] band means and on the reference spectral scale
+            // (crate::band_energy interop helpers). `log_energy` is
+            // log2(band ENERGY) in this crate's spectrum scale, hence
+            // the halving.
+            *slot = 0.5 * analysis.log_energy + crate::band_energy::interop_wire_bias_f32(band, lm);
             shapes.push(analysis.shape);
             offset += n;
         }
@@ -681,7 +687,10 @@ fn encode_celt_frame_impl(
         {
             return Err(Error::NotImplemented);
         }
-        denormalize_band_in_place_f32(&mut band_samples, envelope_q8[band]);
+        denormalize_band_in_place_f32(
+            &mut band_samples,
+            crate::band_energy::render_band_energy_q8(envelope_q8[band], band, lm),
+        );
         reconstructed.extend_from_slice(&band_samples);
     }
 
@@ -728,12 +737,19 @@ fn encode_celt_frame_impl(
         envelope_q8 =
             assemble_band_log_energy_q8(coarse_state, 0, Some(&fine_q14), Some(&fin_corr_q14))
                 .ok_or(Error::InvalidParameter)?;
+        // The finalize corrections live on the wire axis (one unit =
+        // 6 dB of amplitude); the sample scaler applies half-exponent
+        // energy semantics, so feed it the doubled corrections.
+        let mut fin_corr_render = fin_corr_q14;
+        for c in &mut fin_corr_render {
+            *c *= 2;
+        }
         if !crate::fine_energy::apply_finalize_scale_f32(
             &mut reconstructed,
             lm,
             start,
             end,
-            &fin_corr_q14,
+            &fin_corr_render,
         ) {
             return Err(Error::InvalidParameter);
         }
@@ -936,7 +952,8 @@ fn encode_stereo_celt_frame_impl(
         {
             let n = band_bins(band, lm).ok_or(Error::InvalidParameter)? as usize;
             let analysis = analyze_band_f32(&spectrum[offset..offset + n]);
-            *slot = analysis.log_energy;
+            // Wire-domain coarse target (see the mono engine).
+            *slot = 0.5 * analysis.log_energy + crate::band_energy::interop_wire_bias_f32(band, lm);
             shapes[ch].push(analysis.shape);
             offset += n;
         }
@@ -1135,7 +1152,10 @@ fn encode_stereo_celt_frame_impl(
                 return Err(Error::NotImplemented);
             }
             let env = if ch == 0 { &env_l } else { &env_r };
-            denormalize_band_in_place_f32(&mut band_samples, env[band]);
+            denormalize_band_in_place_f32(
+                &mut band_samples,
+                crate::band_energy::render_band_energy_q8(env[band], band, lm),
+            );
             rec.extend_from_slice(&band_samples);
         }
     }
@@ -1191,7 +1211,13 @@ fn encode_stereo_celt_frame_impl(
             (&mut rec_l, &fin_corr_q14[0]),
             (&mut rec_r, &fin_corr_q14[1]),
         ] {
-            if !crate::fine_energy::apply_finalize_scale_f32(rec, lm, start, end, corr) {
+            // Wire-axis corrections → doubled for the half-exponent
+            // sample scaler (see the mono engine).
+            let mut corr_render = *corr;
+            for c in &mut corr_render {
+                *c *= 2;
+            }
+            if !crate::fine_energy::apply_finalize_scale_f32(rec, lm, start, end, &corr_render) {
                 return Err(Error::InvalidParameter);
             }
         }

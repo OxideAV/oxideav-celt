@@ -110,7 +110,9 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     let env_q8 =
         oxideav_celt::assemble_band_log_energy_q8(&dec_state, 0, Some(&fine_q14), None).unwrap();
 
-    let window_energy: Vec<i32> = env_q8[start..end].to_vec();
+    let window_energy: Vec<i32> = (start..end)
+        .map(|b| oxideav_celt::render_band_energy_q8(env_q8[b], b, lm))
+        .collect();
     let mut residual = decode_residual_bands(
         &mut dec,
         lm,
@@ -147,12 +149,16 @@ fn encode_then_decode_matches_encoder_reconstruction() {
     )
     .unwrap();
     assert_eq!(env_final, encoded.envelope_q8, "envelope diverged");
+    let mut fin_render = fin.corrections_q14[0];
+    for c in &mut fin_render {
+        *c *= 2;
+    }
     assert!(oxideav_celt::apply_finalize_scale_f32(
         &mut residual.samples,
         lm,
         start,
         end,
-        &fin.corrections_q14[0],
+        &fin_render,
     ));
     assert_eq!(
         residual.samples, encoded.reconstructed_spectrum,
@@ -443,7 +449,9 @@ fn auto_encode_auto_decode_self_contained_loop() {
     let fine_q14 = decode_fine_energy(&mut dec, &alloc.fine_bits);
     let env_q8 =
         oxideav_celt::assemble_band_log_energy_q8(&dec_state, 0, Some(&fine_q14), None).unwrap();
-    let window_energy: Vec<i32> = env_q8[start..end].to_vec();
+    let window_energy: Vec<i32> = (start..end)
+        .map(|b| oxideav_celt::render_band_energy_q8(env_q8[b], b, lm))
+        .collect();
     let mut residual = decode_residual_bands(
         &mut dec,
         lm,
@@ -478,12 +486,16 @@ fn auto_encode_auto_decode_self_contained_loop() {
     )
     .unwrap();
     assert_eq!(env_final, encoded.envelope_q8);
+    let mut fin_render = fin.corrections_q14[0];
+    for c in &mut fin_render {
+        *c *= 2;
+    }
     assert!(oxideav_celt::apply_finalize_scale_f32(
         &mut residual.samples,
         lm,
         start,
         end,
-        &fin.corrections_q14[0],
+        &fin_render,
     ));
     assert_eq!(
         residual.samples, encoded.reconstructed_spectrum,
