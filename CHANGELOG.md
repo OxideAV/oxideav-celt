@@ -6,6 +6,60 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-406 (2026-07-10) — transient (short-block) frames decode
+  and encode end to end:** the §4.3.1 short-block WOLA pair
+  (`MdctSynthesis::frame_short` / `MdctAnalysis::frame_short` +
+  `short_block_geometry`) de-interleaves the frame spectrum into
+  `2^LM` short MDCTs (`spectrum[nb_blocks*f + s]`) and overlap-adds
+  them at stride `sb = 120` starting `pad = (N - sb)/2` into the
+  frame — a placement *derived* from the [PRINCEN86]
+  aliasing-cancellation requirement against the §4.3.7 low-overlap
+  long window, so long and transient frames alternate freely on one
+  stream (pinned by mixed-stream perfect-reconstruction tests across
+  every transition kind and every `LM`).
+  `LongMdctSynthesis::synthesize_frame` /
+  `LongMdctAnalysis::analyze_frame` (+ the stereo `_kind` variants)
+  route both block kinds over one shared overlap state; every decode
+  driver (`decode_celt_frame[_auto]`,
+  `decode_stereo_frame[_coded/_auto]`) and every encoder (spectrum +
+  PCM, mono + stereo) now accepts transient frames — the former
+  `NotImplemented` rejections are gone. The encoder searches the PVQ
+  codebook against the inverse-§4.3.4.5-TF-transformed band shapes
+  (`apply_tf_resolution_change_inverse` /
+  `walsh_hadamard_sequency_inverse_inplace`) and reconstructs through
+  the forward transform, keeping the loop bit-exact. Transient tonal
+  fidelity matches the long-MDCT loop (measured rel ~0.044,
+  corr ~0.9990 at `lm=3`/160 B).
+
+* **Round-406 — §4.3.5 anti-collapse:** the `{1,1}/2` bit is coded /
+  decoded at its Table-56 position (after the band shapes) exactly
+  when the §4.3.3 reservation was made on a non-silent transient
+  frame. A set bit fires `apply_anti_collapse`: per-(band, short-MDCT)
+  collapse detection on the interleaved lanes the short-block
+  synthesis de-interleaves, flat pseudo-random `±r` fill at the
+  minimum-of-two-previous-frames energy (capped at the band's coded
+  envelope), and band renormalization back to the §4.3.6 envelope —
+  every property the §4.3.5 prose pins; the detection criterion, LCG,
+  and injection arithmetic are documented in-crate decoder decisions.
+  Both decoder states carry the two-frame per-band energy history +
+  seed (`reset()` clears them; fresh states hold
+  `ENERGY_HISTORY_FLOOR_LOG2`).
+
+* **Round-406 — §4.3.2.2 final fine-energy backfill:** the finalize
+  step lands on both sides of the wire, mono and stereo: leftover raw
+  bits are spent one extra fine-energy bit per band per channel in
+  the two-priority ascending-band order. The depth-aware pair
+  (`finalize_extra_bits_depth` / `encode_finalize_extra_bits_depth`)
+  refines each band one level below its existing fine depth
+  (`±2^-(B_i+2)`, reducing to the flat `B = 1` cell at `B_i = 0`);
+  `finalize_priorities_from_k` is the documented in-crate priority
+  rule (funded bands first — the RFC pins the walk but defers the
+  assignment to the allocation); `apply_finalize_scale_f32` folds the
+  correction into the already-denormalized residual. Both sides
+  measure the identical leftover budget through the §4.1.6/§5.1.6
+  `tell()` lockstep, so the codec-loop bit-exactness identities pass
+  unchanged with the refinement included.
+
 * **Round-393 (2026-07-06) — §5.3.1 pitch pre-filter + pitch search,
   wired into the mono PCM loop:**
   `apply_pitch_prefilter_transition_f32` is the exact FIR inverse of

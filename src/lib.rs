@@ -2,6 +2,32 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
+//! **Status (2026-07-10):** round-406. The §4.3 walk runs past the
+//! fine-energy boundary on both frame kinds. **Transient (short-block)
+//! frames decode and encode end to end**: the §4.3.1 short-block WOLA
+//! placement is derived from the \[PRINCEN86\] aliasing-cancellation
+//! requirement against the §4.3.7 low-overlap long window
+//! ([`short_block_geometry`]), so
+//! long and transient frames alternate freely on one streaming state;
+//! the encoder searches the PVQ codebook against the
+//! inverse-§4.3.4.5-TF-transformed shapes
+//! ([`apply_tf_resolution_change_inverse`]) and reconstructs through
+//! the forward transform, keeping the codec loops bit-exact across
+//! mixed long/transient streams at every `LM` (transient tonal
+//! fidelity rel ~0.044 / corr ~0.9990 at `lm=3`/160 B — on par with
+//! the long-MDCT loop). **§4.3.5 anti-collapse** is implemented: the
+//! `{1,1}/2` bit at its Table-56 position under the §4.3.3
+//! reservation gate, with the injection
+//! ([`anti_collapse::apply_anti_collapse`])
+//! as documented in-crate arithmetic over the two-frame per-band
+//! energy history both decoder states now carry. The **§4.3.2.2
+//! finalize backfill** spends the leftover raw bits (one extra
+//! depth-aware fine-energy bit per band per channel, priorities
+//! derived in-crate from the shape allocation) on both sides of the
+//! wire through the §4.1.6/§5.1.6 `tell()` lockstep. Remaining gaps:
+//! the reference-exact §4.3.3 reallocation bisection, the §4.3.4.4
+//! split-gain path, and the §4.3.4.4 stereo `itheta` coupling.
+//!
 //! **Status (2026-07-04):** round-389. The **stereo PCM codec loop**
 //! closes over the uncoupled (Table 56 `dual`) path:
 //! [`encode_stereo_celt_frame_pcm_auto`] →

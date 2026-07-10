@@ -6,6 +6,27 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**Transient (short-block) frames + anti-collapse + finalize, r406.**
+The §4.3 walk now runs past the fine-energy boundary on **both** frame
+kinds: transient frames decode and encode end to end (the §4.3.1
+short-block WOLA placement is *derived* from the \[PRINCEN86\]
+aliasing-cancellation requirement against the §4.3.7 low-overlap long
+window — `short_block_geometry` documents the derivation — so long and
+transient frames alternate freely on one stream), the §4.3.5
+anti-collapse bit is coded/decoded at its Table-56 position with the
+injection implemented as documented in-crate arithmetic over a
+two-frame per-band energy history, and the §4.3.2.2 **finalize**
+backfill spends the leftover raw bits (one extra fine-energy bit per
+band per channel, depth-aware, priorities derived in-crate from the
+shape allocation) on both sides of the wire. The encoder searches the
+PVQ codebook against the inverse-§4.3.4.5-TF-transformed shapes and
+reconstructs through the forward transform, so every codec-loop
+bit-exactness identity holds across mixed long/transient streams at
+every `LM` (transient tonal fidelity: rel ~0.044, corr ~0.9990 at
+`lm=3`/160 B — on par with the long-MDCT loop). Sections below
+describing transient/anti-collapse/finalize as rejected or gap-blocked
+predate r406 where not yet reworded.
+
 **Decoder building blocks, in progress.** The range decoder and the
 full CELT control-symbol decode path (frame-prefix → coarse energy →
 fine energy → time-frequency parameters → spreading → bit allocation)
@@ -64,18 +85,18 @@ the main fine-energy corrections are inputs — the §4.3.4.4 `itheta`
 coupling and the main §4.3.2.2 fine-energy channel interleave are the
 docs-gap boundaries, the same shape the mono path keeps for `band_k`.
 
-Not yet implemented: the §4.3.3 reallocation loop that produces
-`band_k` / `fine_bits` (concurrent skip decoding + fine/shape split),
-the §4.3.4.4 split-gain band-split path, the §4.3.4.4 stereo `itheta`
-mid/side bitstream coupling (the r389 stereo codec uses the uncoupled
-dual path instead — see below), the transient short-block time-domain
-reassembly (§4.3.1 / §4.3.7), and the §4.3.5 anti-collapse injection —
-each blocked on detail that RFC 6716 §4.3.3 / §4.3.4.4 / §4.3.1 /
-§4.3.7 / §4.3.5 and the clean-room narrative §2.7 defer to the
-reference implementation. Every frame decoder rejects a transient
-frame with `Error::NotImplemented` rather than mis-decode it, and the
-stereo decoders reject a joint-coded (non-dual) or intensity-coded
-prefix the same way.
+Not yet implemented: the reference-exact §4.3.3 reallocation loop that
+produces `band_k` / `fine_bits` (the `interp_bits2pulses` bisection
+with concurrent skip-bit decoding — the in-crate derivation covers the
+documented arithmetic with documented in-crate fine/shape-split and
+skip-floor rules), the §4.3.4.4 split-gain band-split path (the
+quantized split-gain precision/PDF is deferred to the reference), and
+the §4.3.4.4 stereo `itheta` mid/side bitstream coupling (the stereo
+codec uses the uncoupled dual path instead — see below); the stereo
+decoders reject a joint-coded (non-dual) or intensity-coded prefix
+with `Error::NotImplemented` rather than mis-parse it. Since r406,
+transient (short-block) frames and the §4.3.5 anti-collapse pass are
+implemented (see the r406 status above).
 
 **End-to-end mono frame encode (spectrum → bytes → PCM), r382.** The
 encode direction now closes the loop: `encode_celt_frame` chains §4.3.6
@@ -171,9 +192,10 @@ encoder's bit-exact reconstruction, waveform fidelity on a tonal
 signal (steady-state relative L2 error < 0.8, correlation > 0.6 with
 no fine bits spent), and spectral closure (re-analyzing the decoded
 PCM recovers the encoder's reconstructed spectra one frame delayed).
-Remaining encode-side gaps: the codec-registration entry point and
-transient (short-block) analysis (§4.3.1 geometry docs gap); the
-§5.3.1 pitch pre-filter landed in r393 (below).
+Remaining encode-side gap: the codec-registration entry point; the
+§5.3.1 pitch pre-filter landed in r393 (below) and the transient
+(short-block) analysis landed in r406 (the §4.3.1 geometry is derived,
+not deferred — see the r406 status).
 
 **Stereo PCM codec loop (dual/uncoupled path), r389.** The stereo
 dimension now closes the same loop the mono side closed in r385:
@@ -372,14 +394,15 @@ pulse counts — clamping each `K` to the largest value whose PVQ codebook
 the deferred §4.3.4.4 split regime). `decode_celt_frame_auto(state,
 frame_bytes, start, end)` chains the whole thing: decode the prefix,
 derive the pulse counts and fine-energy bits (r393's
-`derive_band_allocation`), and run `decode_celt_frame` — a mono,
-non-transient CELT frame → PCM with **no caller-supplied `band_k` /
-`fine_bits`**. It is the deepest
+`derive_band_allocation`), and run `decode_celt_frame` — a mono CELT
+frame (long or, since r406, transient) → PCM with **no
+caller-supplied `band_k` / `fine_bits`**. It is the deepest
 caller-input-free decode the wall permits: every step is RFC-specified
-except the deferred fine/shape split, approximated by treating the whole
-combined allocation as shape. A transient frame, an out-of-range window,
-or a band that hits the §4.3.4.4 split gap is surfaced as
-`Error::NotImplemented` / `InvalidParameter`, never mis-decoded. The
+except the deferred fine/shape split, carried by the documented
+in-crate rule. An out-of-range window or a band that hits the
+§4.3.4.4 split gap (or a decoded `tf_change` its short-block geometry
+cannot carry) is surfaced as `Error::NotImplemented` /
+`InvalidParameter`, never mis-decoded. The
 derivation is deterministic (identical bytes → identical pulse counts →
 identical PCM) and matches the manual `decode_frame_prefix` →
 `derive_band_pulses` → `decode_celt_frame` compose exactly.
@@ -1242,8 +1265,9 @@ Multi-band residual decode loop (RFC 6716 §4.3.4 → §4.3.6):
   `Error::NotImplemented` rather than a silent mis-decode;
   length-mismatched per-band slices or an out-of-range window/`lm` are
   `Error::InvalidParameter`. This is the mono / per-channel, non-split
-  loop; stereo joint coding and the §4.3.5 anti-collapse pass (which
-  follows it) stay out of scope for the same docs-gap reasons.
+  loop; stereo joint coding stays out of scope (§4.3.4.4 docs gap),
+  and the §4.3.5 anti-collapse pass that follows it is applied by the
+  frame drivers (r406).
 
 Frame-prefix decode driver (RFC 6716 §4.3, Table 56):
 
@@ -1266,14 +1290,13 @@ Frame-prefix decode driver (RFC 6716 §4.3, Table 56):
   The coarse-energy `state` is mutated in place so the §4.3.2.1
   inter-frame prediction carries across frames.
 * The driver leaves the range decoder positioned at the Table 56
-  `fine energy` symbol. Everything from there onward — the §4.3.3
-  reallocation pass (concurrent skip decoding), the fine-energy vs.
-  shape split, the §4.3.4 residual (per-band PVQ) loop, the §4.3.5
-  anti-collapse processing, and the finalize step — depends on the
-  reallocation bisection and the fine/shape split formula, both of
-  which RFC 6716 §4.3.3 and the clean-room narrative §2.7 defer to the
-  reference implementation. They remain documented docs gaps; the
-  driver stops at that boundary.
+  `fine energy` symbol. The frame drivers continue the walk from
+  there: fine energy, the §4.3.4 residual loop, the §4.3.5
+  anti-collapse bit + injection, and the §4.3.2.2 finalize backfill
+  (r406). The reference-exact §4.3.3 reallocation bisection with
+  concurrent skip decoding remains the documented docs gap; the
+  in-crate derivation (`derive_band_allocation`) carries that seam
+  with documented in-crate rules.
 * Out-of-range `lm` (`> 3`) or band window (`start > end` /
   `end > 21`) is rejected with `Error::InvalidParameter` before any
   decode. Callers check `RangeDecoder::has_error()` after the call for
@@ -1330,12 +1353,13 @@ Long-MDCT synthesis spine (RFC 6716 §4.3.6 → §4.3.7):
   emitting `mdct_size(lm)` time-domain samples (the §4.3.7.1
   post-filter's input), with `reset()` for the §4.5.2 decoder reset.
   This is the residual-spectrum → time-domain PCM counterpart of the
-  `decode_residual_bands` band-loop spine. It handles the non-transient
-  (single long MDCT) case only — the transient short-block reassembly
-  (the per-short-block frequency-vector layout and inter-block
-  overlap-add) is delegated to the reference by §4.3.1 / §4.3.7 and
-  remains a documented docs gap, the same boundary the residual loop
-  keeps for the short-block geometry.
+  `decode_residual_bands` band-loop spine.
+  `synthesize_frame(residual, start, end, transient)` (r406) routes a
+  transient frame through the §4.3.1 short-block reassembly
+  (`MdctSynthesis::frame_short`) over the same shared overlap tail —
+  the placement is derived from the \[PRINCEN86\] boundary
+  cancellation (`short_block_geometry`), so long and transient frames
+  alternate freely on one state.
 * `StereoLongMdctSynthesis` — the two-channel counterpart: two
   independent per-channel `LongMdctSynthesis` spines, each with its own
   §4.3.7 overlap tail (there is no cross-channel state in the synthesis
@@ -1382,21 +1406,19 @@ End-to-end frame decode → PCM (RFC 6716 §4.3, Table 56 → §4.3.7):
   produces them is RFC-deferred (the same boundary `decode_residual_bands`
   and `bits_to_pulses_band_loop` keep). When that pass lands, the only
   change here is to compute these two vectors from the `FramePrefix`.
-* A `transient` or stereo frame is rejected with
-  `Error::NotImplemented` (the §4.3.1/§4.3.7 short-block reassembly and
-  the §4.3.4.4 stereo-angle gaps); a saturated codebook surfaces the
-  §4.3.4.4 split gap the same way. A `silence`-flagged frame decodes to
-  all-zero PCM.
+* A stereo frame is rejected with `Error::NotImplemented` by the mono
+  driver (use the stereo drivers); a saturated codebook surfaces the
+  §4.3.4.4 split gap the same way. A `silence`-flagged frame decodes
+  to all-zero PCM. Transient frames decode through the §4.3.1
+  short-block path (r406), including the §4.3.5 anti-collapse bit +
+  injection and the §4.3.2.2 finalize backfill.
 
-The §4.3.5 anti-collapse processing is a documented docs gap: the RFC
-§4.3.5 narrative describes the intent ("a pseudo-random signal is
-inserted with an energy corresponding to the minimum energy over the
-two previous frames; a renormalization step is then required") but
-gives no collapse-detection threshold, pseudo-random generator, or
-injection magnitude — those live in `bands.c::anti_collapse()`, outside
-the staged docs. Since `decode_celt_frame` only handles non-transient
-frames (where §4.3.5 does not even decode the anti-collapse bit), the
-gap does not block the mono long-MDCT path.
+The §4.3.5 anti-collapse pass is implemented (r406): the bit position,
+reservation gate, minimum-of-two-previous-frames injection energy, and
+renormalization property are the RFC prose; the collapse-detection
+criterion, LCG generator, and injection arithmetic are documented
+in-crate decoder decisions (module `anti_collapse`). Both decoder
+states carry the two-frame per-band energy history and the seed.
 
 The codec-registration entry points with the runtime still return
 `Error::NotImplemented`; the mono MDCT-domain frame encoder is
