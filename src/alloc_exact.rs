@@ -73,7 +73,7 @@ pub fn get_pulses(i: i32) -> i32 {
 /// **split-adjusted** frame shift in `-1..=3` (the Appendix A callers
 /// index row `lm + 1`). `None` on a sentinel row (never dereferenced
 /// by legal traffic) or out-of-range arguments.
-fn cache_row(band: usize, lm: i32) -> Option<&'static [u8]> {
+pub(crate) fn cache_row(band: usize, lm: i32) -> Option<&'static [u8]> {
     if band >= NUM_BANDS || !(-1..=3).contains(&lm) {
         return None;
     }

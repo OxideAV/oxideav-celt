@@ -350,6 +350,7 @@ pub mod band_decode;
 pub mod band_energy;
 pub mod band_layout;
 pub mod band_minimums;
+pub mod band_quant;
 pub mod band_split;
 pub mod bit_allocation;
 pub mod bits_to_pulses;

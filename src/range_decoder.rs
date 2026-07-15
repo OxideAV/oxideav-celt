@@ -369,7 +369,7 @@ impl<'a> RangeDecoder<'a> {
 
     /// `ec_decode(ft)` (RFC 6716 §4.1.2): compute the symbol-index
     /// proxy `fs = ft - min(val/(rng/ft) + 1, ft)`.
-    fn decode(&mut self, ft: u32) -> u32 {
+    pub(crate) fn decode(&mut self, ft: u32) -> u32 {
         // The spec phrases this with integer division. `rng/ft` is
         // computed first; the divisor is then `val / (rng/ft)`.
         // `rng/ft >= 1` because `rng > 2**23` and `ft <= 2**16` in
