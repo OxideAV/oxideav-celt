@@ -2,7 +2,26 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-07-10):** round-408. The **§4.3.3 reallocation
+//! **Status (2026-07-15):** round-414. **Reference-exact decode.**
+//! The RFC 6716 Appendix A reference listing (embedded in the staged
+//! RFC text, extracted per §A.1 and SHA-1-verified) pins the §4.3.3 /
+//! §4.3.4 arithmetic exactly, and three new modules transcribe it:
+//! [`alloc_exact`] (the exact allocation walk incl. the fine/shape
+//! split, skip predicate, and priority predicate), [`band_quant`]
+//! (the exact band loop incl. §4.3.4.4 splits with the coded split
+//! angle, folding, collapse masks, and the stereo paths), and
+//! [`ref_decode`] ([`ref_decode::CeltRefDecoder`] — the unified
+//! mono+stereo end-to-end frame decoder with the absolute `eMeans`
+//! energy scale, exact §4.3.5 anti-collapse, reference synthesis
+//! alignment, and the two-stage §4.3.7.1 comb filter). Real
+//! reference-encoded streams decode at the float-rounding floor:
+//! 90.4 / 87.6 dB SNR on the two staged fixtures (s16 comparison
+//! floor; 118 / 99 dB float-vs-float) and 132.9–137.0 dB float SNR
+//! across a black-box 2.5/5/10/20 ms × mono/stereo sweep. The
+//! in-crate encoder still writes the r408 walk's wire; moving it
+//! onto the exact modules is the next step.
+//!
+//! **Status (2026-07-10, earlier):** round-408. The **§4.3.3 reallocation
 //! walk** is implemented per the freshly staged behavioral chapter
 //! ([`realloc_walk`]): outer bisection over the Table-57 quality
 //! codepoints, 1/64 interpolation on the cap-clamped bracketing

@@ -6,6 +6,67 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**Reference-exact decode, r414.** Real reference-encoded CELT streams
+decode at the float-rounding floor. The RFC 6716 Appendix A reference
+listing — embedded in the staged RFC text itself and extracted per
+§A.1 (SHA-1-verified against the value §A.1 prints) — pins the three
+predicates the staged behavioral chapter's §10 could only bound, and
+three new modules transcribe it end to end:
+
+* `alloc_exact` — the exact §4.3.3 allocation walk: codepoint search,
+  1/64 interpolation, concurrent top-down skip decoding with the
+  exact candidate predicate (`band_bits >= max(thresh, alloc_floor +
+  8)`) and the boosted-band `skip_start` floor, intensity / dual
+  placement with the shrinking intensity reservation, the exact
+  fine/shape split (fair-share offset on `logN`, the second/third
+  fine-bit offset steps, divide-with-rounding, the bust guard, the
+  `MAX_FINE_BITS` cap), the exact priority-0/1 predicate, and the
+  balance — plus the §4.3.4.1 pseudo-pulse machinery (`get_pulses`,
+  nearest-cost `bits2pulses` with ties down, `pulses2bits`).
+* `band_quant` — the exact §4.3.4 band loop: per-band bit targets
+  `clamp(pulses[i] + balance/min(3, codedBands − i))` with the
+  tell-coupled running balance, the §4.3.4.4 split recursion with the
+  coded split angle (step / uniform / triangular PDFs, `compute_qn`,
+  `bitexact_cos` / `bitexact_log2tan` / `isqrt32` — all
+  integer-exact), the §4.3.4.5 Haar recombine/time transforms with
+  the `ordery` Hadamard reordering, the §4.3.4.3 spreading rotation,
+  spectral folding with the LCG noise fill and collapse masks, and
+  the stereo mid/side, intensity, inversion, and N = 2 special
+  paths — decode and encode directions.
+* `ref_decode` (`CeltRefDecoder`) — the unified mono + stereo
+  end-to-end frame decoder: every Table-56 budget gate at its exact
+  position (silence, post-filter, transient, intra, tf, spread,
+  dynalloc, trim, anti-collapse reservation), the absolute `eMeans`
+  energy scale (`bandE = 2^(bandLogE + eMeans)` — retiring the r408
+  empirical `+14.0` bridge and the LM 0 open item), the exact §4.3.5
+  anti-collapse over the two-frame energy history, the reference
+  synthesis alignment (the long basis emits its low-overlap window
+  support `[P, P + frame + overlap)`, `P = (frame − overlap)/2`, at
+  twice the §4.3.7 half-scale; interleaved short blocks at hop 120),
+  the two-stage §4.3.7.1 comb filter with the parameter pipeline, and
+  the §4.3.7.2 de-emphasis at the reference output scale (1/32768).
+
+**Measured** (runtime-gated black-box harnesses; validator binaries
+invoked as opaque processes only): the two staged reference-encoded
+fixtures decode at **90.4 dB / 87.6 dB SNR** against their staged
+reference decodes (the s16 comparison floor; **118 / 99 dB**
+float-vs-float), least-squares gain 1.000000; a generated sweep over
+2.5/5/10/20 ms × mono/stereo (tones, hard transients, near-silence,
+noise) measures **132.9–137.0 dB float SNR** on all eight combos
+(`tests/ref_decode_fixtures.rs`, `tests/blackbox_ref_decode.rs`).
+Symbol-level traces (allocation vectors, per-band bit targets, split
+angles, leaf pulse counts, collapse masks, balance) are bit-identical
+to an instrumented oracle built from the staged listing per §A.1.
+The dynalloc boost loop was corrected to the normative listing on the
+way (1/8-bit symbol-cost gate against the diminishing budget;
+channel-counting quanta width) — the §4.3.3 prose narration slips on
+both points. Remaining decode gaps: Hybrid windows (`start = 17`) and
+non-48 kHz operating points are not driven by the new decoder yet;
+the in-crate *encoder* still writes the r408 walk's wire (moving the
+auto encoders onto `alloc_exact`/`band_quant` — both already carry
+the encode direction — is the natural next step toward
+reference-compatible encode).
+
 **§4.3.3 reallocation walk + wire-interop energy convention, r408.**
 The full bit-allocation walk of RFC 6716 §4.3.3 is implemented per the
 staged clean-room behavioral chapter

@@ -4,6 +4,60 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-414 — reference-exact decode: real reference-encoded CELT
+  streams decode at the float-rounding floor.** The RFC 6716
+  Appendix A reference listing — embedded in the staged RFC text and
+  extracted per §A.1 (SHA-1-verified) — pins everything the staged
+  behavioral chapter's §10 had left to bit-exactness, and three new
+  modules transcribe it:
+  * `alloc_exact` — the exact §4.3.3 allocation walk (codepoint
+    search, 1/64 interpolation, concurrent skip with the exact
+    predicate and the boosted-band `skip_start` floor,
+    intensity/dual placement, the exact fine/shape split constants
+    and priority-0/1 predicate, balance), plus the §4.3.4.1
+    pseudo-pulse machinery (`get_pulses`, `bits2pulses` nearest-cost
+    inversion with ties down, `pulses2bits`) and the 48 kHz `logN`
+    table.
+  * `band_quant` — the exact §4.3.4 band loop: per-band bit targets
+    with the tell-coupled balance, the §4.3.4.4 split recursion with
+    the coded split angle (step/uniform/triangular PDFs,
+    `compute_qn`, `bitexact_cos`/`bitexact_log2tan`/`isqrt32`), the
+    §4.3.4.5 Haar recombine/time transforms with Hadamard
+    reordering, the §4.3.4.3 spreading rotation, spectral folding
+    with the LCG noise fill, the stereo mid/side, intensity, and
+    N = 2 special paths, and per-band collapse masks. Both decode
+    and encode directions.
+  * `ref_decode` (`CeltRefDecoder`) — the unified mono+stereo
+    end-to-end frame decoder with every Table-56 budget gate at its
+    exact position, the absolute `eMeans` energy scale, the exact
+    §4.3.5 anti-collapse, the reference synthesis alignment
+    (long-basis emission at `P = (frame - overlap)/2`, twice the
+    §4.3.7 half-scale), the two-stage §4.3.7.1 comb filter, and the
+    §4.3.7.2 de-emphasis at the reference output scale.
+
+  Measured (runtime-gated black-box tests): the two staged
+  reference-encoded fixtures decode at 90.4 / 87.6 dB SNR against
+  `expected.wav` (the s16 comparison floor; 118 / 99 dB
+  float-vs-float against the reference decode), least-squares gain
+  1.000000; a generated sweep across 2.5/5/10/20 ms × mono/stereo
+  measures 132.9–137.0 dB float SNR on all eight combos. Symbol
+  traces (allocation, per-band targets, split angles, leaf pulse
+  counts, collapse masks) are bit-identical to an instrumented
+  oracle built from the staged listing per §A.1. This retires the
+  r408 empirical `+14.0` energy bridge, the LM 0 band-dependent
+  offset open item, and the −3 dB shape-SNR allocator gap.
+
+### Fixed
+
+* **Round-414 — dynalloc band-boost loop corrected to the normative
+  listing** (in-crate wire change): the inner-loop budget gate scales
+  the symbol cost to 1/8 bits (`tell + (logp << 3)`) and compares
+  against the *diminishing* `total_bits`, and the per-band quanta
+  width counts both channels (`width = C·N`). `decode_band_boosts` /
+  `encode_band_boosts` take an explicit `channels` argument.
+
 ### Changed
 
 * **Round-408 — the §4.3.3 reallocation walk is wired into every
