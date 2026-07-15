@@ -188,6 +188,7 @@ pub fn encode_frame_prefix(
         enc,
         start as u32,
         end as u32,
+        channels as u32,
         &bins,
         &caps,
         frame_8th,

@@ -197,22 +197,28 @@ pub struct BoostResult {
 
 /// Decode the §4.3.3 band-boost loop.
 ///
-/// Implements the §4.3.3 prose at lines 6339–6360 literally:
+/// Implements the loop per the normative RFC 6716 Appendix A listing
+/// (`celt.c`, the decode-side dynalloc walk; the §4.3.3 prose at
+/// lines 6339–6360 narrates the same loop with two slips the listing
+/// resolves — the inner-loop budget comparison is against the
+/// *diminishing* `total_bits` with the symbol cost scaled to 1/8
+/// bits, and the quanta width counts both channels):
 ///
 /// 1. Initialise `dynalloc_logp = 6` (the 6-bit / `p = 1/64`
 ///    starting cost for a boost), `total_bits` from the caller, and
 ///    `total_boost = 0`.
 /// 2. For each band `b` in `start..end`:
-///    * `quanta = min(8*N, max(48, N))` — a 6-bit step size, floored
-///      at 1/8 bit/sample and capped at 1 bit/sample.
+///    * `width = channels * N[b]`,
+///      `quanta = min(8*width, max(48, width))` — a 6-bit step size,
+///      floored at 1/8 bit/sample and capped at 1 bit/sample.
 ///    * `boost = 0`, `dynalloc_loop_logp = dynalloc_logp`.
-///    * While `tell + dynalloc_loop_logp < total_bits + total_boost`
+///    * While `tell + (dynalloc_loop_logp << 3) < total_bits`
 ///      AND `boost < cap[b]`: decode one bit with cost
 ///      `dynalloc_loop_logp` ([`RangeDecoder::dec_bit_logp`]),
 ///      update `tell` (via `tell_frac`). On `0` break the inner
-///      loop. On `1`, add `quanta` to `boost`, add `quanta` to
-///      `total_boost`, subtract `quanta` from `total_bits`, and
-///      set `dynalloc_loop_logp = 1`.
+///      loop. On `1`, add `quanta` to `boost` and `total_boost`,
+///      subtract `quanta` from `total_bits`, and set
+///      `dynalloc_loop_logp = 1`.
 ///    * After the inner loop: if `boost != 0` and `dynalloc_logp > 2`,
 ///      decrement `dynalloc_logp`.
 ///
@@ -221,6 +227,7 @@ pub struct BoostResult {
 /// * `dec` — range decoder, advanced by every emitted boost bit.
 /// * `start` / `end` — `start <= end <= 21`; the band range covered
 ///   by this frame. `end - start` boost values are produced.
+/// * `channels` — 1 or 2; folded into the per-band quanta width.
 /// * `bins_per_band` — `N[b]` (MDCT bins for one channel) for
 ///   `b ∈ start..end`. Must have length `end - start`.
 /// * `caps` — `cap[b]` (output of [`compute_band_caps`]) for
@@ -242,10 +249,14 @@ pub fn decode_band_boosts(
     dec: &mut RangeDecoder<'_>,
     start: u32,
     end: u32,
+    channels: u32,
     bins_per_band: &[u32],
     caps: &[i16],
     total_bits: i32,
 ) -> Option<BoostResult> {
+    if !(1..=2).contains(&channels) {
+        return None;
+    }
     if start > end || end > NUM_BANDS as u32 {
         return None;
     }
@@ -261,19 +272,21 @@ pub fn decode_band_boosts(
     let mut dynalloc_logp: u32 = 6;
 
     for (idx, (&n, &cap_b)) in bins_per_band.iter().zip(caps.iter()).enumerate() {
-        // RFC §4.3.3 line 6345: quanta = min(8*N, max(48, N)) — 6-bit
-        // step floored at 1/8 bit/sample, capped at 1 bit/sample.
-        let n_i32 = n as i32;
-        let quanta = (8 * n_i32).min(n_i32.max(48));
+        // Appendix A: width = C*N (both channels); quanta =
+        // min(8*width, max(48, width)) — 6-bit step floored at
+        // 1/8 bit/sample, capped at 1 bit/sample.
+        let width = (channels * n) as i32;
+        let quanta = (8 * width).min(width.max(48));
         let mut band_boost: i32 = 0;
         let mut dynalloc_loop_logp = dynalloc_logp;
 
         loop {
             // tell() in 1/8 bits comes from ec_tell_frac (§4.1.6.2).
             let tell = dec.tell_frac() as i32;
-            // §4.3.3 loop guard: dynalloc_loop_logp + tell < total_bits +
-            // total_boost AND boost < cap[band].
-            if tell + dynalloc_loop_logp as i32 >= total_bits + total_boost {
+            // Appendix A loop guard: tell + (logp << 3) < total_bits
+            // (which diminishes by quanta per boost) AND
+            // boost < cap[band].
+            if tell + ((dynalloc_loop_logp as i32) << 3) >= total_bits {
                 break;
             }
             if band_boost >= cap_b as i32 {
@@ -339,16 +352,18 @@ pub fn decode_band_boosts(
 ///
 /// Returns [`Error::InvalidParameter`] on inconsistent slice lengths /
 /// band window, or propagates a [`RangeEncoder`] rejection.
+#[allow(clippy::too_many_arguments)] // mirrors the §4.3.3 loop inputs
 pub fn encode_band_boosts(
     enc: &mut RangeEncoder,
     start: u32,
     end: u32,
+    channels: u32,
     bins_per_band: &[u32],
     caps: &[i16],
     total_bits: i32,
     target_boost: &[i32],
 ) -> Result<BoostResult, Error> {
-    if start > end || end > NUM_BANDS as u32 {
+    if start > end || end > NUM_BANDS as u32 || !(1..=2).contains(&channels) {
         return Err(Error::InvalidParameter);
     }
     let coded_bands = (end - start) as usize;
@@ -370,8 +385,8 @@ pub fn encode_band_boosts(
         .zip(target_boost.iter())
         .enumerate()
     {
-        let n_i32 = n as i32;
-        let quanta = (8 * n_i32).min(n_i32.max(48));
+        let width = (channels * n) as i32;
+        let quanta = (8 * width).min(width.max(48));
         // Floor the request to a whole number of quanta (the §4.3.3
         // boost step is quantized); a negative request is zero.
         let mut want_steps = if quanta > 0 { want.max(0) / quanta } else { 0 };
@@ -383,7 +398,7 @@ pub fn encode_band_boosts(
             // Same gates as the decode loop: when either closes, the
             // decoder stops without reading, so the encoder stops
             // without writing.
-            if tell + dynalloc_loop_logp as i32 >= total_bits + total_boost {
+            if tell + ((dynalloc_loop_logp as i32) << 3) >= total_bits {
                 break;
             }
             if band_boost >= cap_b as i32 {
@@ -444,14 +459,15 @@ mod tests {
         for target in targets {
             let mut enc = RangeEncoder::new();
             let enc_result =
-                encode_band_boosts(&mut enc, 0, 6, &bins, &caps, total_bits, target).unwrap();
+                encode_band_boosts(&mut enc, 0, 6, 1, &bins, &caps, total_bits, target).unwrap();
             let mut frame = enc.finish();
             // Pad so the decoder's tell_frac gates see the same running
             // budget arithmetic (the gates only use tell_frac, which is
             // frame-length independent, but keep the frame non-empty).
             frame.resize(frame.len().max(8), 0);
             let mut dec = RangeDecoder::new(&frame);
-            let dec_result = decode_band_boosts(&mut dec, 0, 6, &bins, &caps, total_bits).unwrap();
+            let dec_result =
+                decode_band_boosts(&mut dec, 0, 6, 1, &bins, &caps, total_bits).unwrap();
             assert_eq!(dec_result, enc_result, "target {target:?}");
             assert!(!dec.has_error());
         }
@@ -467,13 +483,13 @@ mod tests {
         // quanta = min(64, max(48, 8)) = 48 for every band.
         let target = [48i32, 96, 48];
         let mut enc = RangeEncoder::new();
-        let result = encode_band_boosts(&mut enc, 0, 3, &bins, &caps, 8000, &target).unwrap();
+        let result = encode_band_boosts(&mut enc, 0, 3, 1, &bins, &caps, 8000, &target).unwrap();
         assert_eq!(result.boost, target.to_vec());
         assert_eq!(result.total_boost, 192);
         // Non-multiple targets floor to the quanta grid.
         let mut enc2 = RangeEncoder::new();
         let result2 =
-            encode_band_boosts(&mut enc2, 0, 3, &bins, &caps, 8000, &[50, 47, -3]).unwrap();
+            encode_band_boosts(&mut enc2, 0, 3, 1, &bins, &caps, 8000, &[50, 47, -3]).unwrap();
         assert_eq!(result2.boost, vec![48, 0, 0]);
     }
 
@@ -487,7 +503,7 @@ mod tests {
         assert!(compute_band_caps(0, false, 1, &bins, &mut caps));
         let mut enc = RangeEncoder::new();
         let tell_before = enc.tell_frac();
-        let result = encode_band_boosts(&mut enc, 0, 2, &bins, &caps, 0, &[48, 48]).unwrap();
+        let result = encode_band_boosts(&mut enc, 0, 2, 1, &bins, &caps, 0, &[48, 48]).unwrap();
         assert_eq!(result.boost, vec![0, 0]);
         assert_eq!(result.total_boost, 0);
         assert_eq!(
@@ -505,12 +521,12 @@ mod tests {
         let caps = [100i16; 3];
         // target length mismatch.
         assert_eq!(
-            encode_band_boosts(&mut enc, 0, 3, &bins, &caps, 1000, &[0, 0]),
+            encode_band_boosts(&mut enc, 0, 3, 1, &bins, &caps, 1000, &[0, 0]),
             Err(Error::InvalidParameter)
         );
         // band window out of range.
         assert_eq!(
-            encode_band_boosts(&mut enc, 0, 22, &bins, &caps, 1000, &[0, 0, 0]),
+            encode_band_boosts(&mut enc, 0, 22, 1, &bins, &caps, 1000, &[0, 0, 0]),
             Err(Error::InvalidParameter)
         );
     }
@@ -613,7 +629,7 @@ mod tests {
         // dynalloc_logp = 6 the guard fails at total_bits <= 14.
         let bins = [4u32; 21];
         let caps = [100i16; 21];
-        let result = decode_band_boosts(&mut dec, 0, 21, &bins, &caps, 8).expect("decoder ok");
+        let result = decode_band_boosts(&mut dec, 0, 21, 1, &bins, &caps, 8).expect("decoder ok");
         assert_eq!(result.boost, vec![0i32; 21]);
         assert_eq!(result.total_boost, 0);
         assert_eq!(result.total_bits_remaining, 8);
@@ -631,7 +647,8 @@ mod tests {
         // Generous budget so the loop guard never fires.
         let bins = [8u32; 21];
         let caps = [200i16; 21];
-        let result = decode_band_boosts(&mut dec, 0, 21, &bins, &caps, 4096).expect("decoder ok");
+        let result =
+            decode_band_boosts(&mut dec, 0, 21, 1, &bins, &caps, 4096).expect("decoder ok");
         // At least one boost should have landed somewhere.
         let nonzero = result.boost.iter().filter(|&&b| b > 0).count();
         assert!(
@@ -660,7 +677,7 @@ mod tests {
         let mut dec = RangeDecoder::new(&buf);
         let bins = [8u32]; // single band, quanta = 48
         let caps = [48i16]; // cap exactly one quanta
-        let result = decode_band_boosts(&mut dec, 0, 1, &bins, &caps, 4096).expect("decoder ok");
+        let result = decode_band_boosts(&mut dec, 0, 1, 1, &bins, &caps, 4096).expect("decoder ok");
         // Boost is bounded by cap; with cap = quanta = 48, at most
         // one accepted boost iteration: band_boost == 0 or 48, never
         // 96. (After one accept band_boost = 48 = cap, the
@@ -681,14 +698,14 @@ mod tests {
         // bins length != end - start.
         let bins = [8u32, 8];
         let caps = [100i16];
-        assert!(decode_band_boosts(&mut dec, 0, 1, &bins, &caps, 1000).is_none());
+        assert!(decode_band_boosts(&mut dec, 0, 1, 1, &bins, &caps, 1000).is_none());
         // start > end.
         let bins_ok = [8u32];
-        assert!(decode_band_boosts(&mut dec, 5, 3, &bins_ok, &caps, 1000).is_none());
+        assert!(decode_band_boosts(&mut dec, 5, 3, 1, &bins_ok, &caps, 1000).is_none());
         // end > NUM_BANDS.
         let bins_big = [8u32; 22];
         let caps_big = [100i16; 22];
-        assert!(decode_band_boosts(&mut dec, 0, 22, &bins_big, &caps_big, 1000).is_none());
+        assert!(decode_band_boosts(&mut dec, 0, 22, 1, &bins_big, &caps_big, 1000).is_none());
     }
 
     /// Quanta computation per §4.3.3 line 6345: `min(8*N, max(48, N))`.
@@ -712,7 +729,8 @@ mod tests {
         let caps = [10_000i16; 7];
         let expected_q = [8, 32, 48, 48, 48, 48, 64];
         let mut dec = RangeDecoder::new(&buf);
-        let result = decode_band_boosts(&mut dec, 0, 7, &bins, &caps, 16_384).expect("decoder ok");
+        let result =
+            decode_band_boosts(&mut dec, 0, 7, 1, &bins, &caps, 16_384).expect("decoder ok");
         for (b, (&boost_v, &q)) in result.boost.iter().zip(expected_q.iter()).enumerate() {
             assert_eq!(
                 boost_v % q,

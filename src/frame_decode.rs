@@ -231,8 +231,16 @@ pub fn decode_frame_prefix(
     // after the trim). The loop reads from the decoder.
     let frame_8th =
         i32::try_from(u64::from(frame_bytes) * u64::from(BITS_TO_8TH) * 8).unwrap_or(i32::MAX);
-    let boosts = decode_band_boosts(dec, start as u32, end as u32, &bins, &caps, frame_8th)
-        .ok_or(Error::InvalidParameter)?;
+    let boosts = decode_band_boosts(
+        dec,
+        start as u32,
+        end as u32,
+        channels as u32,
+        &bins,
+        &caps,
+        frame_8th,
+    )
+    .ok_or(Error::InvalidParameter)?;
 
     // Table 56 step 6: alloc. trim (§4.3.3 / §2.4). Gate:
     // ec_tell_frac() + 48 <= frame size in 1/8 bits - total_boost.

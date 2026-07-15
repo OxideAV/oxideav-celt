@@ -340,6 +340,7 @@
 use oxideav_core::RuntimeContext;
 
 pub mod alloc_combine;
+pub mod alloc_exact;
 pub mod allocation_budget;
 pub mod analysis;
 pub mod anti_collapse;
