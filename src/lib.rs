@@ -376,6 +376,7 @@ pub mod pvq;
 pub mod range_decoder;
 pub mod range_encoder;
 pub mod realloc_walk;
+pub mod ref_decode;
 pub mod residual;
 pub mod spread;
 pub mod spread_rotation;

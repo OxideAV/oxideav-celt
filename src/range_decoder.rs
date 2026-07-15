@@ -367,6 +367,13 @@ impl<'a> RangeDecoder<'a> {
 
     // ----- internal helpers -----
 
+    /// The current range size (`rng`). The reference decoder exports
+    /// this as the per-frame seed of the §4.3.5 noise generator
+    /// (`st->rng = dec->rng` at frame end).
+    pub(crate) fn range_state(&self) -> u32 {
+        self.rng
+    }
+
     /// `ec_decode(ft)` (RFC 6716 §4.1.2): compute the symbol-index
     /// proxy `fs = ft - min(val/(rng/ft) + 1, ft)`.
     pub(crate) fn decode(&mut self, ft: u32) -> u32 {

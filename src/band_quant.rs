@@ -43,10 +43,11 @@ pub fn celt_lcg_rand(seed: u32) -> u32 {
     seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223)
 }
 
-/// `FRAC_MUL16` (Appendix A): `(a * b) >> 15` on 16-bit operands.
+/// `FRAC_MUL16` (Appendix A `mathops.h`): rounded Q15 product on
+/// 16-bit-truncated operands — `(16384 + (i16)a * (i16)b) >> 15`.
 #[inline]
 fn frac_mul16(a: i32, b: i32) -> i32 {
-    (a * b) >> 15
+    (16384 + (a as i16 as i32) * (b as i16 as i32)) >> 15
 }
 
 /// The bit-exact cosine approximation the split-angle mid/side gains
@@ -1339,9 +1340,13 @@ mod tests {
     fn integer_helpers() {
         assert_eq!(celt_lcg_rand(0), 1_013_904_223);
         assert_eq!(celt_lcg_rand(1_013_904_223), 1_196_435_762);
-        // bitexact_cos endpoints: cos(0) = 32767 + 1, cos(pi/2) ~ 1.
+        // bitexact_cos endpoints: cos(0) = 32767 + 1; the split code
+        // only evaluates interior angles (0 and 16384 take the
+        // special-cased mid/side constants), so probe the interior.
         assert_eq!(bitexact_cos(0), 32768);
-        assert!(bitexact_cos(16384) <= 2);
+        assert!(bitexact_cos(16383) <= 32);
+        let mid = bitexact_cos(8192) as f64 / 32768.0;
+        assert!((mid - (core::f64::consts::PI / 4.0).cos()).abs() < 0.01);
         // isqrt32 is floor(sqrt(x)) over a sweep.
         for v in [0u32, 1, 2, 3, 4, 8, 15, 16, 17, 999, 1_000_000, u32::MAX] {
             let g = isqrt32(v);
