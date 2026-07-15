@@ -141,6 +141,7 @@ pub fn wav_pcm_f32(bytes: &[u8]) -> Vec<f32> {
 }
 
 /// Write a mono/stereo s16 WAV at 48 kHz.
+#[allow(dead_code)] // used by the sweep test binary only
 pub fn write_wav_s16(path: &std::path::Path, channels: u16, samples: &[i16]) {
     let data_len = samples.len() * 2;
     let mut out = Vec::with_capacity(44 + data_len);
