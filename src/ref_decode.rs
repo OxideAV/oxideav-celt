@@ -39,6 +39,8 @@ use crate::Error;
 /// `docs/audio/opus/tables/e-means.csv` in Q4 — these are the Q4
 /// values divided by 16). Only the first 21 entries apply to the
 /// 48 kHz mode.
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const E_MEANS: [f32; NUM_BANDS] = [
     6.437_5, 6.25, 5.75, 5.312_5, 5.062_5, 4.812_5, 4.5, 4.375, 4.875, 4.687_5, 4.562_5, 4.437_5,
     4.875, 4.625, 4.312_5, 4.5, 4.375, 4.625, 4.75, 4.437_5, 3.75,
@@ -53,10 +55,14 @@ const COMB_GAINS: [[f32; 3]; 3] = [
 ];
 
 /// §4.3.7.1 minimum pitch period (`COMBFILTER_MINPERIOD`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const COMBFILTER_MINPERIOD: usize = 15;
 
 /// Maximum §4.3.7.1 pitch period the history must cover
 /// (`MAX_PERIOD`).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub const MAX_PERIOD: usize = 1024;
 
 /// The §4.3.7 overlap length (fixed 120 for the 48 kHz mode).
@@ -235,6 +241,8 @@ pub struct CeltRefDecoder {
     channels: usize,
     /// §4.3.2.1 inter-frame energy prediction (`oldBandE`) — carries
     /// the fine/finalize-corrected values per the reference.
+    // internal — exposed for tests/fuzz; not part of the stable API
+    #[doc(hidden)]
     pub coarse: CoarseEnergyState,
     old_log_e: [[f32; NUM_BANDS]; 2],
     old_log_e2: [[f32; NUM_BANDS]; 2],

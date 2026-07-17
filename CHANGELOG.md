@@ -4,6 +4,15 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+* Marked the internal §4.3 band/allocation/PVQ chain and the
+  reference-exact decoder plumbing `#[doc(hidden)]` (attributes only;
+  no signature or visibility changes). The stable surface is the
+  `ref_decode::CeltRefDecoder` decode entry point, the `Error` type,
+  and `register`; everything else is exposed only for tests/fuzz and
+  no longer counted as public API by cargo-semver-checks.
+
 ### Added
 
 * **Round-414 — reference-exact decode: real reference-encoded CELT
