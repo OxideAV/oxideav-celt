@@ -432,6 +432,15 @@ impl RangeEncoder {
         }
     }
 
+    /// The current range size (`rng`). Mirrors the decoder's
+    /// [`crate::range_decoder::RangeDecoder::range_state`]: after the
+    /// same symbols both coders hold the same `rng`, so the encoder
+    /// can carry the identical per-frame §4.3.5 noise seed the
+    /// decoder derives at frame end.
+    pub(crate) fn range_state(&self) -> u32 {
+        self.rng
+    }
+
     /// Current whole-bit budget produced so far (RFC 6716 §5.1.6,
     /// `ec_tell`).
     ///

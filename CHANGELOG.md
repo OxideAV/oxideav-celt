@@ -4,6 +4,45 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-417 — reference-compatible encoder arc**
+  (`ref_encode::CeltRefEncoder`): the full Table-56 walk in the
+  encode direction, mirroring every budget gate of the
+  reference-exact decoder — silence flag, post-filter gate,
+  transient flag, §5.3.3 two-pass intra/inter selection, §4.3.2.1
+  coarse-energy encode on the absolute `eMeans` scale, the gated
+  §4.3.4.5 tf walk, spread, §5.3.4.1 dynalloc band boosts
+  (contrast rule `D_j = 2E_j − E_{j−1} − E_{j+1}` at the per-LM
+  thresholds), the §5.3.4.2 tilt/stereo-correlation trim, the
+  anti-collapse reservation, the exact §4.3.3 allocation walk in
+  its encode direction (skip hysteresis on the previous frame's
+  `coded_bands`, intensity/dual placement), fine energy,
+  the exact §4.3.4 band loop (PVQ search + encode with
+  resynthesis, mid/side stereo), and the §4.3.2.2 finalize
+  backfill — assembled to a fixed frame size via the §5.1.5
+  merge. The analysis front end is the exact adjoint of the
+  decoder's synthesis alignment (§4.3.7.2 pre-emphasis at the
+  reference signal scale; long-basis window support
+  `[P, P + frame + overlap)` at half the §4.3.7 forward-companion
+  scale; `2^LM` interleaved short blocks at hop 120 on transient
+  frames; 120 samples of algorithmic delay), with the unquantized
+  analysis→synthesis identity measured at 143–150 dB across every
+  LM and both frame kinds. Measured (runtime-gated black-box
+  harness `tests/ref_encode_interop.rs` against a decoder and an
+  encoder built from the §A.1-extracted listing): every emitted
+  stream decodes **identically** on the crate's decoder and the
+  §A.1 listing decoder across 2.5/5/10/20 ms × mono/stereo
+  (cross-decoder float SNR 99.4–133.0 dB — the measured numerical
+  floor of the decoder pair itself, max per-sample diff ≤ 1.1e-5),
+  and a rate sweep at 40/80/160 B/frame measures decode quality
+  within −3.5 dB of the §A.1 listing encoder at high rates while
+  **beating it at the low end** (e.g. 20 ms mono 40 B: 21.3 dB vs
+  14.4 dB; 10 ms mono 40 B: 25.5 dB vs 21.4 dB). In-crate gates:
+  every-LM mono+stereo encode→decode round trips through
+  `CeltRefDecoder`, byte determinism, silence-frame runs, and
+  long/short boundary crossings.
+
 ### Changed
 
 * Marked the internal §4.3 band/allocation/PVQ chain and the

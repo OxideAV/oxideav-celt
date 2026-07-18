@@ -434,6 +434,7 @@ pub mod range_encoder;
 #[doc(hidden)]
 pub mod realloc_walk;
 pub mod ref_decode;
+pub mod ref_encode;
 #[doc(hidden)]
 pub mod residual;
 #[doc(hidden)]
