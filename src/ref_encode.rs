@@ -40,7 +40,7 @@ use crate::alloc_exact::{compute_allocation_exact, AllocIo, BITRES, MAX_FINE_BIT
 use crate::band_cap::{compute_band_caps, encode_band_boosts};
 use crate::band_layout::EBAND_EDGES_5MS;
 use crate::band_minimums::BAND_BINS_LM;
-use crate::band_quant::{quant_all_bands, BandAmps, QuantIo};
+use crate::band_quant::{haar1, quant_all_bands, BandAmps, QuantIo};
 use crate::bit_allocation::encode_alloc_trim;
 use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, NUM_BANDS};
 use crate::encoder_decisions::{
@@ -75,11 +75,14 @@ const TARGET_FLOOR: f32 = -28.0;
 const SILENCE_THRESHOLD: f32 = -27.5;
 
 /// The §4.3.4.5 tf-parameter encode — the exact mirror of the
-/// decoder's gated walk (per-band toggle bits under the running budget
-/// gate, then the gated `tf_select` bit). This encoder currently
-/// always chooses the identity TF resolution (a legal per-§5.3 choice:
-/// every toggle codes the high-probability `0`); the mirror still
-/// walks every gate so the coder state stays in lockstep.
+/// decoder's gated walk: one differential toggle bit per band under
+/// the running budget gate, then the gated `tf_select` bit. `desired`
+/// carries the per-band choices from [`choose_tf_resolution`]; a band
+/// whose toggle the budget gate closes keeps the running value,
+/// exactly as the decoder will reconstruct it. `tf_select` stays 0 (a
+/// legal §5.3 choice; the bit is written whenever the decoder's gate
+/// would read it).
+#[allow(clippy::too_many_arguments)]
 fn tf_encode(
     enc: &mut RangeEncoder,
     start: usize,
@@ -87,6 +90,7 @@ fn tf_encode(
     is_transient: bool,
     lm: u32,
     total_bits: u32,
+    desired: &[bool; NUM_BANDS],
     tf_res: &mut [i32; NUM_BANDS],
 ) -> Result<(), Error> {
     let mut tell = enc.tell();
@@ -95,15 +99,17 @@ fn tf_encode(
     let tf_select_rsv = u32::from(lm > 0 && tell + logp + 1 <= total_bits);
     let budget = total_bits - tf_select_rsv;
     let mut tf_changed = false;
-    let curr = false;
-    for _ in start..end {
+    let mut curr = false;
+    let mut raw = [false; NUM_BANDS];
+    for (i, r) in raw.iter_mut().enumerate().take(end).skip(start) {
         if tell + logp <= budget {
-            // Toggle bit: 0 keeps the running choice (always, for the
-            // identity decision).
-            enc.enc_bit_logp(0, logp)?;
+            let toggle = desired[i] != curr;
+            enc.enc_bit_logp(u32::from(toggle), logp)?;
+            curr ^= toggle;
             tell = enc.tell();
             tf_changed |= curr;
         }
+        *r = curr;
         logp = if is_transient { 4 } else { 5 };
     }
     let tf_select = 0u8;
@@ -113,10 +119,76 @@ fn tf_encode(
     {
         enc.enc_bit_logp(u32::from(tf_select), 1)?;
     }
-    for r in tf_res.iter_mut().take(end).skip(start) {
-        *r = tf_adjustment(is_transient, tf_select, lm as u8, curr) as i32;
+    for i in start..end {
+        tf_res[i] = tf_adjustment(is_transient, tf_select, lm as u8, raw[i]) as i32;
     }
     Ok(())
+}
+
+/// L1 compaction of one band's unit-norm shape after the §4.3.4.5
+/// TF transform the band walk would apply for `tf_change` (the
+/// level-0 mono recombine / time-split ladder of the §4.3.4 loop).
+/// A lower L1 at fixed L2 means a sparser vector — cheaper for the
+/// PVQ codebook at equal quality.
+fn tf_l1_metric(band: &[f32], b_frame: usize, tf_change: i32) -> f32 {
+    let mut v = band.to_vec();
+    let n = v.len();
+    let mut b_blocks = b_frame;
+    let mut n_b = n / b_blocks.max(1);
+    let mut tf = tf_change;
+    let recombine = tf.max(0).min(b_blocks.trailing_zeros() as i32);
+    for k in 0..recombine {
+        haar1(&mut v, n >> k, 1 << k);
+    }
+    b_blocks >>= recombine;
+    n_b <<= recombine;
+    while (n_b & 1) == 0 && tf < 0 {
+        haar1(&mut v, n_b, b_blocks);
+        b_blocks <<= 1;
+        n_b >>= 1;
+        tf += 1;
+    }
+    v.iter().map(|a| a.abs()).sum()
+}
+
+/// Per-band §4.3.4.5 TF-resolution decision (encoder freedom; the RFC
+/// leaves the criterion to the encoder): on a **transient** frame,
+/// toggle a band (keep it at short-block resolution instead of the
+/// Table-62 default full recombine) when the short-resolution shape is
+/// markedly sparser in L1 — a band whose energy is concentrated in one
+/// short block codes far better untangled. Non-transient frames keep
+/// the identity resolution: an A/B sweep against the §A.1 listing
+/// encoder measured the L1 proxy as a small net loss for the long-MDCT
+/// time-split candidates on tonal material (a rate-distortion lambda
+/// would be needed to price those toggles; recorded as a follow-up),
+/// while the transient-frame decision is a clear win on onsets.
+fn choose_tf_resolution(
+    x: &[f32],
+    m: usize,
+    is_transient: bool,
+    lm: u32,
+    start: usize,
+    end: usize,
+) -> [bool; NUM_BANDS] {
+    const MARGIN: f32 = 0.85;
+    let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
+    let b_frame = if is_transient { m } else { 1 };
+    let adj0 = tf_adjustment(is_transient, 0, lm as u8, false) as i32;
+    let adj1 = tf_adjustment(is_transient, 0, lm as u8, true) as i32;
+    let mut out = [false; NUM_BANDS];
+    if !is_transient || adj0 == adj1 {
+        return out;
+    }
+    for i in start..end {
+        let band = &x[m * eb(i)..m * eb(i + 1)];
+        if band.len() < 2 {
+            continue;
+        }
+        let l1_keep = tf_l1_metric(band, b_frame, adj0);
+        let l1_toggle = tf_l1_metric(band, b_frame, adj1);
+        out[i] = l1_toggle < MARGIN * l1_keep;
+    }
+    out
 }
 
 /// Transient detector (encoder freedom, RFC 6716 §5.3.2 leaves the
@@ -384,7 +456,16 @@ impl CeltRefEncoder {
                 total_bits,
             )?;
 
-            // ── Time-frequency parameters (identity choice) ──
+            // ── Time-frequency parameters (per-band L1 decision) ──
+            let mut tf_desired = choose_tf_resolution(&x, m, is_transient, lm, start, end);
+            if channels == 2 {
+                let tf_y = choose_tf_resolution(&y, m, is_transient, lm, start, end);
+                // One tf vector covers both channels (Table 56 codes
+                // one walk per frame): only toggle when both agree.
+                for (d, ty) in tf_desired.iter_mut().zip(tf_y.iter()) {
+                    *d &= *ty;
+                }
+            }
             let mut tf_res = [0i32; NUM_BANDS];
             tf_encode(
                 &mut enc,
@@ -393,6 +474,7 @@ impl CeltRefEncoder {
                 is_transient,
                 lm,
                 total_bits,
+                &tf_desired,
                 &mut tf_res,
             )?;
 
@@ -668,6 +750,73 @@ mod tests {
                 "lm={lm} C={channels} {bytes}B: SNR {snr:.2} dB too low"
             );
         }
+    }
+
+    /// Tiny and odd byte budgets exercise every Table-56 budget gate
+    /// (post-filter, transient, intra, coarse fallbacks, tf, spread,
+    /// boosts, trim, reservations, skip floor) and the §5.1.5
+    /// fixed-size assembly: every frame in `2..=1275` territory must
+    /// encode to exactly the requested size and decode finite.
+    #[test]
+    fn tiny_and_odd_byte_budgets_roundtrip() {
+        let budgets = [
+            2usize, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 30, 47, 60, 120, 239, 1275,
+        ];
+        for lm in 0u32..=3 {
+            let frame = 120usize << lm;
+            for channels in 1usize..=2 {
+                let pcm = tone(frame, channels, 2, 0.4);
+                for &bytes in &budgets {
+                    let mut enc = CeltRefEncoder::new(lm, channels).expect("encoder");
+                    let mut dec = CeltRefDecoder::new(lm, channels).expect("decoder");
+                    for f in 0..2 {
+                        let chunk = &pcm[f * frame * channels..(f + 1) * frame * channels];
+                        let b = enc
+                            .encode_frame(chunk, bytes)
+                            .unwrap_or_else(|e| panic!("lm={lm} C={channels} {bytes}B: {e}"));
+                        assert_eq!(b.len(), bytes);
+                        let out = dec
+                            .decode_frame(&b)
+                            .unwrap_or_else(|e| panic!("lm={lm} C={channels} {bytes}B: {e}"));
+                        assert!(
+                            out.iter().all(|v| v.is_finite()),
+                            "non-finite at lm={lm} C={channels} {bytes}B"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The transient-frame TF decision toggles a band whose energy is
+    /// concentrated in a single short block (sparser at short
+    /// resolution than after the Table-62 default recombine) and
+    /// leaves a block-uniform band alone; non-transient frames always
+    /// keep the identity resolution.
+    #[test]
+    fn tf_decision_prefers_short_resolution_for_concentrated_bands() {
+        let lm = 2u32;
+        let m = 1usize << lm;
+        let n_coded = m * EBAND_EDGES_5MS[NUM_BANDS] as usize;
+        let mut x = vec![0f32; n_coded];
+        // Band 13 spans 4 base bins (16 coefficients at LM 2). In the
+        // interleaved transient layout, coefficient `b + j*m` belongs
+        // to short block `b`: concentrate all energy in block 0.
+        let eb13 = m * EBAND_EDGES_5MS[13] as usize;
+        let eb14 = m * EBAND_EDGES_5MS[14] as usize;
+        for j in 0..(eb14 - eb13) / m {
+            x[eb13 + j * m] = 0.5;
+        }
+        // Band 14: spread evenly across all four blocks.
+        let eb15 = m * EBAND_EDGES_5MS[15] as usize;
+        for (k, v) in x[eb14..eb15].iter_mut().enumerate() {
+            *v = if k % 2 == 0 { 0.25 } else { -0.25 };
+        }
+        let choice = choose_tf_resolution(&x, m, true, lm, 0, NUM_BANDS);
+        assert!(choice[13], "block-concentrated band should stay short");
+        assert!(!choice[14], "block-uniform band should recombine");
+        let long_choice = choose_tf_resolution(&x, m, false, lm, 0, NUM_BANDS);
+        assert!(long_choice.iter().all(|&b| !b), "long frames stay identity");
     }
 
     /// Determinism: the same input yields byte-identical frames.

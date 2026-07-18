@@ -6,6 +6,24 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-417 — §4.3.4.5 per-band TF machinery + transient TF
+  decision, and the byte-budget gate sweep**: `tf_encode` now codes
+  arbitrary per-band TF toggles (differential bits under the exact
+  decode-mirror budget gates; a gate-closed band keeps the running
+  value exactly as the decoder reconstructs it), and
+  `choose_tf_resolution` picks them: on **transient** frames a band
+  stays at short-block resolution instead of the Table-62 default
+  recombine when its short-resolution shape is markedly sparser in
+  L1 (a concentrated onset codes better untangled). Non-transient
+  frames keep the identity resolution — an A/B sweep measured the
+  plain L1 proxy as a small net loss for the long-MDCT time-split
+  candidates on tonal material (pricing those needs a
+  rate-distortion lambda; follow-up). New regression test
+  `tiny_and_odd_byte_budgets_roundtrip` drives every Table-56
+  budget gate: frame budgets from 2 bytes up encode to exactly the
+  requested size and decode finite at every LM × channels (a
+  2..=1275 sweep over all combos measured zero failures).
+
 * **Round-417 — §5.3.5 stereo coding decisions in the reference
   encoder**: the encode-side allocation walk now signals the
   Table-66 bitrate-threshold **intensity** start band and the L1
