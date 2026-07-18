@@ -6,6 +6,18 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-417 — §5.3.5 stereo coding decisions in the reference
+  encoder**: the encode-side allocation walk now signals the
+  Table-66 bitrate-threshold **intensity** start band and the L1
+  mid/side-vs-dual **dual-stereo** verdict (both §5.3.5; previously
+  pinned to full-band mid/side). The exact §4.3.4 band loop already
+  carried both wire paths, so the change is decision wiring only.
+  Measured on the oracle rate sweep: stereo decode quality improves
+  ~2 dB at every rate (10 ms stereo 40 B: 10.9 → 13.2 dB, now ahead
+  of the §A.1 listing encoder's 12.7 dB; 80 B: 18.9 → 20.8; 160 B:
+  24.1 → 26.0). A spread None-vs-Normal A/B measured within
+  ±0.3 dB; the constant Normal choice stays.
+
 * **Round-417 — oxideav-core registry wiring** (`codec` module): the
   `celt` codec now registers a real decoder **and** encoder into the
   runtime context per the workspace dual-API convention — `register`

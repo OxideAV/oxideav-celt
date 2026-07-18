@@ -44,7 +44,8 @@ use crate::band_quant::{quant_all_bands, BandAmps, QuantIo};
 use crate::bit_allocation::encode_alloc_trim;
 use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, NUM_BANDS};
 use crate::encoder_decisions::{
-    boost_thresholds, choose_alloc_trim, choose_intra_mode, low_band_stereo_correlation,
+    boost_thresholds, choose_alloc_trim, choose_intra_mode, choose_mid_side_stereo,
+    intensity_start_band, low_band_stereo_correlation,
 };
 use crate::mdct::{build_low_overlap_window_f32, mdct_naive_f32};
 use crate::range_encoder::RangeEncoder;
@@ -486,10 +487,14 @@ impl CeltRefEncoder {
                 lm,
                 AllocIo::Encode {
                     enc: &mut enc,
-                    // No intensity stereo (mid/side over every coded
-                    // band); the walk clamps to the post-skip window.
-                    intensity: end as i32,
-                    dual_stereo: false,
+                    // §5.3.5: the Table-66 bitrate threshold picks the
+                    // first intensity-coded band (`end` = disabled);
+                    // the walk clamps to the post-skip window.
+                    intensity: intensity_start_band(total_bits, lm).unwrap_or(end) as i32,
+                    // §5.3.5 L1 mid/side-vs-dual verdict on the raw
+                    // per-channel spectra (dual when L/R wins).
+                    dual_stereo: channels == 2
+                        && !choose_mid_side_stereo(&freqs[0], &freqs[1], lm, start).unwrap_or(true),
                     prev_coded_bands: self.prev_coded_bands,
                 },
             )?;
