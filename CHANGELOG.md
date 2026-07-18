@@ -6,6 +6,18 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-417 — staged raw-frame reference fixtures + decode
+  regression**: four raw CELT frame streams encoded by the §A.1
+  reference listing (bare 48 kHz frames, all four LMs, mono and
+  stereo, tone/transient/silence/noise content) are staged with the
+  listing decoder's float decodes under
+  `docs/audio/celt/fixtures/ref-lm*` (generation commands + SHA-256
+  in the staging README), and the new runtime-gated
+  `celt_raw_frame_fixture_reference_exactness` test regresses this
+  crate's decoder against them (>= 95 dB float SNR, <= 1e-4 max
+  deviation; measures 99.4–109.2 dB) — reference-exactness coverage
+  with no oracle build and no `opusenc`/`opusdec` dependency.
+
 * **Round-417 — §4.3.4.5 per-band TF machinery + transient TF
   decision, and the byte-budget gate sweep**: `tf_encode` now codes
   arbitrary per-band TF toggles (differential bits under the exact

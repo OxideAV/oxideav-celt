@@ -93,6 +93,75 @@ fn decode_fixture(dir: &std::path::Path) -> FixtureResult {
     FixtureResult { snr_db, gain }
 }
 
+/// Raw-frame reference-decode regression: the staged
+/// `docs/audio/celt/fixtures/ref-lm*` sets carry length-prefixed raw
+/// CELT frames produced by the §A.1 reference listing **encoder**
+/// together with the listing decoder's float decode; this crate's
+/// decoder must reproduce that decode at the decoder-pair numerical
+/// floor (>= 95 dB float SNR, no localized divergence) with no oracle
+/// build required.
+#[test]
+fn celt_raw_frame_fixture_reference_exactness() {
+    let candidates = [
+        PathBuf::from("../../docs/audio/celt/fixtures"),
+        PathBuf::from("docs/audio/celt/fixtures"),
+    ];
+    let Some(dir) = candidates.into_iter().find(|p| p.is_dir()) else {
+        eprintln!("celt raw-frame fixture staging area not present; skipping");
+        return;
+    };
+    let mut measured = 0usize;
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .expect("fixture dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("ref-lm"))
+        })
+        .collect();
+    entries.sort();
+    for d in entries {
+        let name = d.file_name().unwrap().to_string_lossy().to_string();
+        // ref-lm{L}-{mono|stereo}-{N}B
+        let lm: u32 = name[6..7].parse().expect("lm digit");
+        let channels = if name.contains("stereo") { 2usize } else { 1 };
+        let frames = std::fs::read(d.join("frames.bin")).expect("frames.bin");
+        let expected: Vec<f32> = std::fs::read(d.join("expected.f32"))
+            .expect("expected.f32")
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let mut dec = CeltRefDecoder::new(lm, channels).expect("decoder");
+        let mut ours: Vec<f32> = Vec::new();
+        let mut pos = 0usize;
+        while pos + 2 <= frames.len() {
+            let len = u16::from_le_bytes([frames[pos], frames[pos + 1]]) as usize;
+            pos += 2;
+            ours.extend(dec.decode_frame(&frames[pos..pos + len]).expect("decode"));
+            pos += len;
+        }
+        assert_eq!(ours.len(), expected.len(), "{name}: length mismatch");
+        let (mut ee, mut err, mut maxdiff) = (0f64, 0f64, 0f32);
+        for (o, e) in ours.iter().zip(expected.iter()) {
+            ee += (*e as f64) * (*e as f64);
+            let d = *e - *o;
+            err += (d as f64) * (d as f64);
+            maxdiff = maxdiff.max(d.abs());
+        }
+        let snr = 10.0 * (ee / err.max(1e-300)).log10();
+        eprintln!("{name}: SNR {snr:.1} dB, maxdiff {maxdiff:.2e}");
+        assert!(snr >= 95.0, "{name}: SNR {snr:.1} dB below floor");
+        assert!(
+            maxdiff <= 1e-4,
+            "{name}: localized divergence {maxdiff:.2e}"
+        );
+        measured += 1;
+    }
+    assert!(measured >= 4, "expected the four staged raw-frame sets");
+}
+
 #[test]
 fn celt_fixture_reference_exactness() {
     let Some(dir) = fixture_dir() else {
