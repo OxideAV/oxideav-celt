@@ -391,6 +391,7 @@ pub mod bit_allocation;
 pub mod bits_to_pulses;
 #[doc(hidden)]
 pub mod coarse_energy;
+pub mod codec;
 #[doc(hidden)]
 pub mod deemphasis;
 #[doc(hidden)]
@@ -682,10 +683,12 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// No-op codec registration. The range decoder is a leaf primitive
-/// and does not need to advertise a codec ID; once the band/MDCT
-/// path lands, this hook will register the `celt` decoder with the
-/// runtime.
-pub fn register(_ctx: &mut RuntimeContext) {}
+pub use codec::{make_decoder, make_encoder, CeltCodecOptions, CeltDecoder, CeltEncoder};
+
+/// Install the `celt` codec (decoder + encoder) into the runtime
+/// context — see [`codec::register`].
+pub fn register(ctx: &mut RuntimeContext) {
+    codec::register(ctx);
+}
 
 oxideav_core::register!("celt", register);

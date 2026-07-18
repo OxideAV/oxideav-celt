@@ -6,6 +6,22 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-417 — oxideav-core registry wiring** (`codec` module): the
+  `celt` codec now registers a real decoder **and** encoder into the
+  runtime context per the workspace dual-API convention — `register`
+  installs the same `make_decoder` / `make_encoder` factories that
+  are exported directly. `CeltDecoder` (one raw CELT frame per
+  packet → interleaved-f32 `AudioFrame`, seek-safe `reset`) and
+  `CeltEncoder` (frame-buffered f32 input → fixed-size packets, pts
+  at 1/48 000, zero-padded final frame on `flush`) wrap the
+  reference-exact chain. Stream configuration follows
+  `CodecParameters` (`channels` 1/2, 48 kHz, `bit_rate` → per-frame
+  byte budget) plus a schema-declared `frame_size` codec option
+  (120/240/480/960); invalid parameter sets are rejected at the
+  factory. Tests: full registry encode→decode round trip with
+  fidelity gate, factory validation, reset-equals-fresh, and
+  flush padding.
+
 * **Round-417 — reference-compatible encoder arc**
   (`ref_encode::CeltRefEncoder`): the full Table-56 walk in the
   encode direction, mirroring every budget gate of the
