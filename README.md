@@ -6,6 +6,50 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**Reference-compatible encode + registry wiring, r417.** The crate
+now carries the full codec arc: the r414 reference-exact decoder is
+joined by a **reference-compatible encoder**
+(`ref_encode::CeltRefEncoder`) and both are registered into the
+oxideav-core runtime (`codec` module: `register` plus the direct
+`make_decoder` / `make_encoder` factories, per the workspace
+dual-API convention — one raw CELT frame per packet, interleaved-f32
+audio frames, stream shape from `CodecParameters` + the
+schema-declared `frame_size` option).
+
+The encoder is the exact mirror of the decoder's Table-56 walk —
+every symbol the decoder reads under a budget gate is written under
+the identical gate — driving the exact §4.3.3 allocation walk and
+the exact §4.3.4 band loop in their encode direction on the absolute
+`eMeans` energy scale, with the §5.3 decisions wired: §5.3.3
+two-pass intra selection, §5.3.4.1 contrast band boosts, §5.3.4.2
+tilt/correlation trim, §5.3.5 Table-66 intensity threshold + L1
+mid/side-vs-dual verdict, transient detection, and a transient-frame
+per-band §4.3.4.5 TF decision. The analysis front end (§4.3.7.2
+pre-emphasis at the reference signal scale + the forward MDCT at the
+decoder's exact emission alignment, long and short blocks)
+reconstructs at 143–150 dB unquantized; the encoder carries the
+reference's 120-sample lookahead.
+
+**Measured (r417, runtime-gated black-box):** against decoder and
+encoder oracles built from the RFC 6716 §A reference listing
+(extracted per §A.1 from the staged RFC text, SHA-1-verified), every
+stream this encoder emits decodes **identically** through the
+crate's decoder and the listing decoder across 2.5/5/10/20 ms ×
+mono/stereo — cross-decoder float SNR 99.4–133.0 dB (the decoder
+pair's own numerical floor, measured identically on listing-encoded
+streams; max per-sample diff ≤ 1.1e-5) — and a 40/80/160 B/frame
+rate sweep measures decode quality within −3.5 dB of the listing
+encoder at high rates while **beating it at the low end** (20 ms
+mono 40 B: 21.3 dB vs 14.4 dB; 10 ms stereo 40 B: 13.2 dB vs
+12.7 dB). Byte budgets from 2 to 1275 encode to exactly the
+requested size and decode finite at every LM × channels
+(`tests/ref_encode_interop.rs` + the in-crate gates). Remaining
+encode gaps: the long-frame TF time-split decision needs a
+rate-distortion lambda (the L1 proxy measured as a net loss and is
+disabled on non-transient frames), the anti-collapse bit is always
+signalled off, and Hybrid (`start = 17`) / non-48 kHz operating
+points remain undriven in both directions.
+
 **Reference-exact decode, r414.** Real reference-encoded CELT streams
 decode at the float-rounding floor. The RFC 6716 Appendix A reference
 listing — embedded in the staged RFC text itself and extracted per
@@ -61,11 +105,10 @@ The dynalloc boost loop was corrected to the normative listing on the
 way (1/8-bit symbol-cost gate against the diminishing budget;
 channel-counting quanta width) — the §4.3.3 prose narration slips on
 both points. Remaining decode gaps: Hybrid windows (`start = 17`) and
-non-48 kHz operating points are not driven by the new decoder yet;
-the in-crate *encoder* still writes the r408 walk's wire (moving the
-auto encoders onto `alloc_exact`/`band_quant` — both already carry
-the encode direction — is the natural next step toward
-reference-compatible encode).
+non-48 kHz operating points are not driven by the new decoder yet.
+The pre-r414 auto encoders (`pcm_encode`) still write the r408
+walk's wire; the reference-compatible encode arc landed in r417 as
+the separate `ref_encode` module (see the r417 status above).
 
 **§4.3.3 reallocation walk + wire-interop energy convention, r408.**
 The full bit-allocation walk of RFC 6716 §4.3.3 is implemented per the

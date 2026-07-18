@@ -310,14 +310,13 @@ pub fn mid_side_extra_dof(lm: u32) -> u32 {
 /// are not coded — `lm > 3`, either spectrum shorter than the span,
 /// or a zero `L1_lr`).
 ///
-/// **Note:** the current frame encoders can only *honour* the dual
-/// verdict — the §4.3.4.4 `itheta` mid-side coupling is the
-/// documented docs gap — and always encode the uncoupled path, which
-/// §5.3.5 explicitly sanctions ("it is always safe to use ... any
-/// audio frame" either way; dual is a legal choice for every frame).
-/// The decision is exposed so the coupled path can adopt it when the
-/// gap closes, and so callers can measure the efficiency the gap
-/// costs.
+/// Since r417 the reference-compatible encoder
+/// ([`crate::ref_encode::CeltRefEncoder`]) carries this verdict on
+/// the wire: the exact §4.3.4 band loop codes the `itheta` mid/side
+/// coupling, so a `Some(true)` frame is coupled and a `Some(false)`
+/// frame signals dual stereo (§5.3.5 sanctions either choice on any
+/// frame). The pre-r414 `pcm_encode` drivers still pin the uncoupled
+/// path.
 pub fn choose_mid_side_stereo(left: &[f32], right: &[f32], lm: u32, start: usize) -> Option<bool> {
     if start != 0 || lm > 3 {
         return None;
@@ -372,10 +371,11 @@ pub fn choose_mid_side_stereo(left: &[f32], right: &[f32], lm: u32, start: usize
 /// is used here and noted as an apparent erratum in the RFC text.)
 ///
 /// Returns `None` for "disabled" (rate above 130 kbit/s, and `lm > 3`
-/// defensively). Like the mid/side verdict, intensity coding itself
-/// is not yet encodable (its band walk is inside the §4.3.4.4 gap);
-/// the current encoders pin "intensity never applies", which the
-/// returned threshold would replace once the gap closes.
+/// defensively). Since r417 the reference-compatible encoder
+/// ([`crate::ref_encode::CeltRefEncoder`]) signals this threshold in
+/// the exact §4.3.3 allocation walk, and the exact §4.3.4 band loop
+/// codes the intensity path; the pre-r414 `pcm_encode` drivers still
+/// pin "intensity never applies".
 pub fn intensity_start_band(frame_bits: u32, lm: u32) -> Option<usize> {
     if lm > 3 {
         return None;

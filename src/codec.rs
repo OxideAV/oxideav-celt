@@ -1,5 +1,6 @@
-//! oxideav-core codec registration: the `celt` [`Decoder`] /
-//! [`Encoder`] wrappers over [`CeltRefDecoder`] / [`CeltRefEncoder`],
+//! oxideav-core codec registration: the `celt`
+//! [`oxideav_core::Decoder`] / [`oxideav_core::Encoder`] wrappers
+//! over [`CeltRefDecoder`] / [`CeltRefEncoder`],
 //! the direct [`make_decoder`] / [`make_encoder`] factories, and the
 //! [`register`] entry point (the workspace dual-API convention: the
 //! registry path and the direct factories share the same functions).

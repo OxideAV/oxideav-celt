@@ -2,7 +2,29 @@
 //!
 //! Pure-Rust CELT layer of the Opus codec (RFC 6716).
 //!
-//! **Status (2026-07-15):** round-414. **Reference-exact decode.**
+//! **Status (2026-07-18):** round-417. **Reference-compatible encode
+//! and registry wiring.** The full codec arc: [`ref_encode`]
+//! ([`ref_encode::CeltRefEncoder`]) is the exact encode-direction
+//! mirror of the r414 reference-exact decoder's Table-56 walk —
+//! every gated symbol written at the decoder's exact position,
+//! driving the exact §4.3.3 allocation walk and §4.3.4 band loop on
+//! the absolute `eMeans` scale, with the §5.3 decisions wired
+//! (two-pass intra, contrast band boosts, tilt/correlation trim,
+//! Table-66 intensity + mid/side-vs-dual, transient detection,
+//! transient-frame per-band TF) and an analysis front end that is
+//! the exact adjoint of the decoder's synthesis (143–150 dB
+//! unquantized identity; 120-sample lookahead). Black-box: every
+//! emitted stream decodes identically through this crate's decoder
+//! and a decoder built from the §A.1-extracted reference listing
+//! (cross-decoder 99.4–133.0 dB float SNR — the decoder pair's own
+//! numerical floor), with rate-sweep quality within −3.5 dB of the
+//! listing encoder at high rates and ahead at low rates. The
+//! [`codec`] module registers both directions into the oxideav-core
+//! runtime (`register` + the direct `make_decoder` / `make_encoder`
+//! factories, one raw CELT frame per packet, interleaved-f32
+//! frames).
+//!
+//! **Status (2026-07-15, earlier):** round-414. **Reference-exact decode.**
 //! The RFC 6716 Appendix A reference listing (embedded in the staged
 //! RFC text, extracted per §A.1 and SHA-1-verified) pins the §4.3.3 /
 //! §4.3.4 arithmetic exactly, and three new modules transcribe it:
