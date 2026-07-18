@@ -624,11 +624,15 @@ impl CeltRefEncoder {
                 true,
             )?;
 
-            // ── Anti-collapse bit (this encoder never requests the
-            // injection; a legal choice — the reservation is still
-            // honoured so the budget stays in lockstep) ──
+            // ── Anti-collapse bit (encoder freedom): whenever the
+            // reservation was made, request the §4.3.5 injection —
+            // the decoder noise-fills only the short blocks whose
+            // collapse masks actually collapsed, so the request is
+            // free on fully-coded frames and prevents spectral
+            // holes on sparse transients. Decode-side state is
+            // unaffected either way. ──
             if anti_collapse_rsv > 0 {
-                enc.enc_bits(0, 1)?;
+                enc.enc_bits(1, 1)?;
             }
 
             // ── Final fine-energy bits (§4.3.2.2 finalize) ──

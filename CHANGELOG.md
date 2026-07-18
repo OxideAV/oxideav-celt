@@ -6,6 +6,17 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-417 — anti-collapse requested on transient frames**: the
+  encoder now writes the §4.3.5 anti-collapse bit as 1 whenever the
+  reservation was made (previously always 0). The decoder noise-fills
+  only short blocks whose collapse masks actually collapsed, so the
+  request is free on fully-coded frames and prevents spectral holes
+  on starved transients; decoder state is unaffected either way.
+  Cross-decoder verification at starvation rates where the injection
+  fires (20 ms mono 25 B, 10 ms stereo 35 B): this crate's decoder
+  and the §A.1 listing decoder still agree at 132.7 / 123.0 dB float
+  SNR — the injection's LCG seed pipeline is in exact lockstep.
+
 * **Round-417 — staged raw-frame reference fixtures + decode
   regression**: four raw CELT frame streams encoded by the §A.1
   reference listing (bare 48 kHz frames, all four LMs, mono and
