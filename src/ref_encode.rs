@@ -487,7 +487,6 @@ impl CeltRefEncoder {
             if lm > 0 && tell + 3 <= total_bits {
                 is_transient = want_transient;
                 enc.enc_bit_logp(u32::from(is_transient), 3)?;
-                tell = enc.tell();
             }
 
             // ── Analysis: forward MDCT, band energies, unit shapes ──

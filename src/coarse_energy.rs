@@ -514,9 +514,9 @@ fn loss_distortion(
     channels: usize,
 ) -> f32 {
     let mut dist = 0.0f32;
-    for c in 0..channels {
-        for i in start..eff_end {
-            let d = target[c][i] - state.energy[c][i];
+    for (tc, sc) in target.iter().zip(state.energy.iter()).take(channels) {
+        for (t, e) in tc[start..eff_end].iter().zip(&sc[start..eff_end]) {
+            let d = t - e;
             dist += d * d;
         }
     }
@@ -707,6 +707,7 @@ mod tests {
             let budget = budget_bytes * 8;
             let mut state = CoarseEnergyState::new();
             let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+            #[allow(clippy::needless_range_loop)] // paired matrix fill
             for c in 0..channels {
                 for b in 0..NUM_BANDS {
                     state.energy[c][b] = ((b * 7 + c * 3 + case as usize) % 11) as f32 - 5.0;
@@ -785,6 +786,7 @@ mod tests {
             0,
         )
         .unwrap();
+        #[allow(clippy::needless_range_loop)] // paired matrix compare
         for b in 0..NUM_BANDS {
             assert!(
                 state.energy[0][b] >= start_energy[0][b] - 5.0 - 1.0,
