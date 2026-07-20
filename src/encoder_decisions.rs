@@ -266,6 +266,84 @@ pub fn choose_alloc_trim(
     (5 + tilt_dev - stereo_dev).clamp(0, 10) as u8
 }
 
+/// The §5.3.4.2 allocation-trim decision at the reference listing's
+/// exact operating point (transcribed from the §A.1 listing,
+/// `alloc_trim_analysis`) — the trim map the RFC's §5.3.4.2 envelope
+/// describes:
+///
+/// * **Stereo:** the low-frequency inter-channel correlation is the
+///   mean over the first 8 bands of the per-band dot product of the
+///   two channels' **unit-norm** band shapes (`x`/`y`, the coded
+///   band-contiguous normalized spectra). The trim drops by 4/3/2/1
+///   for correlations above `0.995 / 0.92 / 0.85 / 0.8`.
+/// * **Tilt:** `diff = mean over channels and bands < end-1 of
+///   E_i * (2 + 2*i - NUM_BANDS) / 2`, the first-moment spectral
+///   tilt of the per-band base-2 log-energies (`band_log_e`,
+///   eMeans-relative). The trim drops by 1 for `diff > 2` and again
+///   for `diff > 8`, and rises by 1 for `diff < -4` and again for
+///   `diff < -10`.
+///
+/// The result clamps to the legal `0..=10`. Trim is encoder freedom
+/// (the coded value keeps the decoder in lockstep), so this is a
+/// quality decision, not a wire requirement — but it is the map the
+/// reference rate-distortion behaviour was tuned around.
+pub fn alloc_trim_analysis(
+    x: &[f32],
+    y: Option<&[f32]>,
+    band_log_e: &[[f32; NUM_BANDS]; 2],
+    end: usize,
+    lm: u32,
+) -> u8 {
+    use crate::band_layout::EBAND_EDGES_5MS;
+    let mut trim = 5i32;
+    let m = 1usize << lm;
+    let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
+    let channels = 1 + usize::from(y.is_some());
+    if let Some(y) = y {
+        // Inter-channel correlation over the first 8 bands' unit-norm
+        // shapes: each band's dot product is its correlation, so the
+        // mean over 8 bands is the listing's Q10 `sum`.
+        let mut sum = 0.0f32;
+        for i in 0..8 {
+            let mut partial = 0.0f32;
+            for (l, r) in x[eb(i)..eb(i + 1)].iter().zip(&y[eb(i)..eb(i + 1)]) {
+                partial += l * r;
+            }
+            sum += partial;
+        }
+        sum *= 1.0 / 8.0;
+        if sum > 0.995 {
+            trim -= 4;
+        } else if sum > 0.92 {
+            trim -= 3;
+        } else if sum > 0.85 {
+            trim -= 2;
+        } else if sum > 0.8 {
+            trim -= 1;
+        }
+    }
+    let mut diff = 0.0f32;
+    for ch in band_log_e.iter().take(channels) {
+        for (i, &e) in ch.iter().enumerate().take(end.saturating_sub(1)) {
+            diff += e * (2 + 2 * i as i32 - NUM_BANDS as i32) as f32;
+        }
+    }
+    diff /= (2 * channels * (end - 1)) as f32;
+    if diff > 2.0 {
+        trim -= 1;
+    }
+    if diff > 8.0 {
+        trim -= 1;
+    }
+    if diff < -4.0 {
+        trim += 1;
+    }
+    if diff < -10.0 {
+        trim += 1;
+    }
+    trim.clamp(0, 10) as u8
+}
+
 /// The number of bands the §5.3.5 mid/side-vs-dual comparison runs
 /// over: "comparing the estimated entropy with and without coupling
 /// over the first 13 bands".

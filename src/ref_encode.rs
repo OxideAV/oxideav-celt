@@ -44,8 +44,8 @@ use crate::band_quant::{haar1, quant_all_bands, BandAmps, QuantIo};
 use crate::bit_allocation::encode_alloc_trim;
 use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, NUM_BANDS};
 use crate::encoder_decisions::{
-    boost_thresholds, choose_alloc_trim, choose_intra_mode, choose_mid_side_stereo,
-    intensity_start_band, low_band_stereo_correlation,
+    alloc_trim_analysis, boost_thresholds, choose_intra_mode, choose_mid_side_stereo,
+    intensity_start_band,
 };
 use crate::mdct::{build_low_overlap_window_f32, mdct_naive_f32};
 use crate::range_encoder::RangeEncoder;
@@ -580,33 +580,37 @@ impl CeltRefEncoder {
             if !compute_band_caps(lm, channels == 2, channels as u32, &bins, &mut caps16) {
                 return Err(Error::InvalidParameter);
             }
-            // §5.3.4.1 boost rule on the channel-max band envelope:
-            // an interior band whose contrast `D_j = 2E_j - E_{j-1} -
-            // E_{j+1}` exceeds `t1` (`t2`) gets one (two) dynalloc
-            // quanta; the quantum is the decode loop's
-            // `min(8*width, max(48, width))` with `width = C*N`.
-            let mut emax = [0f32; NUM_BANDS];
-            for i in start..end {
-                emax[i] = targets[0][i];
-                if channels == 2 {
-                    emax[i] = emax[i].max(targets[1][i]);
-                }
-            }
+            // §5.3.4.1 boost rule: an interior band whose contrast
+            // `D_j = 2E_j - E_{j-1} - E_{j+1}` (averaged across the
+            // two channels on stereo frames, as in the §A.1 listing)
+            // exceeds `t1` (`t2`) gets one (two) dynalloc quanta; the
+            // quantum is the decode loop's `min(8*width, max(48,
+            // width))` with `width = C*N`. The listing only runs this
+            // above 50 bytes/frame; boosts are encoder freedom and an
+            // A/B sweep against the listing measures the tonal-band
+            // boosts as a 4-7 dB win at 40 bytes, so this encoder
+            // keeps them at every rate (the `LM >= 1` gate stays: at
+            // LM 0 the boosts measured as a small loss).
             let (t1, t2) = boost_thresholds(lm);
             let mut want_boost = vec![0i32; end - start];
-            for j in start + 1..end.saturating_sub(1) {
-                let d = 2.0 * emax[j] - emax[j - 1] - emax[j + 1];
-                let steps = if d > t2 {
-                    2
-                } else if d > t1 {
-                    1
-                } else {
-                    0
-                };
-                if steps > 0 {
-                    let width = channels as i32 * (m * (eb(j + 1) - eb(j))) as i32;
-                    let quanta = (8 * width).min(width.max(48));
-                    want_boost[j - start] = steps * quanta;
+            if lm >= 1 {
+                for j in start + 1..end.saturating_sub(1) {
+                    let mut d = 2.0 * targets[0][j] - targets[0][j - 1] - targets[0][j + 1];
+                    if channels == 2 {
+                        d = 0.5 * (d + 2.0 * targets[1][j] - targets[1][j - 1] - targets[1][j + 1]);
+                    }
+                    let steps = if d > t2 {
+                        2
+                    } else if d > t1 {
+                        1
+                    } else {
+                        0
+                    };
+                    if steps > 0 {
+                        let width = channels as i32 * (m * (eb(j + 1) - eb(j))) as i32;
+                        let quanta = (8 * width).min(width.max(48));
+                        want_boost[j - start] = steps * quanta;
+                    }
                 }
             }
             let boosts = encode_band_boosts(
@@ -622,16 +626,17 @@ impl CeltRefEncoder {
             let mut offsets = [0i32; NUM_BANDS];
             offsets[start..end].copy_from_slice(&boosts.boost);
 
-            // ── Allocation trim (§5.3.4.2: tilt + stereo-correlation
-            // deviations from the default 5) ──
-            let stereo_corr = if channels == 2 {
-                low_band_stereo_correlation(&freqs[0], &freqs[1], lm, start)
-            } else {
-                None
-            };
-            let alloc_trim = choose_alloc_trim(&emax[start..end], stereo_corr);
+            // ── Allocation trim (§5.3.4.2 at the listing's exact
+            // operating point; the un-gated default 5 mirrors the
+            // decoder's fallback so the allocation walks stay in
+            // lockstep when the budget closes the gate) ──
             let trim_gated =
                 enc.tell_frac() as i64 + 48 <= frame_8th as i64 - boosts.total_boost as i64;
+            let alloc_trim = if trim_gated {
+                alloc_trim_analysis(&x, (channels == 2).then_some(&y[..]), &targets, end, lm)
+            } else {
+                5
+            };
             encode_alloc_trim(&mut enc, trim_gated, alloc_trim)?;
 
             // ── Anti-collapse reservation + the exact allocation ──
