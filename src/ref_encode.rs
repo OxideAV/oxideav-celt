@@ -125,70 +125,158 @@ fn tf_encode(
     Ok(())
 }
 
-/// L1 compaction of one band's unit-norm shape after the §4.3.4.5
-/// TF transform the band walk would apply for `tf_change` (the
-/// level-0 mono recombine / time-split ladder of the §4.3.4 loop).
-/// A lower L1 at fixed L2 means a sparser vector — cheaper for the
-/// PVQ codebook at equal quality.
-fn tf_l1_metric(band: &[f32], b_frame: usize, tf_change: i32) -> f32 {
-    let mut v = band.to_vec();
-    let n = v.len();
-    let mut b_blocks = b_frame;
-    let mut n_b = n / b_blocks.max(1);
-    let mut tf = tf_change;
-    let recombine = tf.max(0).min(b_blocks.trailing_zeros() as i32);
-    for k in 0..recombine {
-        haar1(&mut v, n >> k, 1 << k);
+/// The rate-distortion L1 metric of the §4.3.4.5 TF analysis
+/// (transcribed from the §A.1 reference listing, `l1_metric`): the
+/// candidate vector is viewed as `2^level` interleaved sub-vectors
+/// (the time slices at the candidate resolution); the metric is the
+/// sum of the sub-vectors' L2 norms scaled by `2^(-level/2)` — an
+/// L1-over-time / L2-over-frequency sparsity proxy — inflated by a
+/// per-level bias (`+12%/+5%/+2%` per level for 1-/2-/wider-bin
+/// short-block widths) that prices the coding overhead of finer time
+/// resolution.
+fn tf_l1_metric(tmp: &[f32], n: usize, level: usize, width: usize) -> f32 {
+    const SQRT_M_1: [f32; 4] = [1.0, std::f32::consts::FRAC_1_SQRT_2, 0.5, 0.353_553_39];
+    let mut l1 = 0.0f32;
+    for i in 0..(1usize << level) {
+        let mut l2 = 0.0f32;
+        for j in 0..(n >> level) {
+            let v = tmp[(j << level) + i];
+            l2 += v * v;
+        }
+        l1 += l2.sqrt();
     }
-    b_blocks >>= recombine;
-    n_b <<= recombine;
-    while (n_b & 1) == 0 && tf < 0 {
-        haar1(&mut v, n_b, b_blocks);
-        b_blocks <<= 1;
-        n_b >>= 1;
-        tf += 1;
-    }
-    v.iter().map(|a| a.abs()).sum()
+    l1 *= SQRT_M_1[level];
+    let bias = match width {
+        1 => 0.12 * level as f32,
+        2 => 0.05 * level as f32,
+        _ => 0.02 * level as f32,
+    };
+    l1 + bias * l1
 }
 
-/// Per-band §4.3.4.5 TF-resolution decision (encoder freedom; the RFC
-/// leaves the criterion to the encoder): on a **transient** frame,
-/// toggle a band (keep it at short-block resolution instead of the
-/// Table-62 default full recombine) when the short-resolution shape is
-/// markedly sparser in L1 — a band whose energy is concentrated in one
-/// short block codes far better untangled. Non-transient frames keep
-/// the identity resolution: an A/B sweep against the §A.1 listing
-/// encoder measured the L1 proxy as a small net loss for the long-MDCT
-/// time-split candidates on tonal material (a rate-distortion lambda
-/// would be needed to price those toggles; recorded as a follow-up),
-/// while the transient-frame decision is a clear win on onsets.
-fn choose_tf_resolution(
+/// The per-band §4.3.4.5 TF-resolution decision with rate-distortion
+/// pricing (transcribed from the §A.1 reference listing,
+/// `tf_analysis`) — long **and** transient frames.
+///
+/// Per band, the Haar recombine/split ladder is walked over every
+/// reachable time-resolution level and the [`tf_l1_metric`] picks the
+/// sparsest level (`metric[i]`, in signed Table-60..63 level units).
+/// A Viterbi pass then chooses the per-band toggle vector: deviating
+/// from a band's best level costs the level distance, flipping the
+/// toggle between neighboring bands costs `lambda` — the rate price
+/// of one differential tf bit, stepped by frame budget (12/6/4/3 for
+/// `< 40 / < 60 / < 100 / >= 100` bytes). Frames under `15*C` bytes
+/// skip the analysis (every band keeps the frame default).
+///
+/// Returns the per-band toggles plus the metric sum (`tf_sum`, the
+/// VBR boost hint). `tf_select` stays 0, as in the listing encoder.
+fn tf_analysis(
     x: &[f32],
+    y: Option<&[f32]>,
     m: usize,
     is_transient: bool,
     lm: u32,
-    start: usize,
     end: usize,
-) -> [bool; NUM_BANDS] {
-    const MARGIN: f32 = 0.85;
-    let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
-    let b_frame = if is_transient { m } else { 1 };
-    let adj0 = tf_adjustment(is_transient, 0, lm as u8, false) as i32;
-    let adj1 = tf_adjustment(is_transient, 0, lm as u8, true) as i32;
-    let mut out = [false; NUM_BANDS];
-    if !is_transient || adj0 == adj1 {
-        return out;
-    }
-    for i in start..end {
-        let band = &x[m * eb(i)..m * eb(i + 1)];
-        if band.len() < 2 {
-            continue;
+    effective_bytes: usize,
+) -> ([bool; NUM_BANDS], i32) {
+    let channels = 1 + usize::from(y.is_some());
+    let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
+    let mut tf_res = [false; NUM_BANDS];
+    let mut tf_sum = 0i32;
+    if effective_bytes < 15 * channels {
+        for r in tf_res.iter_mut().take(end) {
+            *r = is_transient;
         }
-        let l1_keep = tf_l1_metric(band, b_frame, adj0);
-        let l1_toggle = tf_l1_metric(band, b_frame, adj1);
-        out[i] = l1_toggle < MARGIN * l1_keep;
+        return (tf_res, 0);
     }
-    out
+    let lambda = if effective_bytes < 40 {
+        12
+    } else if effective_bytes < 60 {
+        6
+    } else if effective_bytes < 100 {
+        4
+    } else {
+        3
+    };
+    let lm = lm as usize;
+    let mut metric = [0i32; NUM_BANDS];
+    for i in 0..end {
+        let n = eb(i + 1) - eb(i);
+        let mut tmp: Vec<f32> = x[eb(i)..eb(i + 1)].to_vec();
+        if let Some(y) = y {
+            for (t, v) in tmp.iter_mut().zip(&y[eb(i)..eb(i + 1)]) {
+                *t += *v;
+            }
+        }
+        let width = n >> lm;
+        let mut best_l1 = tf_l1_metric(&tmp, n, if is_transient { lm } else { 0 }, width);
+        let mut best_level = 0i32;
+        for k in 0..lm {
+            // Transient bands walk the recombine ladder down from the
+            // short-block layout; long bands walk the time-split
+            // ladder up from the single block.
+            let level = if is_transient {
+                haar1(&mut tmp, n >> (lm - k), 1 << (lm - k));
+                lm - k - 1
+            } else {
+                haar1(&mut tmp, n >> k, 1 << k);
+                k + 1
+            };
+            let l1 = tf_l1_metric(&tmp, n, level, width);
+            if l1 < best_l1 {
+                best_l1 = l1;
+                best_level = (k + 1) as i32;
+            }
+        }
+        metric[i] = if is_transient {
+            best_level
+        } else {
+            -best_level
+        };
+        tf_sum += metric[i];
+    }
+    // Viterbi over the toggle vector: state 0/1, switching costs
+    // lambda, staying costs the distance between the band's best
+    // level and the Table-60..63 adjustment the toggle would code.
+    let tf_select = 0u8;
+    let target = |toggle: bool| tf_adjustment(is_transient, tf_select, lm as u8, toggle) as i32;
+    let mut path0 = [false; NUM_BANDS];
+    let mut path1 = [false; NUM_BANDS];
+    let mut cost0 = 0i32;
+    let mut cost1 = if is_transient { 0 } else { lambda };
+    for i in 1..end {
+        let (curr0, p0) = {
+            let from0 = cost0;
+            let from1 = cost1 + lambda;
+            if from0 < from1 {
+                (from0, false)
+            } else {
+                (from1, true)
+            }
+        };
+        path0[i] = p0;
+        let (curr1, p1) = {
+            let from0 = cost0 + lambda;
+            let from1 = cost1;
+            if from0 < from1 {
+                (from0, false)
+            } else {
+                (from1, true)
+            }
+        };
+        path1[i] = p1;
+        cost0 = curr0 + (metric[i] - target(false)).abs();
+        cost1 = curr1 + (metric[i] - target(true)).abs();
+    }
+    tf_res[end - 1] = cost0 >= cost1;
+    for i in (0..end - 1).rev() {
+        tf_res[i] = if tf_res[i + 1] {
+            path1[i + 1]
+        } else {
+            path0[i + 1]
+        };
+    }
+    (tf_res, tf_sum)
 }
 
 /// Transient detector (encoder freedom, RFC 6716 §5.3.2 leaves the
@@ -456,16 +544,17 @@ impl CeltRefEncoder {
                 total_bits,
             )?;
 
-            // ── Time-frequency parameters (per-band L1 decision) ──
-            let mut tf_desired = choose_tf_resolution(&x, m, is_transient, lm, start, end);
-            if channels == 2 {
-                let tf_y = choose_tf_resolution(&y, m, is_transient, lm, start, end);
-                // One tf vector covers both channels (Table 56 codes
-                // one walk per frame): only toggle when both agree.
-                for (d, ty) in tf_desired.iter_mut().zip(tf_y.iter()) {
-                    *d &= *ty;
-                }
-            }
+            // ── Time-frequency parameters (§A.1 lambda-priced
+            // Viterbi analysis over both frame kinds) ──
+            let (tf_desired, _tf_sum) = tf_analysis(
+                &x,
+                (channels == 2).then_some(&y[..]),
+                m,
+                is_transient,
+                lm,
+                end,
+                frame_bytes,
+            );
             let mut tf_res = [0i32; NUM_BANDS];
             tf_encode(
                 &mut enc,
@@ -792,35 +881,100 @@ mod tests {
         }
     }
 
-    /// The transient-frame TF decision toggles a band whose energy is
-    /// concentrated in a single short block (sparser at short
-    /// resolution than after the Table-62 default recombine) and
-    /// leaves a block-uniform band alone; non-transient frames always
-    /// keep the identity resolution.
+    /// The Viterbi TF analysis: on a transient frame, a run of bands
+    /// whose energy is concentrated in one short block (sparsest at
+    /// short resolution, metric 0) toggles to stay short, while a run
+    /// of block-uniform bands keeps the Table-62 default recombine —
+    /// and an isolated single-band deviation is priced away by the
+    /// switching lambda.
     #[test]
-    fn tf_decision_prefers_short_resolution_for_concentrated_bands() {
+    fn tf_analysis_viterbi_prices_runs_and_isolated_bands() {
         let lm = 2u32;
         let m = 1usize << lm;
         let n_coded = m * EBAND_EDGES_5MS[NUM_BANDS] as usize;
+        let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
+        // Bands 0..8: energy spread evenly across all four short
+        // blocks (uniform in time — recombining is sparsest).
         let mut x = vec![0f32; n_coded];
-        // Band 13 spans 4 base bins (16 coefficients at LM 2). In the
-        // interleaved transient layout, coefficient `b + j*m` belongs
-        // to short block `b`: concentrate all energy in block 0.
-        let eb13 = m * EBAND_EDGES_5MS[13] as usize;
-        let eb14 = m * EBAND_EDGES_5MS[14] as usize;
-        for j in 0..(eb14 - eb13) / m {
-            x[eb13 + j * m] = 0.5;
+        for v in x[..eb(8)].iter_mut() {
+            *v = 0.25;
         }
-        // Band 14: spread evenly across all four blocks.
-        let eb15 = m * EBAND_EDGES_5MS[15] as usize;
-        for (k, v) in x[eb14..eb15].iter_mut().enumerate() {
-            *v = if k % 2 == 0 { 0.25 } else { -0.25 };
+        // Bands 8..21: all energy in short block 0 (interleaved
+        // layout: coefficient `b + j*m` belongs to block `b`).
+        for i in 8..NUM_BANDS {
+            for j in 0..(eb(i + 1) - eb(i)) / m {
+                x[eb(i) + j * m] = 0.5;
+            }
         }
-        let choice = choose_tf_resolution(&x, m, true, lm, 0, NUM_BANDS);
-        assert!(choice[13], "block-concentrated band should stay short");
-        assert!(!choice[14], "block-uniform band should recombine");
-        let long_choice = choose_tf_resolution(&x, m, false, lm, 0, NUM_BANDS);
-        assert!(long_choice.iter().all(|&b| !b), "long frames stay identity");
+        let (choice, tf_sum) = tf_analysis(&x, None, m, true, lm, NUM_BANDS, 160);
+        assert!(
+            choice[8..NUM_BANDS].iter().all(|&b| b),
+            "block-concentrated run should stay short: {choice:?}"
+        );
+        assert!(
+            choice[..8].iter().all(|&b| !b),
+            "block-uniform run should recombine: {choice:?}"
+        );
+        // metric: 2 recombines best for uniform bands, 0 for
+        // concentrated ones.
+        assert_eq!(tf_sum, 2 * 8);
+
+        // An isolated deviation (one concentrated band amid uniform
+        // neighbors) saves at most |metric| = LM but pays two lambda
+        // switches: the Viterbi keeps it on the frame default.
+        let mut x = vec![0.25f32; n_coded];
+        for v in x[eb(13)..eb(14)].iter_mut() {
+            *v = 0.0;
+        }
+        for j in 0..(eb(14) - eb(13)) / m {
+            x[eb(13) + j * m] = 0.5;
+        }
+        let (choice, _) = tf_analysis(&x, None, m, true, lm, NUM_BANDS, 160);
+        assert!(
+            choice.iter().all(|&b| !b),
+            "isolated deviation should be priced away: {choice:?}"
+        );
+
+        // Below 15*C bytes the analysis is skipped: every band keeps
+        // the frame default (short blocks on a transient frame).
+        let (choice, tf_sum) = tf_analysis(&x, None, m, true, lm, NUM_BANDS, 10);
+        assert!(choice[..NUM_BANDS].iter().all(|&b| b));
+        assert_eq!(tf_sum, 0);
+    }
+
+    /// Long (non-transient) frames now price time-splits too: a run
+    /// of bands sparser after a Haar time-split (alternating-sign
+    /// pairs) toggles on, while smooth tonal bands keep the long
+    /// resolution.
+    #[test]
+    fn tf_analysis_long_frames_price_time_splits() {
+        let lm = 2u32;
+        let m = 1usize << lm;
+        let n_coded = m * EBAND_EDGES_5MS[NUM_BANDS] as usize;
+        let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
+        // Bands 0..10: single nonzero bin per band (already maximally
+        // sparse — splitting cannot improve, metric 0).
+        let mut x = vec![0f32; n_coded];
+        for i in 0..10 {
+            x[eb(i)] = 1.0;
+        }
+        // Bands 10..21: alternating-sign pairs — one Haar level turns
+        // each pair into a single nonzero coefficient (sparser).
+        for i in 10..NUM_BANDS {
+            for (k, v) in x[eb(i)..eb(i + 1)].iter_mut().enumerate() {
+                *v = if k % 2 == 0 { 0.5 } else { -0.5 };
+            }
+        }
+        let (choice, tf_sum) = tf_analysis(&x, None, m, false, lm, NUM_BANDS, 160);
+        assert!(
+            choice[10..NUM_BANDS].iter().all(|&b| b),
+            "alternating run should time-split: {choice:?}"
+        );
+        assert!(
+            choice[..10].iter().all(|&b| !b),
+            "sparse tonal run keeps long resolution: {choice:?}"
+        );
+        assert!(tf_sum < 0, "long-frame metrics are non-positive");
     }
 
     /// Determinism: the same input yields byte-identical frames.
