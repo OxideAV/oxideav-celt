@@ -6,6 +6,43 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**Encoder beats the reference listing at every measured rate, r419.**
+The r417 encoder's remaining rate-distortion gap is closed and
+inverted. The round transcribed the §A.1 listing's entire decision
+layer — the lambda-priced Viterbi **TF analysis** (long *and*
+transient frames now take time/frequency splits), the two-pass
+badness-driven **coarse-energy RD** (`quant_coarse_energy_rd`: intra
+and inter both encoded, lower clamping distortion wins, decay bound +
+end-of-budget clamps, delayed-intra statistic), the
+**alloc-trim / spreading / dual-stereo** analyses, stereo-averaged
+dynalloc contrast, and the consecutive-transient anti-collapse rule —
+and then found the actual ~3 dB culprit by symbol-level A/B: the
+allocations already matched; the listing's advantage was the **§5.3.1
+pitch prefilter** (post-filter noise shaping). The encoder now runs
+the full prefilter chain (pitch search over 1024 samples of
+unfiltered pre-emphasized history, the §A.1 gain/threshold envelope,
+Table-56 octave/period/gain/tapset fields, and the comb prefilter —
+the FIR inverse of the decoder's post-filter with the squared-window
+parameter transition).
+
+**Measured (r419, oracle sweep at matched CBR rates):** every mono
+LM × rate point now measures **above** the §A.1 listing encoder —
++1.2 to +11.0 dB (5 ms mono: 35.7/45.2/51.0 dB vs 27.8/39.1/49.5 at
+40/80/160 B; 10 ms mono: 31.0/37.1/43.2 vs 21.4/33.8/42.0; 20 ms
+mono: 25.4/29.5/35.9 vs 14.4/27.5/31.9) — and stereo +0.2 to
++3.2 dB (10 ms stereo: 15.9/23.8/29.9 vs 12.7/23.5/29.7).
+Cross-decoder lockstep holds at 99.4–133 dB float SNR across all
+eight LM × channel combos (max per-sample diff ≤ 1.1e-5). **VBR**
+landed as `encode_frame_vbr` plus the registry `vbr` option: the
+§A.1 target/drift controller with transient boosts, 2-byte
+digital-silence frames, and the constrained-VBR reservoir — a
+64 kb/s 10 ms tonal stream tracks its target and the mixed test
+signal lands at 55–67 kb/s across LMs. Remaining: Hybrid
+(`start = 17`) / non-48 kHz operating points stay undriven in both
+directions, and the prefilter's pitch search is the crate's
+documented §5.3.1 design rather than the listing's downsampled
+xcorr chain (encoder freedom; parity measured above).
+
 **Reference-compatible encode + registry wiring, r417.** The crate
 now carries the full codec arc: the r414 reference-exact decoder is
 joined by a **reference-compatible encoder**
@@ -43,12 +80,11 @@ encoder at high rates while **beating it at the low end** (20 ms
 mono 40 B: 21.3 dB vs 14.4 dB; 10 ms stereo 40 B: 13.2 dB vs
 12.7 dB). Byte budgets from 2 to 1275 encode to exactly the
 requested size and decode finite at every LM × channels
-(`tests/ref_encode_interop.rs` + the in-crate gates). Remaining
-encode gaps: the long-frame TF time-split decision needs a
-rate-distortion lambda (the L1 proxy measured as a net loss and is
-disabled on non-transient frames), the anti-collapse bit is always
-signalled off, and Hybrid (`start = 17`) / non-48 kHz operating
-points remain undriven in both directions.
+(`tests/ref_encode_interop.rs` + the in-crate gates). The encode
+gaps this round left — long-frame TF RD pricing, the high-rate
+quality deficit, the always-off anti-collapse request — were closed
+in r419 (see the status above); Hybrid (`start = 17`) / non-48 kHz
+operating points remain undriven in both directions.
 
 **Reference-exact decode, r414.** Real reference-encoded CELT streams
 decode at the float-rounding floor. The RFC 6716 Appendix A reference

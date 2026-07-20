@@ -6,6 +6,64 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-419 — §5.3.1 pitch prefilter signalled by the reference
+  encoder**: the encoder now runs the full prefilter chain per frame
+  (pitch search over 1024 samples of unfiltered pre-emphasized
+  history, the §A.1 gain/threshold envelope with continuity snap and
+  the 3-bit §4.3.7.1 gain grid, the Table-56
+  octave/period/gain/tapset field encode, and the comb prefilter —
+  the §4.3.7.1 lobe over the unfiltered signal with negated gains
+  and the squared-window parameter transition, the FIR inverse of
+  the decoder's post-filter). This was the measured ~3 dB high-rate
+  gap: a symbol-level A/B against the §A.1 listing showed
+  near-identical allocations, with the listing's advantage coming
+  entirely from post-filter noise shaping. Every mono LM × rate
+  point of the oracle sweep now measures **above** the listing
+  encoder (+1.2 to +11.0 dB), stereo +0.2 to +3.2 dB, with
+  cross-decoder lockstep held at 99.4–133 dB on all eight
+  LM × channel combos.
+
+* **Round-419 — lambda-priced Viterbi TF analysis (long + transient
+  frames)**: the §A.1 `tf_analysis` transcription replaces the
+  transient-only L1-margin heuristic — the interleaved L1-over-L2
+  sparsity metric with per-level width bias scores every reachable
+  Haar time/frequency level per band, and a Viterbi pass prices
+  per-band toggles against the differential tf-bit lambda (12/6/4/3
+  by rate). Long frames now take time-splits; `tf_sum` feeds the
+  VBR controller.
+
+* **Round-419 — two-pass badness-driven coarse-energy RD**
+  (`quant_coarse_energy_rd`): both intra and inter passes are
+  encoded on scratch encoder/state clones and the lower-badness pass
+  is kept (rate breaks ties, loss-rate intra bias hook), with the
+  listing's decay bound (`max_decay = min(16, bytes/8)`) and
+  end-of-budget `qi` clamps, plus the cross-frame delayed-intra
+  loss-distortion statistic. Pinned by a decode-identity sweep.
+
+* **Round-419 — §A.1 decision parity**: `alloc_trim_analysis` (the
+  first-8-bands unit-shape correlation ladder + first-moment
+  spectral tilt), `spreading_decision` (the per-band tonality-vote
+  CDF with recursive averaging and hysteresis, plus the tapset arm),
+  `stereo_analysis` (the L1 entropy dual-vs-mid/side verdict with
+  the `thetas` degree-of-freedom charge; 2.5 ms frames always
+  couple), stereo-averaged dynalloc contrast, and the
+  consecutive-transient anti-collapse request rule. The listing's
+  `>50-byte` dynalloc gate is deliberately not taken (measured 4–7
+  dB win from contrast boosts at 40 bytes — the crate's documented
+  encoder freedom); the LM 0 gate is.
+
+* **Round-419 — VBR** (`encode_frame_vbr` + the registry `vbr`
+  option): the §A.1 variable-bitrate controller — tf_sum/transient
+  7/4 and 3/2 target boosts, long-frame trim, spent-bits fold-in,
+  the 2-byte-margin floor, the drift integrator, 2-byte
+  digital-silence frames, and the constrained-VBR reservoir with
+  up-front max-rate pre-clamp. Decision gates key on the
+  target-derived `effectiveBytes` in VBR mode. Measured: a 64 kb/s
+  10 ms tonal stream tracks the target (rate pinned in-range past
+  the adaptation ramp) and the mixed test signal (10% silence)
+  lands at 55–67 kb/s across LMs with silence spans at the 2-byte
+  floor.
+
 * **Round-417 — anti-collapse requested on transient frames**: the
   encoder now writes the §4.3.5 anti-collapse bit as 1 whenever the
   reservation was made (previously always 0). The decoder noise-fills
