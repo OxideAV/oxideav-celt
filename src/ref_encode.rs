@@ -46,10 +46,12 @@ use crate::coarse_energy::{quant_coarse_energy_rd, CoarseEnergyState, NUM_BANDS}
 use crate::encoder_decisions::{
     alloc_trim_analysis, boost_thresholds, choose_mid_side_stereo, intensity_start_band,
 };
-use crate::mdct::{build_low_overlap_window_f32, mdct_naive_f32};
+use crate::mdct::{build_low_overlap_window_f32, celt_window_f32, mdct_naive_f32};
+use crate::pitch::pitch_search;
+use crate::post_filter::POST_FILTER_TAPS_F32;
 use crate::range_encoder::RangeEncoder;
 use crate::ref_decode::E_MEANS;
-use crate::spread::{encode_spread, Spread};
+use crate::spread::{encode_spread, spreading_decision, Spread};
 use crate::synthesis::mdct_size;
 use crate::tf_change::tf_adjustment;
 use crate::Error;
@@ -72,6 +74,75 @@ const TARGET_FLOOR: f32 = -28.0;
 /// or below this is coded as a Table-56 silence frame. Documented
 /// in-crate encoder freedom (§4.3 only defines the silence flag).
 const SILENCE_THRESHOLD: f32 = -27.5;
+
+/// The §4.3.7.1 comb-filter maximum period (the prefilter history
+/// depth).
+const COMB_MAX_PERIOD: usize = 1024;
+
+/// The §4.3.7.1 comb-filter minimum period.
+const COMB_MIN_PERIOD: usize = 15;
+
+/// The §4.3.7.1 tapset ICDF (Table 56 `{2, 1, 1}/4`).
+const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
+
+/// The encoder-side §5.3.1 comb **pre**filter (the §A.1 listing's
+/// `run_prefilter` application): the §4.3.7.1 comb lobe evaluated on
+/// the **unfiltered** pre-emphasized signal (`src`, `[history |
+/// frame]` with the frame starting at `p`) and *added* (the caller
+/// passes negated §4.3.7.1 gains, making this the FIR inverse the
+/// RFC prescribes — "applied in such a way as to be the inverse of
+/// the decoder's post-filter"). The first `window.len()` samples
+/// crossfade from the previous frame's `(t0, g0, tap0)` to this
+/// frame's `(t1, g1, tap1)` with the squared §4.3.7 window, exactly
+/// mirroring the decoder's transition. Returns the filtered frame.
+#[allow(clippy::too_many_arguments)]
+fn prefilter_comb(
+    src: &[f32],
+    p: usize,
+    n: usize,
+    t0: usize,
+    t1: usize,
+    g0_: f32,
+    g1_: f32,
+    tap0: usize,
+    tap1: usize,
+    window: &[f32],
+) -> Vec<f32> {
+    let g00 = g0_ * POST_FILTER_TAPS_F32[tap0][0];
+    let g01 = g0_ * POST_FILTER_TAPS_F32[tap0][1];
+    let g02 = g0_ * POST_FILTER_TAPS_F32[tap0][2];
+    let g10 = g1_ * POST_FILTER_TAPS_F32[tap1][0];
+    let g11 = g1_ * POST_FILTER_TAPS_F32[tap1][1];
+    let g12 = g1_ * POST_FILTER_TAPS_F32[tap1][2];
+    let mut out = Vec::with_capacity(n);
+    let overlap = window.len().min(n);
+    for (i, w) in window.iter().enumerate().take(overlap) {
+        let idx = p + i;
+        let f = w * w;
+        let a0 = idx - t0;
+        let a1 = idx - t1;
+        out.push(
+            src[idx]
+                + (1.0 - f) * g00 * src[a0]
+                + (1.0 - f) * g01 * (src[a0 - 1] + src[a0 + 1])
+                + (1.0 - f) * g02 * (src[a0 - 2] + src[a0 + 2])
+                + f * g10 * src[a1]
+                + f * g11 * (src[a1 - 1] + src[a1 + 1])
+                + f * g12 * (src[a1 - 2] + src[a1 + 2]),
+        );
+    }
+    for i in overlap..n {
+        let idx = p + i;
+        let a1 = idx - t1;
+        out.push(
+            src[idx]
+                + g10 * src[a1]
+                + g11 * (src[a1 - 1] + src[a1 + 1])
+                + g12 * (src[a1 - 2] + src[a1 + 2]),
+        );
+    }
+    out
+}
 
 /// The §4.3.4.5 tf-parameter encode — the exact mirror of the
 /// decoder's gated walk: one differential toggle bit per band under
@@ -332,6 +403,24 @@ pub struct CeltRefEncoder {
     /// The §A.1 delayed-intra statistic (accumulated loss
     /// distortion) driving the two-pass coarse mode selection.
     delayed_intra: f32,
+    /// The §A.1 spreading-decision recursive tonality average.
+    tonal_average: i32,
+    /// The §A.1 high-frequency tonality average (tapset arm).
+    hf_average: i32,
+    /// The §A.1 §4.3.7.1 tapset choice state (the prefilter's coded
+    /// tapset follows it).
+    tapset_decision: i32,
+    /// Per-channel **unfiltered** pre-emphasized history
+    /// (`COMB_MAX_PERIOD` samples) — the §5.3.1 prefilter's comb
+    /// source and the pitch-search window.
+    pre_hist: Vec<Vec<f32>>,
+    /// Previous frame's §4.3.7.1 prefilter period / gain / tapset
+    /// (the transition's outgoing parameter set).
+    prefilter_period: usize,
+    prefilter_gain: f32,
+    prefilter_tapset: usize,
+    /// The 120-sample §4.3.7 window for the prefilter transition.
+    pf_window: Vec<f32>,
 }
 
 impl CeltRefEncoder {
@@ -358,7 +447,15 @@ impl CeltRefEncoder {
             short_window,
             rng: 0,
             prev_coded_bands: 0,
-            delayed_intra: 0.0,
+            delayed_intra: 1.0,
+            tonal_average: 256,
+            hf_average: 0,
+            tapset_decision: 0,
+            pre_hist: vec![vec![0.0; COMB_MAX_PERIOD]; channels],
+            prefilter_period: COMB_MIN_PERIOD,
+            prefilter_gain: 0.0,
+            prefilter_tapset: 0,
+            pf_window: (0..OVERLAP).map(|i| celt_window_f32(i, OVERLAP)).collect(),
         })
     }
 
@@ -423,20 +520,20 @@ impl CeltRefEncoder {
         let frame_8th = (frame_bytes * 64) as i32;
 
         // §4.3.7.2 pre-emphasis at the reference signal scale, into
-        // per-channel `[history | frame]` analysis blocks.
-        let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(channels);
+        // per-channel **unfiltered** `[COMB_MAX_PERIOD history |
+        // frame]` buffers — the §5.3.1 prefilter's comb source.
+        let mut pres: Vec<Vec<f32>> = Vec::with_capacity(channels);
         for c in 0..channels {
-            let mut block = Vec::with_capacity(frame + OVERLAP);
-            block.extend_from_slice(&self.in_mem[c]);
+            let mut pre = Vec::with_capacity(COMB_MAX_PERIOD + frame);
+            pre.extend_from_slice(&self.pre_hist[c]);
             let mut mem = self.preemph_mem[c];
             for j in 0..frame {
                 let s = SIG_SCALE * pcm[j * channels + c];
-                block.push(s - PREEMPH_COEF * mem);
+                pre.push(s - PREEMPH_COEF * mem);
                 mem = s;
             }
             self.preemph_mem[c] = mem;
-            self.in_mem[c].copy_from_slice(&block[frame..frame + OVERLAP]);
-            blocks.push(block);
+            pres.push(pre);
         }
 
         // Mono prediction parity with the decoder ("a mono frame
@@ -450,15 +547,12 @@ impl CeltRefEncoder {
 
         let mut enc = RangeEncoder::new();
 
-        // ── Table 56: silence ──
-        let want_transient = detect_transient(&blocks, frame, lm);
-        // Provisional analysis to detect all-band silence (geometry
-        // does not matter for the threshold; use the long transform).
-        // Real analysis happens after the transient gate below.
+        // ── Table 56: silence ── (detected over the carried overlap
+        // tail plus the new frame, before any filtering)
         let mut tell = enc.tell();
         let mut silence = true;
-        'sil: for block in &blocks {
-            for &s in &block[..] {
+        'sil: for (c, pre) in pres.iter().enumerate().take(channels) {
+            for &s in self.in_mem[c].iter().chain(&pre[COMB_MAX_PERIOD..]) {
                 if s.abs() >= 0.5 {
                     silence = false;
                     break 'sil;
@@ -473,13 +567,114 @@ impl CeltRefEncoder {
             enc.enc_bit_logp(u32::from(silence), 15)?;
         }
 
+        // ── §5.3.1 pitch prefilter decision (the §A.1 gain/threshold
+        // envelope over this crate's documented pitch search) ──
+        let mut gain1 = 0.0f32;
+        let mut pitch_index = COMB_MIN_PERIOD;
+        let mut prefilter_tapset = 0usize;
+        if frame_bytes > 12 * channels && !silence {
+            // Channel-averaged unfiltered pre-emphasized signal.
+            let mut dm = pres[0].clone();
+            if channels == 2 {
+                for (d, &v) in dm.iter_mut().zip(pres[1].iter()) {
+                    *d = 0.5 * (*d + v);
+                }
+            }
+            if let Some(est) = pitch_search(&dm, frame, Some(self.prefilter_period as u16)) {
+                pitch_index = (est.period as usize).clamp(COMB_MIN_PERIOD, COMB_MAX_PERIOD - 2);
+                gain1 = 0.7 * est.correlation.max(0.0);
+            }
+            prefilter_tapset = self.tapset_decision.clamp(0, 2) as usize;
+        }
+        // Threshold for enabling the prefilter (§A.1: rate/continuity
+        // adjusted, hard floor 0.2).
+        let mut pf_threshold = 0.2f32;
+        if (pitch_index as i32 - self.prefilter_period as i32).abs() * 10 > pitch_index as i32 {
+            pf_threshold += 0.2;
+        }
+        if frame_bytes < 25 {
+            pf_threshold += 0.1;
+        }
+        if frame_bytes < 35 {
+            pf_threshold += 0.1;
+        }
+        if self.prefilter_gain > 0.4 {
+            pf_threshold -= 0.1;
+        }
+        if self.prefilter_gain > 0.55 {
+            pf_threshold -= 0.1;
+        }
+        pf_threshold = pf_threshold.max(0.2);
+        let pf_on: bool;
+        let mut qg = 0i32;
+        if gain1 < pf_threshold {
+            gain1 = 0.0;
+            pf_on = false;
+        } else {
+            // Continuity snap, then the §4.3.7.1 3-bit gain grid.
+            if (gain1 - self.prefilter_gain).abs() < 0.1 {
+                gain1 = self.prefilter_gain;
+            }
+            qg = (((0.5 + gain1 * 32.0 / 3.0).floor() as i32) - 1).clamp(0, 7);
+            gain1 = 0.09375 * (qg + 1) as f32;
+            pf_on = true;
+        }
+
+        // ── Apply the comb prefilter (previous → current parameters
+        // with the squared-window transition, gains negated) into the
+        // filtered analysis blocks; roll the unfiltered history.
+        // Runs on every frame — a silence frame still fades the
+        // previous frame's filter out, exactly like the decoder. ──
+        let mut blocks: Vec<Vec<f32>> = Vec::with_capacity(channels);
+        for (c, pre) in pres.iter().enumerate().take(channels) {
+            let t0 = self.prefilter_period.max(COMB_MIN_PERIOD);
+            let filtered = prefilter_comb(
+                pre,
+                COMB_MAX_PERIOD,
+                frame,
+                t0,
+                pitch_index,
+                -self.prefilter_gain,
+                -gain1,
+                self.prefilter_tapset,
+                prefilter_tapset,
+                &self.pf_window,
+            );
+            let mut block = Vec::with_capacity(frame + OVERLAP);
+            block.extend_from_slice(&self.in_mem[c]);
+            block.extend_from_slice(&filtered);
+            self.in_mem[c].copy_from_slice(&block[frame..frame + OVERLAP]);
+            let keep = pre.len() - COMB_MAX_PERIOD;
+            self.pre_hist[c].copy_from_slice(&pre[keep..]);
+            blocks.push(block);
+        }
+        self.prefilter_period = pitch_index;
+        self.prefilter_gain = gain1;
+        self.prefilter_tapset = prefilter_tapset;
+
+        let want_transient = detect_transient(&blocks, frame, lm);
+
         let mut is_transient = false;
         if !silence {
-            // ── Post-filter gate (this encoder does not signal one;
-            // §5.3.1 sanctions the choice) ──
+            // ── Post-filter fields (Table 56: flag, then octave /
+            // period / gain / tapset when signalled). A `pf_on` frame
+            // implies `frame_bytes > 12*channels`, so the field and
+            // tapset gates cannot close on it. ──
             tell = enc.tell();
             if start == 0 && tell + 16 <= total_bits {
-                enc.enc_bit_logp(0, 1)?;
+                enc.enc_bit_logp(u32::from(pf_on), 1)?;
+                if pf_on {
+                    let pi = pitch_index + 1;
+                    // EC_ILOG(pi) - 5: the coded octave.
+                    let octave = (usize::BITS - pi.leading_zeros()) as i32 - 5;
+                    debug_assert!((0..=5).contains(&octave));
+                    enc.enc_uint(octave as u32, 6)?;
+                    enc.enc_bits((pi - (16usize << octave)) as u32, 4 + octave as u32)?;
+                    enc.enc_bits(qg as u32, 3)?;
+                    if enc.tell() + 2 <= total_bits {
+                        enc.enc_icdf(prefilter_tapset, &TAPSET_ICDF, 2)?;
+                    }
+                }
                 tell = enc.tell();
             }
 
@@ -569,10 +764,25 @@ impl CeltRefEncoder {
                 &mut tf_res,
             )?;
 
-            // ── Spread decision (§5.3 freedom; Normal by default) ──
-            let spread = Spread::Normal;
+            // ── Spread decision (§A.1 tonality vote; Normal on
+            // transient or tiny frames, and when the gate is closed
+            // the decoder's Normal default is mirrored) ──
+            let mut spread = Spread::Normal;
             tell = enc.tell();
             if tell + 4 <= total_bits {
+                if !is_transient && frame_bytes >= 10 * channels {
+                    spread = spreading_decision(
+                        &x,
+                        (channels == 2).then_some(&y[..]),
+                        m,
+                        end,
+                        &mut self.tonal_average,
+                        Spread::Normal,
+                        &mut self.hf_average,
+                        &mut self.tapset_decision,
+                        false,
+                    );
+                }
                 encode_spread(&mut enc, spread)?;
             }
 
@@ -982,6 +1192,42 @@ mod tests {
             "sparse tonal run keeps long resolution: {choice:?}"
         );
         assert!(tf_sum < 0, "long-frame metrics are non-positive");
+    }
+
+    /// A strongly periodic signal signals the §5.3.1 pitch prefilter
+    /// on the wire once the search locks (silence bit 0, then
+    /// post-filter bit 1), and the stream keeps decoding cleanly —
+    /// while a low-budget frame (`<= 12*C` bytes) never signals one.
+    #[test]
+    fn prefilter_signalled_on_periodic_signal() {
+        use crate::range_decoder::RangeDecoder;
+        let frame = 480usize;
+        let pcm = tone(frame, 1, 6, 0.4);
+        let mut enc = CeltRefEncoder::new(2, 1).expect("encoder");
+        let mut dec = CeltRefDecoder::new(2, 1).expect("decoder");
+        let mut pf_seen = false;
+        for f in 0..6 {
+            let bytes = enc
+                .encode_frame(&pcm[f * frame..(f + 1) * frame], 100)
+                .expect("encode");
+            let mut rd = RangeDecoder::new(&bytes);
+            assert_eq!(rd.dec_bit_logp(15), 0, "not silence");
+            pf_seen |= rd.dec_bit_logp(1) == 1;
+            let out = dec.decode_frame(&bytes).expect("decode");
+            assert!(out.iter().all(|v| v.is_finite()));
+        }
+        assert!(pf_seen, "steady 440 Hz tone never signalled the prefilter");
+
+        // Tiny frames: the prefilter gate stays closed.
+        let mut enc = CeltRefEncoder::new(2, 1).expect("encoder");
+        for f in 0..3 {
+            let bytes = enc
+                .encode_frame(&pcm[f * frame..(f + 1) * frame], 12)
+                .expect("encode");
+            let mut rd = RangeDecoder::new(&bytes);
+            assert_eq!(rd.dec_bit_logp(15), 0);
+            assert_eq!(rd.dec_bit_logp(1), 0, "12-byte frame signalled pf");
+        }
     }
 
     /// Determinism: the same input yields byte-identical frames.

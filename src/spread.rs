@@ -46,17 +46,16 @@
 //! * The interleaved pre-rotation by `(pi/2 - theta)` with a stride
 //!   of `round(sqrt(N / nb_blocks))` when each time block represents
 //!   eight samples or more. Also deferred until band decode.
-//! * The §5.3.7 encoder-side spreading-value derivation, which is
-//!   irrelevant on the decode side: the bitstream carries the chosen
-//!   `spread` value directly.
-//!
 //! ## Clean-room provenance
 //!
 //! Every PDF, every cumulative frequency, every `f_r` row of Table 59,
 //! and every closed-form formula in this module is transcribed from
 //! RFC 6716 §4.3.4.3 + Table 56 + Table 59 in
-//! `docs/audio/opus/rfc6716-opus.txt`. No external implementation was
-//! consulted.
+//! `docs/audio/opus/rfc6716-opus.txt`. The encoder-side
+//! [`spreading_decision`] is transcribed from the RFC's own Appendix A
+//! reference listing (`spreading_decision`), extracted from the staged
+//! RFC text per §A.1 and SHA-1-verified; no source outside the staged
+//! docs was consulted.
 
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
@@ -266,6 +265,125 @@ pub fn pre_rotation_stride(n: u32, nb_blocks: u32) -> Option<u32> {
     let rounded = if frac_lo < frac_hi { k } else { k + 1 };
     Some(rounded.max(1))
 }
+
+/// The encoder-side spreading decision (transcribed from the §A.1
+/// reference listing, `spreading_decision`): a tonality vote over the
+/// coded bands drives the Table-56 `spread` selection with recursive
+/// averaging and hysteresis.
+///
+/// Per band wider than 8 bins, a rough CDF of the unit-norm
+/// coefficients `x` is taken — `tcount[k]` counts coefficients with
+/// `x^2 * N` below `1/4`, `1/16`, `1/64` — and the band votes 0..3
+/// "tonality points" (one for each threshold a majority of the band
+/// sits under; a tonal band concentrates energy in few bins, so most
+/// coefficients are tiny). The frame vote `sum` (x256, averaged over
+/// bands and channels) is folded into the running `*average`, biased
+/// by the previous decision (hysteresis, the listing's
+/// `(3*sum + ((3-last)<<7) + 66) / 4` fold), and mapped through the
+/// `80 / 256 / 384` ladder to Aggressive / Normal / Light / None —
+/// noisy frames (few small coefficients) spread more, tonal frames
+/// spread less.
+///
+/// The `update_hf` arm (only live when the encoder ran its pitch
+/// prefilter on a long frame) maintains the `*hf_average` /
+/// `*tapset_decision` state for the §4.3.7.1 tapset choice from the
+/// top four bands' small-coefficient density.
+///
+/// `x` / `y` are the (per-channel) coded-window unit-norm spectra in
+/// the band-contiguous layout; `m = 1 << LM`. Returns the spread
+/// choice for this frame.
+#[allow(clippy::too_many_arguments)]
+pub fn spreading_decision(
+    x: &[f32],
+    y: Option<&[f32]>,
+    m: usize,
+    end: usize,
+    average: &mut i32,
+    last_decision: Spread,
+    hf_average: &mut i32,
+    tapset_decision: &mut i32,
+    update_hf: bool,
+) -> Spread {
+    use crate::band_layout::EBAND_EDGES_5MS;
+    let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
+    debug_assert!(end > 0 && end < EBAND_EDGES_5MS.len());
+    if eb(end) - eb(end - 1) <= 8 {
+        return Spread::None;
+    }
+    let mut sum = 0i32;
+    let mut nb_bands = 0i32;
+    let mut hf_sum = 0i32;
+    let channels = 1 + usize::from(y.is_some());
+    for ch in [Some(x), y].into_iter().flatten() {
+        for i in 0..end {
+            let n = eb(i + 1) - eb(i);
+            if n <= 8 {
+                continue;
+            }
+            let mut tcount = [0i32; 3];
+            for &v in &ch[eb(i)..eb(i + 1)] {
+                let x2n = v * v * n as f32;
+                if x2n < 0.25 {
+                    tcount[0] += 1;
+                }
+                if x2n < 0.0625 {
+                    tcount[1] += 1;
+                }
+                if x2n < 0.015625 {
+                    tcount[2] += 1;
+                }
+            }
+            // Only include the four last bands (8 kHz and up).
+            if i > NUM_SPREAD_BANDS - 4 {
+                hf_sum += 32 * (tcount[1] + tcount[0]) / n as i32;
+            }
+            let tmp = i32::from(2 * tcount[2] >= n as i32)
+                + i32::from(2 * tcount[1] >= n as i32)
+                + i32::from(2 * tcount[0] >= n as i32);
+            sum += tmp * 256;
+            nb_bands += 1;
+        }
+    }
+    if update_hf {
+        if hf_sum != 0 {
+            hf_sum /= channels as i32 * (4 - NUM_SPREAD_BANDS as i32 + end as i32);
+        }
+        *hf_average = (*hf_average + hf_sum) >> 1;
+        let mut hf = *hf_average;
+        if *tapset_decision == 2 {
+            hf += 4;
+        } else if *tapset_decision == 0 {
+            hf -= 4;
+        }
+        *tapset_decision = if hf > 22 {
+            2
+        } else if hf > 18 {
+            1
+        } else {
+            0
+        };
+    }
+    debug_assert!(nb_bands > 0);
+    sum /= nb_bands.max(1);
+    // Recursive averaging, then hysteresis against the last decision.
+    sum = (sum + *average) >> 1;
+    *average = sum;
+    sum = (3 * sum + (((3 - last_decision.as_u8() as i32) << 7) + 64) + 2) >> 2;
+    if sum < 80 {
+        Spread::Aggressive
+    } else if sum < 256 {
+        Spread::Normal
+    } else if sum < 384 {
+        Spread::Light
+    } else {
+        Spread::None
+    }
+}
+
+/// The band count the [`spreading_decision`] high-frequency arm is
+/// written against (the 21-band Table-55 layout; the "last four
+/// bands" are 8 kHz and up).
+const NUM_SPREAD_BANDS: usize = 21;
 
 #[cfg(test)]
 mod tests {
