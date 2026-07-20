@@ -71,8 +71,59 @@ impl CodecOptionsStruct for CeltCodecOptions {
     }
 }
 
+/// Typed options for the encoder factory: the shared `frame_size`
+/// plus the rate-control mode.
+#[derive(Debug, Clone)]
+pub struct CeltEncoderOptions {
+    /// CELT frame size in samples at 48 kHz: 120, 240, 480, or 960.
+    pub frame_size: u32,
+    /// Variable bitrate: when set, each frame's size follows the
+    /// signal around the `bit_rate` target (transients boosted,
+    /// digital silence collapsed to 2 bytes) instead of the fixed
+    /// CBR size derived from `bit_rate`.
+    pub vbr: bool,
+}
+
+impl Default for CeltEncoderOptions {
+    fn default() -> Self {
+        Self {
+            frame_size: 960,
+            vbr: false,
+        }
+    }
+}
+
+impl CodecOptionsStruct for CeltEncoderOptions {
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "frame_size",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(960),
+            help: "CELT frame size in samples at 48 kHz (120, 240, 480, or 960)",
+        },
+        OptionField {
+            name: "vbr",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "variable bitrate around the bit_rate target (frames self-size; \
+                   digital silence collapses to 2-byte frames)",
+        },
+    ];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
+        match key {
+            "frame_size" => self.frame_size = value.as_u32()?,
+            "vbr" => self.vbr = value.as_bool()?,
+            _ => unreachable!("guarded by SCHEMA"),
+        }
+        Ok(())
+    }
+}
+
 /// Shared parameter validation: `(lm, channels, frame_size)`.
-fn stream_config(params: &CodecParameters) -> CoreResult<(u32, usize, usize)> {
+/// `frame_size` comes from the caller's already-parsed option struct
+/// (the decoder and encoder schemas differ).
+fn stream_config(params: &CodecParameters, frame_size: u32) -> CoreResult<(u32, usize, usize)> {
     if let Some(sr) = params.sample_rate {
         if sr != SAMPLE_RATE {
             return Err(CoreError::unsupported(format!(
@@ -86,8 +137,7 @@ fn stream_config(params: &CodecParameters) -> CoreResult<(u32, usize, usize)> {
             "celt: 1 or 2 channels supported (got {channels})"
         )));
     }
-    let opts: CeltCodecOptions = parse_options(&params.options)?;
-    let lm = match opts.frame_size {
+    let lm = match frame_size {
         120 => 0u32,
         240 => 1,
         480 => 2,
@@ -98,7 +148,7 @@ fn stream_config(params: &CodecParameters) -> CoreResult<(u32, usize, usize)> {
             )))
         }
     };
-    Ok((lm, channels as usize, opts.frame_size as usize))
+    Ok((lm, channels as usize, frame_size as usize))
 }
 
 fn map_err(e: crate::Error) -> CoreError {
@@ -181,7 +231,8 @@ impl oxideav_core::Decoder for CeltDecoder {
 /// Direct decoder factory (the dual-API entry point; also installed
 /// into the registry by [`register`]).
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Decoder>> {
-    let (lm, channels, _frame_size) = stream_config(params)?;
+    let opts: CeltCodecOptions = parse_options(&params.options)?;
+    let (lm, channels, _frame_size) = stream_config(params, opts.frame_size)?;
     Ok(Box::new(CeltDecoder {
         id: CodecId::new(CODEC_ID),
         inner: CeltRefDecoder::new(lm, channels).map_err(map_err)?,
@@ -205,6 +256,9 @@ pub struct CeltEncoder {
     channels: usize,
     frame_size: usize,
     frame_bytes: usize,
+    /// VBR: `Some(bitrate_bps)` sizes each frame from the §A.1
+    /// controller instead of the fixed `frame_bytes`.
+    vbr_bitrate: Option<u32>,
     /// Interleaved sample FIFO awaiting a full frame.
     buffer: Vec<f32>,
     ready: VecDeque<Packet>,
@@ -228,10 +282,16 @@ impl CeltEncoder {
         let span = self.frame_size * self.channels;
         while self.buffer.len() >= span {
             let chunk: Vec<f32> = self.buffer.drain(..span).collect();
-            let data = self
-                .inner
-                .encode_frame(&chunk, self.frame_bytes)
-                .map_err(map_err)?;
+            let data = match self.vbr_bitrate {
+                Some(rate) => self
+                    .inner
+                    .encode_frame_vbr(&chunk, 1275, rate, false)
+                    .map_err(map_err)?,
+                None => self
+                    .inner
+                    .encode_frame(&chunk, self.frame_bytes)
+                    .map_err(map_err)?,
+            };
             let mut packet = Packet::new(0, TimeBase::from_rate(SAMPLE_RATE), data);
             packet.pts = Some(self.position);
             packet.dts = packet.pts;
@@ -307,7 +367,8 @@ impl oxideav_core::Encoder for CeltEncoder {
 /// Direct encoder factory (the dual-API entry point; also installed
 /// into the registry by [`register`]).
 pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Encoder>> {
-    let (lm, channels, frame_size) = stream_config(params)?;
+    let enc_opts: CeltEncoderOptions = parse_options(&params.options)?;
+    let (lm, channels, frame_size) = stream_config(params, enc_opts.frame_size)?;
     let bit_rate = params.bit_rate.unwrap_or(DEFAULT_BIT_RATE);
     let frame_bytes =
         ((bit_rate as u128 * frame_size as u128) / (u128::from(SAMPLE_RATE) * 8)) as usize;
@@ -330,6 +391,9 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
         channels,
         frame_size,
         frame_bytes,
+        vbr_bitrate: enc_opts
+            .vbr
+            .then_some(bit_rate.clamp(1, u32::MAX as u64) as u32),
         buffer: Vec::new(),
         ready: VecDeque::new(),
         position: 0,
@@ -353,7 +417,7 @@ pub fn register(ctx: &mut RuntimeContext) {
             .decoder(make_decoder)
             .encoder(make_encoder)
             .decoder_options::<CeltCodecOptions>()
-            .encoder_options::<CeltCodecOptions>(),
+            .encoder_options::<CeltEncoderOptions>(),
     );
 }
 
@@ -386,6 +450,65 @@ mod tests {
             pts: Some(offset as i64),
             data: vec![bytes],
         })
+    }
+
+    /// The `vbr` encoder option: packets self-size around the
+    /// bit_rate target (silence collapses to the 2-byte minimum,
+    /// tonal frames vary), and the stream still decodes through the
+    /// registry decoder.
+    #[test]
+    fn registry_vbr_option() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut p = params(1, 480, Some(64_000));
+        p.options.insert("vbr", "true");
+        let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+
+        let frames_n = 30usize;
+        for f in 0..frames_n {
+            enc.send_frame(&tone_frame(480, 1, f * 480)).expect("send");
+        }
+        // A silence tail.
+        for f in frames_n..frames_n + 10 {
+            let bytes = vec![0u8; 480 * 4];
+            enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+                samples: 480,
+                pts: Some((f * 480) as i64),
+                data: vec![bytes],
+            }))
+            .expect("send");
+        }
+        enc.flush().expect("flush");
+        let mut packets = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pk) => packets.push(pk),
+                Err(CoreError::Eof) => break,
+                Err(e) => panic!("unexpected encoder error: {e:?}"),
+            }
+        }
+        assert_eq!(packets.len(), frames_n + 10);
+        let tone_sizes: Vec<usize> = packets[5..frames_n].iter().map(|p| p.data.len()).collect();
+        assert!(
+            tone_sizes.iter().any(|&s| s != tone_sizes[0]),
+            "vbr sizes never vary: {tone_sizes:?}"
+        );
+        assert!(
+            packets[frames_n + 2..].iter().all(|p| p.data.len() == 2),
+            "silence packets not minimal"
+        );
+
+        // And the variable-size stream decodes.
+        let mut dec = ctx
+            .codecs
+            .first_decoder(&params(1, 480, None))
+            .expect("decoder");
+        for pk in &packets {
+            dec.send_packet(pk).expect("decode");
+            let f = dec.receive_frame().expect("frame");
+            let Frame::Audio(a) = f else { panic!("audio") };
+            assert_eq!(a.samples, 480);
+        }
     }
 
     /// Registry round trip: register, resolve both factories, encode a

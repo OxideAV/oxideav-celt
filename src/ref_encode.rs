@@ -425,6 +425,13 @@ pub struct CeltRefEncoder {
     prefilter_tapset: usize,
     /// The 120-sample §4.3.7 window for the prefilter transition.
     pf_window: Vec<f32>,
+    /// §A.1 VBR controller state: the constrained-VBR bit reservoir,
+    /// the rate-drift integrator and its negated offset (all in 1/8
+    /// bits), and the adaptation frame counter.
+    vbr_reservoir: i32,
+    vbr_drift: i32,
+    vbr_offset: i32,
+    vbr_count: i32,
 }
 
 impl CeltRefEncoder {
@@ -461,6 +468,10 @@ impl CeltRefEncoder {
             prefilter_gain: 0.0,
             prefilter_tapset: 0,
             pf_window: (0..OVERLAP).map(|i| celt_window_f32(i, OVERLAP)).collect(),
+            vbr_reservoir: 0,
+            vbr_drift: 0,
+            vbr_offset: 0,
+            vbr_count: 0,
         })
     }
 
@@ -510,6 +521,49 @@ impl CeltRefEncoder {
     /// samples) into exactly `frame_bytes` bytes. The decoded output
     /// is the input delayed by `overlap` (120) samples.
     pub fn encode_frame(&mut self, pcm: &[f32], frame_bytes: usize) -> Result<Vec<u8>, Error> {
+        self.encode_impl(pcm, frame_bytes, 0, false)
+    }
+
+    /// Encode one frame in **VBR** mode (the §A.1 listing's variable
+    /// bitrate controller): the frame size follows the signal — the
+    /// base target is `bitrate_bps` minus the coarse-energy floor,
+    /// boosted 7/4 on transient (or strongly time-split) frames and
+    /// trimmed ~3.6% on long multi-block frames, with a drift
+    /// integrator steering the long-term mean onto the target and
+    /// digital-silence frames collapsing to 2 bytes. With
+    /// `constrained` set, a bit reservoir additionally bounds the
+    /// short-term rate above and below (constrained VBR); the frame
+    /// never exceeds `max_bytes` (clamped to the 1275-byte wire
+    /// limit) either way. Returns the coded frame, whose length IS
+    /// the wire size — raw CELT frames are self-delimiting only
+    /// through their container, exactly like the CBR path.
+    pub fn encode_frame_vbr(
+        &mut self,
+        pcm: &[f32],
+        max_bytes: usize,
+        bitrate_bps: u32,
+        constrained: bool,
+    ) -> Result<Vec<u8>, Error> {
+        if bitrate_bps == 0 {
+            return Err(Error::InvalidParameter);
+        }
+        let frame = self.frame_size();
+        // The target rate in 1/8 bits per frame (`den = Fs >> BITRES`).
+        let den = 48_000i64 >> BITRES;
+        let vbr_rate =
+            ((bitrate_bps as i64 * frame as i64 + (den >> 1)) / den).min(1275 * 64) as i32;
+        self.encode_impl(pcm, max_bytes.min(1275), vbr_rate, constrained)
+    }
+
+    /// The shared CBR/VBR encode walk (`vbr_rate` in 1/8 bits per
+    /// frame; 0 selects CBR at exactly `nb_bytes_in` bytes).
+    fn encode_impl(
+        &mut self,
+        pcm: &[f32],
+        nb_bytes_in: usize,
+        vbr_rate: i32,
+        constrained: bool,
+    ) -> Result<Vec<u8>, Error> {
         let lm = self.lm;
         let channels = self.channels;
         let frame = self.frame_size();
@@ -518,9 +572,26 @@ impl CeltRefEncoder {
         let end = NUM_BANDS;
         let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
         let n_coded = m * eb(end);
-        if pcm.len() != channels * frame || !(2..=1275).contains(&frame_bytes) {
+        if pcm.len() != channels * frame || !(2..=1275).contains(&nb_bytes_in) {
             return Err(Error::InvalidParameter);
         }
+        let mut frame_bytes = nb_bytes_in;
+        // Constrained VBR pre-clamp: the reservoir bounds the maximum
+        // rate up front so the bust-prevention gates see the real
+        // budget.
+        if vbr_rate > 0 && constrained {
+            let max_allowed = ((2 * vbr_rate - self.vbr_reservoir) >> (BITRES + 3))
+                .max(2)
+                .min(frame_bytes as i32);
+            frame_bytes = max_allowed as usize;
+        }
+        // Decision gates in VBR mode key on the target rate, not the
+        // cap.
+        let effective_bytes = if vbr_rate > 0 {
+            (vbr_rate >> (3 + BITRES)) as usize
+        } else {
+            frame_bytes
+        };
         let total_bits = (frame_bytes * 8) as u32;
         let frame_8th = (frame_bytes * 64) as i32;
 
@@ -748,14 +819,14 @@ impl CeltRefEncoder {
 
             // ── Time-frequency parameters (§A.1 lambda-priced
             // Viterbi analysis over both frame kinds) ──
-            let (tf_desired, _tf_sum) = tf_analysis(
+            let (tf_desired, tf_sum) = tf_analysis(
                 &x,
                 (channels == 2).then_some(&y[..]),
                 m,
                 is_transient,
                 lm,
                 end,
-                frame_bytes,
+                effective_bytes,
             );
             let mut tf_res = [0i32; NUM_BANDS];
             tf_encode(
@@ -856,6 +927,59 @@ impl CeltRefEncoder {
             };
             encode_alloc_trim(&mut enc, trim_gated, alloc_trim)?;
 
+            // ── Variable bitrate (§A.1 target/drift controller):
+            // the base target follows the tf response (short blocks
+            // boosted 7/4, long multi-block frames trimmed), the
+            // already-spent bits are folded in, the frame may never
+            // shrink below what is written (+2 bytes of decoder
+            // margin), and the drift integrator steers the long-term
+            // mean onto the target. The shrunk size takes effect for
+            // the allocation and everything after it — the earlier
+            // gates all fired at tell values the margin covers. ──
+            if vbr_rate > 0 {
+                let lm_diff = 3 - lm as i32;
+                let span = (end - start) as i32;
+                let mut target = vbr_rate + (self.vbr_offset >> lm_diff)
+                    - ((40 * channels as i32 + 20) << BITRES);
+                if is_transient || tf_sum < -2 * span {
+                    target = 7 * target / 4;
+                } else if tf_sum < -span {
+                    target = 3 * target / 2;
+                } else if m > 1 {
+                    target -= (target + 14) / 28;
+                }
+                let tell_frac = enc.tell_frac() as i32;
+                target += tell_frac;
+                let min_allowed = ((tell_frac + boosts.total_boost + (1 << (BITRES + 3)) - 1)
+                    >> (BITRES + 3))
+                    + 2;
+                let mut nb_available = (target + (1 << (BITRES + 2))) >> (BITRES + 3);
+                nb_available = nb_available.max(min_allowed).min(frame_bytes as i32);
+                let delta = target - vbr_rate;
+                let target_8th = nb_available << (BITRES + 3);
+                let alpha = if self.vbr_count < 970 {
+                    self.vbr_count += 1;
+                    1.0f32 / (self.vbr_count + 20) as f32
+                } else {
+                    0.001
+                };
+                if constrained {
+                    self.vbr_reservoir += target_8th - vbr_rate;
+                }
+                self.vbr_drift += (alpha
+                    * ((delta * (1 << lm_diff)) as f32
+                        - self.vbr_offset as f32
+                        - self.vbr_drift as f32)) as i32;
+                self.vbr_offset = -self.vbr_drift;
+                if constrained && self.vbr_reservoir < 0 {
+                    // Under the floor: raise the rate.
+                    let adjust = (-self.vbr_reservoir) / (8 << BITRES);
+                    nb_available += adjust;
+                    self.vbr_reservoir = 0;
+                }
+                frame_bytes = frame_bytes.min(nb_available.max(2) as usize);
+            }
+
             // ── Anti-collapse reservation + the exact allocation ──
             let mut bits = (frame_bytes as i32 * 8) * 8 - enc.tell_frac() as i32 - 1;
             let anti_collapse_rsv =
@@ -883,7 +1007,8 @@ impl CeltRefEncoder {
                     // §5.3.5: the Table-66 bitrate threshold picks the
                     // first intensity-coded band (`end` = disabled);
                     // the walk clamps to the post-skip window.
-                    intensity: intensity_start_band(total_bits, lm).unwrap_or(end) as i32,
+                    intensity: intensity_start_band((effective_bytes * 8) as u32, lm).unwrap_or(end)
+                        as i32,
                     // §A.1 L1 entropy model dual-vs-mid/side verdict
                     // on the unit-norm spectra; 2.5 ms frames always
                     // couple (the listing's rule).
@@ -971,6 +1096,28 @@ impl CeltRefEncoder {
             for c in 0..2 {
                 for i in 0..NUM_BANDS {
                     self.coarse.energy[c][i] = -28.0;
+                }
+            }
+            // §A.1 VBR: a silence frame sends the 2-byte minimum and
+            // refills the reservoir without touching the drift
+            // (delta = 0), so a silence span cannot launch the rate.
+            if vbr_rate > 0 {
+                frame_bytes = 2;
+                let target_8th = (2 * 8) << BITRES;
+                let alpha = if self.vbr_count < 970 {
+                    self.vbr_count += 1;
+                    1.0f32 / (self.vbr_count + 20) as f32
+                } else {
+                    0.001
+                };
+                if constrained {
+                    self.vbr_reservoir += target_8th - vbr_rate;
+                }
+                self.vbr_drift +=
+                    (alpha * (-self.vbr_offset as f32 - self.vbr_drift as f32)) as i32;
+                self.vbr_offset = -self.vbr_drift;
+                if constrained && self.vbr_reservoir < 0 {
+                    self.vbr_reservoir = 0;
                 }
             }
         }
@@ -1234,6 +1381,55 @@ mod tests {
             let mut rd = RangeDecoder::new(&bytes);
             assert_eq!(rd.dec_bit_logp(15), 0);
             assert_eq!(rd.dec_bit_logp(1), 0, "12-byte frame signalled pf");
+        }
+    }
+
+    /// The VBR controller: frames track the target rate on steady
+    /// tonal content, digital silence collapses to the 2-byte
+    /// minimum, the cap is always respected, and the stream decodes
+    /// cleanly across the size changes. Constrained mode keeps the
+    /// short-term rate bounded by the reservoir.
+    #[test]
+    fn vbr_tracks_target_and_collapses_silence() {
+        let lm = 2u32;
+        let frame = 480usize;
+        let frames_tone = 50usize;
+        let frames_sil = 25usize;
+        let mut pcm = tone(frame, 1, frames_tone, 0.3);
+        pcm.extend(std::iter::repeat(0.0f32).take(frames_sil * frame));
+        for &constrained in &[false, true] {
+            let mut enc = CeltRefEncoder::new(lm, 1).expect("encoder");
+            let mut dec = CeltRefDecoder::new(lm, 1).expect("decoder");
+            let mut sizes = Vec::new();
+            for f in 0..frames_tone + frames_sil {
+                let bytes = enc
+                    .encode_frame_vbr(&pcm[f * frame..(f + 1) * frame], 1275, 64_000, constrained)
+                    .expect("encode");
+                assert!(bytes.len() <= 1275);
+                let out = dec.decode_frame(&bytes).expect("decode");
+                assert!(out.iter().all(|v| v.is_finite()));
+                sizes.push(bytes.len());
+            }
+            // 64 kbit/s at 10 ms = 80 bytes/frame nominal. The tonal
+            // segment must land near it (past the adaptation ramp).
+            let tone_sizes = &sizes[10..frames_tone];
+            let mean = tone_sizes.iter().sum::<usize>() as f64 / tone_sizes.len() as f64;
+            assert!(
+                (55.0..=110.0).contains(&mean),
+                "constrained={constrained}: tonal mean {mean:.1} B/frame off target"
+            );
+            // Silence squeezes to the 2-byte minimum (allow the first
+            // frame of the span to carry the transition).
+            assert!(
+                sizes[frames_tone + 2..].iter().all(|&s| s == 2),
+                "constrained={constrained}: silence frames not minimal: {:?}",
+                &sizes[frames_tone..]
+            );
+            // Sizes genuinely vary (it is not CBR in disguise).
+            assert!(
+                tone_sizes.iter().any(|&s| s != tone_sizes[0]),
+                "constrained={constrained}: sizes never vary"
+            );
         }
     }
 
