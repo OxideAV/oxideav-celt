@@ -530,8 +530,9 @@ pub use bits_to_pulses::{
 };
 #[doc(hidden)]
 pub use coarse_energy::{
-    decode_coarse_energy, encode_coarse_energy, CoarseEnergyState, BETA_COEF_Q15, INTRA_ALPHA_Q15,
-    INTRA_BETA_Q15, MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, SMALL_ENERGY_ICDF,
+    decode_coarse_energy, encode_coarse_energy, quant_coarse_energy_rd, CoarseEnergyState,
+    BETA_COEF_Q15, INTRA_ALPHA_Q15, INTRA_BETA_Q15, MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15,
+    SMALL_ENERGY_ICDF,
 };
 #[doc(hidden)]
 pub use deemphasis::{

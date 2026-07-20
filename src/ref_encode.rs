@@ -42,10 +42,9 @@ use crate::band_layout::EBAND_EDGES_5MS;
 use crate::band_minimums::BAND_BINS_LM;
 use crate::band_quant::{haar1, quant_all_bands, BandAmps, QuantIo};
 use crate::bit_allocation::encode_alloc_trim;
-use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, NUM_BANDS};
+use crate::coarse_energy::{quant_coarse_energy_rd, CoarseEnergyState, NUM_BANDS};
 use crate::encoder_decisions::{
-    alloc_trim_analysis, boost_thresholds, choose_intra_mode, choose_mid_side_stereo,
-    intensity_start_band,
+    alloc_trim_analysis, boost_thresholds, choose_mid_side_stereo, intensity_start_band,
 };
 use crate::mdct::{build_low_overlap_window_f32, mdct_naive_f32};
 use crate::range_encoder::RangeEncoder;
@@ -330,6 +329,9 @@ pub struct CeltRefEncoder {
     /// Previous frame's `coded_bands` (the §4.3.3 skip-choice
     /// hysteresis anchor).
     prev_coded_bands: i32,
+    /// The §A.1 delayed-intra statistic (accumulated loss
+    /// distortion) driving the two-pass coarse mode selection.
+    delayed_intra: f32,
 }
 
 impl CeltRefEncoder {
@@ -356,6 +358,7 @@ impl CeltRefEncoder {
             short_window,
             rng: 0,
             prev_coded_bands: 0,
+            delayed_intra: 0.0,
         })
     }
 
@@ -522,26 +525,26 @@ impl CeltRefEncoder {
                 }
             }
 
-            // ── Intra flag + coarse energy ──
-            // §5.3.3 two-pass mode selection: price the coarse walk
-            // both ways on scratch states and keep the cheaper one
-            // (ties to inter).
-            let intra =
-                choose_intra_mode(&self.coarse, &targets, lm, start, end, channels, total_bits)
-                    .unwrap_or(false);
-            if tell + 3 <= total_bits {
-                enc.enc_bit_logp(u32::from(intra), 3)?;
-            }
-            encode_coarse_energy(
+            // ── Intra flag + coarse energy (§A.1 two-pass
+            // rate-distortion selection: intra and inter passes are
+            // both encoded and the lower-badness pass is kept, ties
+            // to the cheaper rate; the decay bound and end-of-budget
+            // clamps ride along) ──
+            quant_coarse_energy_rd(
                 &mut enc,
                 &mut self.coarse,
                 &targets,
-                intra,
                 lm,
                 start,
                 end,
+                end,
                 channels,
                 total_bits,
+                frame_bytes as i32,
+                false,
+                &mut self.delayed_intra,
+                true,
+                0,
             )?;
 
             // ── Time-frequency parameters (§A.1 lambda-priced

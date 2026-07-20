@@ -84,9 +84,13 @@
 //! `docs/audio/celt/spec/celt-laplace-decode.md`; the `{prob, decay}`
 //! parameter table and the per-LM prediction/`beta` coefficients are
 //! the data extractions `docs/audio/celt/tables/e_prob_model.csv` and
-//! the narrative `celt-coarse-energy-and-allocation.md` §1. No external
-//! library source — including the RFC's Appendix A reference listing —
-//! was consulted.
+//! the narrative `celt-coarse-energy-and-allocation.md` §1. The
+//! two-pass rate-distortion encoder ([`quant_coarse_energy_rd`]) is
+//! transcribed from the RFC's own Appendix A reference listing
+//! (`quant_coarse_energy` / `quant_coarse_energy_impl` /
+//! `loss_distortion`), extracted from the staged RFC text per §A.1
+//! and SHA-1-verified; no source outside the staged docs was
+//! consulted.
 
 use crate::e_prob_model::{E_PROB_MODEL, NUM_LM_FRAME_SIZES, PRED_INTER, PRED_INTRA};
 use crate::laplace::{ec_laplace_decode, ec_laplace_encode};
@@ -393,6 +397,241 @@ pub fn encode_coarse_energy(
     Ok(())
 }
 
+/// One pass of the §A.1 listing's coarse-energy encode
+/// (`quant_coarse_energy_impl`): the fixed-resolution walk of
+/// [`encode_coarse_energy`] extended with the listing's
+/// rate-distortion guards —
+///
+/// * the **decay bound**: a band may not drop more than `max_decay`
+///   below its previous quantized energy (floored at −28), so one
+///   low-energy frame cannot wreck the inter prediction;
+/// * the **end-of-budget clamps**: once fewer than 30 bits remain
+///   after reserving 3 bits for every not-yet-coded slot, `qi` is
+///   clamped to `<= 1` (under 24) and `>= -1` (under 16), keeping the
+///   tail of the envelope cheap instead of starving the shape bits;
+/// * the intra flag itself is written here (Table 56 position) when
+///   `tell + 3 <= budget`.
+///
+/// Returns the pass's **badness** — the summed distance between the
+/// ideal and actually-coded `qi` — the distortion measure the
+/// two-pass selection in [`quant_coarse_energy_rd`] compares.
+#[allow(clippy::too_many_arguments)]
+fn quant_coarse_energy_impl(
+    enc: &mut RangeEncoder,
+    state: &mut CoarseEnergyState,
+    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    intra: bool,
+    lm: usize,
+    start: usize,
+    end: usize,
+    channels: usize,
+    budget: u32,
+    tell0: u32,
+    max_decay: f32,
+) -> Result<i32, Error> {
+    let mut badness = 0i32;
+    let pred = if intra { PRED_INTRA } else { PRED_INTER };
+    let (coef, beta) = if intra {
+        (0.0_f32, INTRA_BETA_Q15 as f32 / Q15_ONE as f32)
+    } else {
+        (
+            PRED_COEF_Q15[lm] as f32 / Q15_ONE as f32,
+            BETA_COEF_Q15[lm] as f32 / Q15_ONE as f32,
+        )
+    };
+    if tell0 + 3 <= budget {
+        enc.enc_bit_logp(u32::from(intra), 3)?;
+    }
+    let mut prev = [0.0_f32; MAX_CHANNELS];
+    for band in start..end {
+        for (c, prev_c) in prev.iter_mut().enumerate().take(channels) {
+            let x = target[c][band];
+            let old = state.energy[c][band].max(ENERGY_FLOOR);
+            let f = x - coef * old - *prev_c;
+            let mut qi = (0.5 + f).floor() as i32;
+            let decay_bound = state.energy[c][band].max(-28.0) - max_decay;
+            // Prevent the energy from dropping faster than the decay
+            // bound (e.g. one-bin bands on a silence transition).
+            if qi < 0 && x < decay_bound {
+                qi += (decay_bound - x) as i32;
+                if qi > 0 {
+                    qi = 0;
+                }
+            }
+            let qi0 = qi;
+            // If the budget cannot cover the rest of the envelope,
+            // clamp toward the implicit cheap symbols.
+            let tell = enc.tell();
+            let bits_left = budget as i32 - tell as i32 - 3 * (channels * (end - band)) as i32;
+            if band != start && bits_left < 30 {
+                if bits_left < 24 {
+                    qi = qi.min(1);
+                }
+                if bits_left < 16 {
+                    qi = qi.max(-1);
+                }
+            }
+            let bits_avail = budget.saturating_sub(tell);
+            let qi = if bits_avail >= LAPLACE_MIN_BUDGET_BITS {
+                let pd = E_PROB_MODEL[lm][pred][band.min(NUM_BANDS - 1)];
+                ec_laplace_encode(enc, qi, (pd.prob as u32) << 7, (pd.decay as u32) << 6)?
+            } else if bits_avail >= 2 {
+                let clamped = qi.clamp(-1, 1);
+                let s = match clamped {
+                    0 => 0usize,
+                    -1 => 1,
+                    _ => 2,
+                };
+                enc.enc_icdf(s, &SMALL_ENERGY_ICDF, 2)?;
+                clamped
+            } else if bits_avail >= 1 {
+                let clamped = qi.clamp(-1, 0);
+                enc.enc_bit_logp((-clamped) as u32, 1)?;
+                clamped
+            } else {
+                -1
+            };
+            badness += (qi0 - qi).abs();
+            let q = qi as f32;
+            state.energy[c][band] = coef * old + *prev_c + q;
+            *prev_c += q - beta * q;
+        }
+    }
+    Ok(badness)
+}
+
+/// The §A.1 listing's loss-robustness distortion measure
+/// (`loss_distortion`): the squared distance between this frame's
+/// energy targets and the previous frame's quantized envelope, summed
+/// over the coded window and capped at 200 — the "how much would
+/// inter prediction hurt on packet loss" statistic that drives the
+/// delayed-intra state.
+fn loss_distortion(
+    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    state: &CoarseEnergyState,
+    start: usize,
+    eff_end: usize,
+    channels: usize,
+) -> f32 {
+    let mut dist = 0.0f32;
+    for c in 0..channels {
+        for i in start..eff_end {
+            let d = target[c][i] - state.energy[c][i];
+            dist += d * d;
+        }
+    }
+    dist.min(200.0)
+}
+
+/// The two-pass rate-distortion coarse-energy encode of the §A.1
+/// reference listing (`quant_coarse_energy`) — the encoder-side
+/// §4.3.2.1 walk with the listing's exact mode selection:
+///
+/// 1. the **intra pass** runs first (on scratch copies of the range
+///    coder and prediction state) whenever two-pass selection is on
+///    or intra is forced;
+/// 2. the **inter pass** then re-encodes from the saved starting
+///    state, and the frame keeps whichever pass has the lower
+///    *badness* (summed `|ideal - coded|` clamping distortion), ties
+///    broken by the cheaper `tell_frac` (plus the loss-rate intra
+///    bias); the losing pass's bytes are discarded by restoring the
+///    saved encoder;
+/// 3. `max_decay = min(16, nb_available_bytes/8)` bounds the per-band
+///    energy drop, and the `delayed_intra` state accumulates the
+///    [`loss_distortion`] statistic (decayed by `pred_coef^2` on
+///    inter frames) so a non-two-pass caller can force intra after
+///    heavy envelope motion.
+///
+/// Writes the Table-56 intra flag and the whole coarse envelope into
+/// `enc`; `state` holds the quantized energies both passes and the
+/// decoder agree on. Returns the chosen intra mode.
+#[allow(clippy::too_many_arguments)]
+pub fn quant_coarse_energy_rd(
+    enc: &mut RangeEncoder,
+    state: &mut CoarseEnergyState,
+    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    lm: u32,
+    start: usize,
+    end: usize,
+    eff_end: usize,
+    channels: usize,
+    budget: u32,
+    nb_available_bytes: i32,
+    force_intra: bool,
+    delayed_intra: &mut f32,
+    mut two_pass: bool,
+    loss_rate: u32,
+) -> Result<bool, Error> {
+    if lm as usize >= NUM_LM_FRAME_SIZES
+        || start > end
+        || end > NUM_BANDS
+        || eff_end > end
+        || channels == 0
+        || channels > MAX_CHANNELS
+    {
+        return Err(Error::InvalidParameter);
+    }
+    let lm = lm as usize;
+    let mut intra = force_intra
+        || (!two_pass
+            && *delayed_intra > (2 * channels * (end - start)) as f32
+            && nb_available_bytes > (channels * (end - start)) as i32);
+    let intra_bias =
+        ((budget as f32 * *delayed_intra * loss_rate as f32) / (channels as f32 * 512.0)) as i64;
+    let new_distortion = loss_distortion(target, state, start, eff_end, channels);
+    let tell0 = enc.tell();
+    if tell0 + 3 > budget {
+        two_pass = false;
+        intra = false;
+    }
+    let max_decay = (16.0f32).min(0.125 * nb_available_bytes as f32);
+
+    let enc_start = enc.clone();
+    let mut state_intra = *state;
+    let mut badness1 = 0i32;
+    if two_pass || intra {
+        badness1 = quant_coarse_energy_impl(
+            enc,
+            &mut state_intra,
+            target,
+            true,
+            lm,
+            start,
+            end,
+            channels,
+            budget,
+            tell0,
+            max_decay,
+        )?;
+    }
+    if !intra {
+        let enc_intra = enc.clone();
+        let tell_intra = enc.tell_frac();
+        *enc = enc_start;
+        let badness2 = quant_coarse_energy_impl(
+            enc, state, target, false, lm, start, end, channels, budget, tell0, max_decay,
+        )?;
+        if two_pass
+            && (badness1 < badness2
+                || (badness1 == badness2
+                    && enc.tell_frac() as i64 + intra_bias > tell_intra as i64))
+        {
+            *enc = enc_intra;
+            *state = state_intra;
+            intra = true;
+        }
+    } else {
+        *state = state_intra;
+    }
+    if intra {
+        *delayed_intra = new_distortion;
+    } else {
+        let pc = PRED_COEF_Q15[lm] as f32 / Q15_ONE as f32;
+        *delayed_intra = pc * pc * *delayed_intra + new_distortion;
+    }
+    Ok(intra)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,6 +692,146 @@ mod tests {
         state.energy[1][20] = -3.5;
         state.reset();
         assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+    }
+
+    /// The two-pass RD encode stays in exact decoder lockstep: for a
+    /// spread of targets, states, and budgets, the frame decodes to
+    /// the identical intra flag and the identical quantized energies
+    /// (both channels), through the plain §4.3.2.1 decode walk.
+    #[test]
+    fn quant_coarse_energy_rd_decoder_lockstep() {
+        for case in 0..8u32 {
+            let lm = case % 4;
+            let channels = 1 + (case as usize / 4);
+            let budget_bytes = [12u32, 96, 40, 200, 24, 160, 64, 250][case as usize];
+            let budget = budget_bytes * 8;
+            let mut state = CoarseEnergyState::new();
+            let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+            for c in 0..channels {
+                for b in 0..NUM_BANDS {
+                    state.energy[c][b] = ((b * 7 + c * 3 + case as usize) % 11) as f32 - 5.0;
+                    target[c][b] = ((b * 5 + c * 2 + 2 * case as usize) % 13) as f32 * 0.7 - 4.0;
+                }
+            }
+            let mut delayed = 1.5f32;
+            let mut enc = RangeEncoder::new();
+            let mut enc_state = state;
+            let intra = quant_coarse_energy_rd(
+                &mut enc,
+                &mut enc_state,
+                &target,
+                lm,
+                0,
+                NUM_BANDS,
+                NUM_BANDS,
+                channels,
+                budget,
+                budget_bytes as i32,
+                false,
+                &mut delayed,
+                true,
+                0,
+            )
+            .unwrap();
+            let bytes = enc.finish_to_size(budget_bytes as usize).unwrap();
+            let mut dec = crate::range_decoder::RangeDecoder::new(&bytes);
+            let dec_intra = dec.dec_bit_logp(3) == 1;
+            assert_eq!(dec_intra, intra, "case {case}: intra flag mismatch");
+            let mut dec_state = state;
+            decode_coarse_energy(&mut dec, &mut dec_state, intra, lm, 0, NUM_BANDS, channels)
+                .unwrap();
+            for c in 0..channels {
+                for b in 0..NUM_BANDS {
+                    assert!(
+                        (dec_state.energy[c][b] - enc_state.energy[c][b]).abs() < 1e-4,
+                        "case {case} c={c} b={b}: {} vs {}",
+                        dec_state.energy[c][b],
+                        enc_state.energy[c][b]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The decay bound: with a small byte budget, a hard drop to
+    /// silence may not pull any band more than
+    /// `max_decay = min(16, bytes/8)` below its previous quantized
+    /// energy.
+    #[test]
+    fn quant_coarse_energy_rd_decay_bound() {
+        let bytes = 40u32; // max_decay = 5.0
+        let mut state = CoarseEnergyState::new();
+        for b in 0..NUM_BANDS {
+            state.energy[0][b] = 6.0;
+        }
+        let start_energy = state.energy;
+        let target = [[-28.0f32; NUM_BANDS]; MAX_CHANNELS];
+        let mut delayed = 0.0f32;
+        let mut enc = RangeEncoder::new();
+        quant_coarse_energy_rd(
+            &mut enc,
+            &mut state,
+            &target,
+            2,
+            0,
+            NUM_BANDS,
+            NUM_BANDS,
+            1,
+            bytes * 8,
+            bytes as i32,
+            false,
+            &mut delayed,
+            true,
+            0,
+        )
+        .unwrap();
+        for b in 0..NUM_BANDS {
+            assert!(
+                state.energy[0][b] >= start_energy[0][b] - 5.0 - 1.0,
+                "band {b} dropped past the decay bound: {} -> {}",
+                start_energy[0][b],
+                state.energy[0][b]
+            );
+        }
+    }
+
+    /// Badness beats rate in the two-pass selection: when the inter
+    /// pass must clamp hard (large prediction errors against a stale
+    /// state) and the intra pass codes the envelope faithfully, the
+    /// intra pass wins even though its flag costs ~3 bits.
+    #[test]
+    fn quant_coarse_energy_rd_prefers_lower_badness() {
+        let bytes = 21u32; // tight: end-of-budget clamps bite inter
+        let mut state = CoarseEnergyState::new();
+        for b in 0..NUM_BANDS {
+            state.energy[0][b] = if b % 2 == 0 { 8.0 } else { -8.0 };
+        }
+        let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        for (b, t) in target[0].iter_mut().enumerate() {
+            *t = if b % 2 == 0 { -6.0 } else { 6.0 };
+        }
+        let mut delayed = 0.0f32;
+        let mut enc = RangeEncoder::new();
+        let intra = quant_coarse_energy_rd(
+            &mut enc,
+            &mut state,
+            &target,
+            0,
+            0,
+            NUM_BANDS,
+            NUM_BANDS,
+            1,
+            bytes * 8,
+            bytes as i32,
+            false,
+            &mut delayed,
+            true,
+            0,
+        )
+        .unwrap();
+        assert!(intra, "high-motion envelope should pick the intra pass");
+        // And the delayed-intra statistic reflects the distortion cap.
+        assert!(delayed > 0.0 && delayed <= 200.0);
     }
 
     /// Out-of-range parameters are rejected without touching the
