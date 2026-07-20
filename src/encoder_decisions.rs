@@ -344,6 +344,38 @@ pub fn alloc_trim_analysis(
     trim.clamp(0, 10) as u8
 }
 
+/// The §5.3.5 dual-vs-mid/side stereo decision at the reference
+/// listing's exact operating point (transcribed from the §A.1
+/// listing, `stereo_analysis`): the L1 norms of the L/R pair and the
+/// (unnormalized) M/S pair over the first 13 bands' coded bins model
+/// the two codings' entropy, the M/S norm scaled by the listing's
+/// literal `0.707107`, and the M/S side additionally charged
+/// `thetas` extra degrees of freedom (13, minus 8 for `LM <= 1` —
+/// the low bands that code no theta there). Returns `true` for
+/// **dual** stereo. `x` / `y` are the coded-window unit-norm spectra
+/// (band-contiguous), `m = 1 << LM`.
+pub fn stereo_analysis(x: &[f32], y: &[f32], lm: u32) -> bool {
+    use crate::band_layout::EBAND_EDGES_5MS;
+    let m = 1usize << lm;
+    let span = m * EBAND_EDGES_5MS[13] as usize;
+    let mut sum_lr = 1e-15f64;
+    let mut sum_ms = 1e-15f64;
+    for (&l, &r) in x[..span].iter().zip(&y[..span]) {
+        let (l, r) = (f64::from(l), f64::from(r));
+        sum_lr += l.abs() + r.abs();
+        sum_ms += (l + r).abs() + (l - r).abs();
+    }
+    #[allow(clippy::approx_constant)] // the listing's literal constant
+    let sum_ms = 0.707107 * sum_ms;
+    let mut thetas = 13i64;
+    // No thetas for the lower bands at LM <= 1.
+    if lm <= 1 {
+        thetas -= 8;
+    }
+    let w = (EBAND_EDGES_5MS[13] as i64) << (lm + 1);
+    (w + thetas) as f64 * sum_ms > w as f64 * sum_lr
+}
+
 /// The number of bands the §5.3.5 mid/side-vs-dual comparison runs
 /// over: "comparing the estimated entropy with and without coupling
 /// over the first 13 bands".

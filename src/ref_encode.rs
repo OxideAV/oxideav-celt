@@ -44,7 +44,7 @@ use crate::band_quant::{haar1, quant_all_bands, BandAmps, QuantIo};
 use crate::bit_allocation::encode_alloc_trim;
 use crate::coarse_energy::{quant_coarse_energy_rd, CoarseEnergyState, NUM_BANDS};
 use crate::encoder_decisions::{
-    alloc_trim_analysis, boost_thresholds, choose_mid_side_stereo, intensity_start_band,
+    alloc_trim_analysis, boost_thresholds, intensity_start_band, stereo_analysis,
 };
 use crate::mdct::{build_low_overlap_window_f32, celt_window_f32, mdct_naive_f32};
 use crate::pitch::pitch_search;
@@ -400,6 +400,10 @@ pub struct CeltRefEncoder {
     /// Previous frame's `coded_bands` (the §4.3.3 skip-choice
     /// hysteresis anchor).
     prev_coded_bands: i32,
+    /// Consecutive-transient run length (the §A.1 anti-collapse
+    /// request rule: request injection only for the first two
+    /// transient frames of a run).
+    consec_transient: u32,
     /// The §A.1 delayed-intra statistic (accumulated loss
     /// distortion) driving the two-pass coarse mode selection.
     delayed_intra: f32,
@@ -447,6 +451,7 @@ impl CeltRefEncoder {
             short_window,
             rng: 0,
             prev_coded_bands: 0,
+            consec_transient: 0,
             delayed_intra: 1.0,
             tonal_average: 256,
             hf_average: 0,
@@ -879,10 +884,10 @@ impl CeltRefEncoder {
                     // first intensity-coded band (`end` = disabled);
                     // the walk clamps to the post-skip window.
                     intensity: intensity_start_band(total_bits, lm).unwrap_or(end) as i32,
-                    // §5.3.5 L1 mid/side-vs-dual verdict on the raw
-                    // per-channel spectra (dual when L/R wins).
-                    dual_stereo: channels == 2
-                        && !choose_mid_side_stereo(&freqs[0], &freqs[1], lm, start).unwrap_or(true),
+                    // §A.1 L1 entropy model dual-vs-mid/side verdict
+                    // on the unit-norm spectra; 2.5 ms frames always
+                    // couple (the listing's rule).
+                    dual_stereo: channels == 2 && lm != 0 && stereo_analysis(&x, &y, lm),
                     prev_coded_bands: self.prev_coded_bands,
                 },
             )?;
@@ -930,15 +935,12 @@ impl CeltRefEncoder {
                 true,
             )?;
 
-            // ── Anti-collapse bit (encoder freedom): whenever the
-            // reservation was made, request the §4.3.5 injection —
-            // the decoder noise-fills only the short blocks whose
-            // collapse masks actually collapsed, so the request is
-            // free on fully-coded frames and prevents spectral
-            // holes on sparse transients. Decode-side state is
-            // unaffected either way. ──
+            // ── Anti-collapse bit (the §A.1 rule: request the
+            // §4.3.5 injection for the first two transient frames
+            // of a run — a long transient run keeps its thinner
+            // short-block energy instead of pumping noise). ──
             if anti_collapse_rsv > 0 {
-                enc.enc_bits(1, 1)?;
+                enc.enc_bits(u32::from(self.consec_transient < 2), 1)?;
             }
 
             // ── Final fine-energy bits (§4.3.2.2 finalize) ──
@@ -990,6 +992,11 @@ impl CeltRefEncoder {
                     self.old_log_e[c][i] = self.old_log_e[c][i].min(self.coarse.energy[c][i]);
                 }
             }
+        }
+        if is_transient {
+            self.consec_transient += 1;
+        } else {
+            self.consec_transient = 0;
         }
 
         self.rng = enc.range_state();
