@@ -4,6 +4,64 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.10...v0.2.0) - 2026-07-20
+
+### Other
+
+- r419 README/CHANGELOG — encoder beats the listing at every measured rate
+- $A.1 VBR controller — encode_frame_vbr + registry 'vbr' option
+- $A.1 stereo_analysis dual/MS verdict + consec-transient anti-collapse
+- signal the §5.3.1 pitch prefilter — the reference encoder's tonal RD lever
+- clippy fixes for the coarse-RD commit (iterator loops, dead tell)
+- two-pass badness-driven coarse-energy RD ($A.1 quant_coarse_energy)
+- listing-exact alloc-trim analysis + stereo-averaged dynalloc contrast
+- lambda-priced Viterbi TF analysis on long and transient frames
+- request §4.3.5 anti-collapse on transient frames
+- raw-frame fixture regression — reference-exact decode gated on the staged listing-encoded sets
+- r417 README/lib.rs/decision-docs — encoder arc + registry status
+- per-band §4.3.4.5 TF encode machinery + transient TF decision + budget-gate sweep
+- §5.3.5 stereo decisions — Table-66 intensity threshold + L1 mid/side-vs-dual verdict
+- oxideav-core registry wiring — Decoder + Encoder registration with dual-API factories
+- reference-compatible encoder arc — exact Table-56 encode walk + §A.1-listing cross-decode validation
+- mark internal §4.3 chain + ref-decode plumbing #[doc(hidden)]
+- r414 README/CHANGELOG/status — reference-exact decode milestone
+- deduplicate the black-box stream plumbing into tests/common
+- black-box reference-decode sweep — 133-137 dB float SNR at every frame size, mono and stereo
+- reference-exact end-to-end frame decoder — real reference streams decode at the comparison floor
+- reference-exact §4.3.4 band-quantization loop (splits, itheta, folding, collapse masks)
+- reference-exact §4.3.3 allocation walk from the normative Appendix A listing
+- r408 README/status — reallocation walk + interop energy convention
+- wire-interop absolute energy convention + black-box reference harness
+- wire the §4.3.3 reallocation walk into every frame driver
+- §4.3.3 reallocation walk per the staged behavioral spec
+- §4.3.3 static allocation takes base-width N — fix the 2^LM inflation
+- decode_stereo_frame doc — coarse-only prediction on the input-boundary variant
+- §4.3.2.1 fine-energy feedback into the inter-frame prediction + RFC 8251 §8 energy cap
+- r406 docs — README/CHANGELOG/lib.rs for the transient + anti-collapse + finalize round
+- §4.3.2.2 final fine-energy backfill wired through the codec loops
+- transient frame encode — the PCM codec loop closes over short-block frames
+- transient frame decode + §4.3.5 anti-collapse wired through every decode driver
+- §4.3.5 anti-collapse injection primitive
+- §4.3.4.5 inverse TF transform for the encode direction
+- transient frame spines — synthesize_frame / analyze_frame over one shared overlap state
+- §4.3.1/§4.3.7 transient short-block WOLA primitives
+- README — r393 §5.3.1 pitch pre-filter section + stale post-filter-rejection claims updated
+- §5.3.1 pitch pre-filter wired into the mono PCM loop + §4.3.7.1 history fixes
+- §5.3.1 pitch pre-filter inverse + pitch search
+- r393 docs — README/CHANGELOG for the corrected-cache allocation round + tightened fidelity assertions
+- in-crate fine/shape split — derived fine-energy bits in the auto codec loops
+- §4.3.3 hard-minimum skip floor in the pulse derivation
+- bit-exact cache pricing in the pulse derivation + rigorous budget fit
+- corrected LM-major pulse-cache mapping (docs #184) + combinatoric validation
+- add CI / crates.io / docs.rs / MIT-license badges
+- stereo-loop depth coverage — narrow band window + mixed sound/silence stream
+- README + crate docs — document the r389 stereo codec loop subsystem
+- §5.3.5 stereo decisions — mid/side-vs-dual L1 rule + Table 66 intensity thresholds
+- §5.3.4.2 allocation-trim decision, wired through the auto encoders
+- stereo PCM codec loop (StereoCeltEncodeState + encode_stereo_celt_frame_pcm[_auto])
+- dual-stereo frame codec + §4.3.4.1 balance-conservation fix
+- dual-stereo residual walk + shared per-band pulse derivation
+
 ### Added
 
 * **Round-419 — §5.3.1 pitch prefilter signalled by the reference
