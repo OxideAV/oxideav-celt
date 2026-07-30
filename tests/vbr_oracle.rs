@@ -269,3 +269,90 @@ fn vbr_controller_tracks_the_reference_oracle() {
         );
     }
 }
+
+/// Multi-rate VBR A/B (runtime-gated on `CELT_HYB_ENC`/`CELT_HYB_DEC`
+/// oracle harness binaries): the controller tracks the reference
+/// across the rate axis, not just the staged 64 kb/s point — same
+/// silence positions, bracketing mean, tracking trajectory at 32,
+/// 96, and 128 kb/s in both VBR modes.
+#[test]
+fn vbr_controller_tracks_the_oracle_across_rates() {
+    let (Some(enc_bin), Some(dec_bin)) = (
+        std::env::var_os("CELT_HYB_ENC"),
+        std::env::var_os("CELT_HYB_DEC"),
+    ) else {
+        eprintln!("CELT_HYB_ENC/CELT_HYB_DEC not set; skipping multi-rate VBR A/B");
+        return;
+    };
+    let (enc_bin, dec_bin) = (PathBuf::from(enc_bin), PathBuf::from(dec_bin));
+    let _ = &dec_bin; // decoder side covered by the fixture arm
+    let dir = std::env::temp_dir().join("celt-vbr-multirate-ab");
+    std::fs::create_dir_all(&dir).expect("tmp dir");
+
+    for &(lm, channels, constrained) in &[(2u32, 1usize, false), (3, 2, true)] {
+        let frame = 120usize << lm;
+        let input = test_signal(channels);
+        let in_f32 = dir.join(format!("in-{channels}.f32"));
+        let mut bytes = Vec::with_capacity(input.len() * 4);
+        for v in &input {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(&in_f32, bytes).expect("write input");
+
+        for &rate in &[32_000u32, 96_000, 128_000] {
+            let oracle_frames = dir.join(format!("o-{lm}-{channels}-{rate}.frames"));
+            let out = std::process::Command::new(&enc_bin)
+                .args([
+                    channels.to_string().as_str(),
+                    frame.to_string().as_str(),
+                    "0",
+                    if constrained { "cvbr" } else { "vbr" },
+                    rate.to_string().as_str(),
+                    in_f32.to_str().unwrap(),
+                    oracle_frames.to_str().unwrap(),
+                ])
+                .output()
+                .expect("oracle encoder runs");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let oracle = stats(
+                &oracle_sizes(&std::fs::read(&oracle_frames).expect("frames")),
+                frame,
+            );
+
+            let mut enc = CeltRefEncoder::new(lm, channels).expect("encoder");
+            let mut sizes = Vec::new();
+            for chunk in input.chunks_exact(frame * channels) {
+                sizes.push(
+                    enc.encode_frame_vbr(chunk, 1275, rate, constrained)
+                        .expect("vbr encode")
+                        .len(),
+                );
+            }
+            let ours = stats(&sizes, frame);
+            let corr = pearson(&ours.sizes, &oracle.sizes);
+            let ratio = ours.mean_kbps / oracle.mean_kbps;
+            eprintln!(
+                "vbr-ab lm={lm} ch={channels} {rate} b/s {}: mean {:.2} vs {:.2} kb/s \
+                 (ratio {ratio:.3}) | 2-byte {} vs {} | corr {corr:.3}",
+                if constrained { "cvbr" } else { "vbr" },
+                ours.mean_kbps,
+                oracle.mean_kbps,
+                ours.silence_frames.len(),
+                oracle.silence_frames.len(),
+            );
+            assert_eq!(
+                ours.silence_frames, oracle.silence_frames,
+                "lm={lm} {rate}: silence positions"
+            );
+            assert!(
+                (0.85..=1.15).contains(&ratio),
+                "lm={lm} {rate}: mean rate ratio {ratio:.3}"
+            );
+            assert!(corr >= 0.85, "lm={lm} {rate}: size correlation {corr:.3}");
+        }
+    }
+}
