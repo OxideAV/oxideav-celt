@@ -623,13 +623,15 @@ impl CeltRefEncoder {
 
         let mut enc = RangeEncoder::new();
 
-        // ── Table 56: silence ── (detected over the carried overlap
-        // tail plus the new frame, before any filtering)
+        // ── Table 56: silence ── (the §A.1 rule: every pre-emphasized
+        // sample of the *current* frame is exactly zero — the frame
+        // after the last nonzero sample still carries the pre-emphasis
+        // memory discharge, so a silence run flags one frame late)
         let mut tell = enc.tell();
         let mut silence = true;
-        'sil: for (c, pre) in pres.iter().enumerate().take(channels) {
-            for &s in self.in_mem[c].iter().chain(&pre[COMB_MAX_PERIOD..]) {
-                if s.abs() >= 0.5 {
+        'sil: for pre in pres.iter().take(channels) {
+            for &s in &pre[COMB_MAX_PERIOD..] {
+                if s != 0.0 {
                     silence = false;
                     break 'sil;
                 }
