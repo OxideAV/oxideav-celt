@@ -239,6 +239,10 @@ fn anti_collapse(
 pub struct CeltRefDecoder {
     lm: u32,
     channels: usize,
+    /// First coded band (`0` for pure CELT; `17` for the CELT layer
+    /// of a Hybrid stream, whose bands below 8 kHz are carried by the
+    /// SILK layer).
+    start: usize,
     /// §4.3.2.1 inter-frame energy prediction (`oldBandE`) — carries
     /// the fine/finalize-corrected values per the reference.
     // internal — exposed for tests/fuzz; not part of the stable API
@@ -271,7 +275,17 @@ impl CeltRefDecoder {
     /// Build a decoder for frame-size shift `lm` (`0..=3`) and 1 or 2
     /// channels.
     pub fn new(lm: u32, channels: usize) -> Result<Self, Error> {
-        if lm > 3 || !(1..=2).contains(&channels) {
+        Self::new_with_start(lm, channels, 0)
+    }
+
+    /// Build a decoder whose frames start at band `start` (`0..21`).
+    /// `start = 17` is the Hybrid-mode CELT layer: the walk skips the
+    /// post-filter fields (never coded when `start != 0`) and codes
+    /// coarse/tf/dynalloc/allocation/shape over bands
+    /// `start..21` only; the spectrum below the start band
+    /// synthesizes as zero (the SILK layer's territory).
+    pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
+        if lm > 3 || !(1..=2).contains(&channels) || start >= NUM_BANDS {
             return Err(Error::InvalidParameter);
         }
         let frame = mdct_size(lm).ok_or(Error::InvalidParameter)?;
@@ -283,6 +297,7 @@ impl CeltRefDecoder {
         Ok(Self {
             lm,
             channels,
+            start,
             coarse: CoarseEnergyState::new(),
             old_log_e: [[-28.0; NUM_BANDS]; 2],
             old_log_e2: [[-28.0; NUM_BANDS]; 2],
@@ -313,7 +328,7 @@ impl CeltRefDecoder {
         let lm = self.lm;
         let channels = self.channels;
         let frame = self.frame_size();
-        let start = 0usize;
+        let start = self.start;
         let end = NUM_BANDS;
         let n_coded = (1usize << lm) * EBAND_EDGES_5MS[end] as usize;
         if bytes.is_empty() || bytes.len() > 1275 {
@@ -677,6 +692,17 @@ impl CeltRefDecoder {
                 for i in 0..NUM_BANDS {
                     self.old_log_e[c][i] = self.old_log_e[c][i].min(self.coarse.energy[c][i]);
                 }
+            }
+        }
+
+        // Bands outside [start, end) hold their reference reset
+        // values across frames ("in case start or end were to
+        // change"): zero prediction state, floored history.
+        for c in 0..2 {
+            for i in 0..start {
+                self.coarse.energy[c][i] = 0.0;
+                self.old_log_e[c][i] = -28.0;
+                self.old_log_e2[c][i] = -28.0;
             }
         }
 

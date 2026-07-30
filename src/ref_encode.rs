@@ -432,13 +432,27 @@ pub struct CeltRefEncoder {
     vbr_drift: i32,
     vbr_offset: i32,
     vbr_count: i32,
+    /// First coded band (`0` for pure CELT; `17` for the Hybrid-mode
+    /// CELT layer).
+    start: usize,
 }
 
 impl CeltRefEncoder {
     /// Build an encoder for frame-size shift `lm` (`0..=3`) and 1 or 2
     /// channels.
     pub fn new(lm: u32, channels: usize) -> Result<Self, Error> {
-        if lm > 3 || !(1..=2).contains(&channels) {
+        Self::new_with_start(lm, channels, 0)
+    }
+
+    /// Build an encoder whose frames start at band `start` (`0..21`).
+    /// `start = 17` is the Hybrid-mode CELT layer: the §5.3.1 pitch
+    /// prefilter is disabled and no post-filter fields are coded
+    /// (exactly the `start != 0` reference behaviour), and
+    /// coarse/tf/dynalloc/allocation/shape cover bands `start..21`
+    /// only — the spectrum below the start band is not coded (the
+    /// SILK layer's territory).
+    pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
+        if lm > 3 || !(1..=2).contains(&channels) || start >= NUM_BANDS {
             return Err(Error::InvalidParameter);
         }
         let frame = mdct_size(lm).ok_or(Error::InvalidParameter)?;
@@ -472,6 +486,7 @@ impl CeltRefEncoder {
             vbr_drift: 0,
             vbr_offset: 0,
             vbr_count: 0,
+            start,
         })
     }
 
@@ -568,7 +583,7 @@ impl CeltRefEncoder {
         let channels = self.channels;
         let frame = self.frame_size();
         let m = 1usize << lm;
-        let start = 0usize;
+        let start = self.start;
         let end = NUM_BANDS;
         let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
         let n_coded = m * eb(end);
@@ -650,7 +665,7 @@ impl CeltRefEncoder {
         let mut gain1 = 0.0f32;
         let mut pitch_index = COMB_MIN_PERIOD;
         let mut prefilter_tapset = 0usize;
-        if frame_bytes > 12 * channels && !silence {
+        if frame_bytes > 12 * channels && start == 0 && !silence {
             // Channel-averaged unfiltered pre-emphasized signal.
             let mut dm = pres[0].clone();
             if channels == 2 {
@@ -1009,8 +1024,11 @@ impl CeltRefEncoder {
                     // §5.3.5: the Table-66 bitrate threshold picks the
                     // first intensity-coded band (`end` = disabled);
                     // the walk clamps to the post-skip window.
-                    intensity: intensity_start_band((effective_bytes * 8) as u32, lm).unwrap_or(end)
-                        as i32,
+                    // (clamped into the coded window, the reference's
+                    // `min(end, max(start, intensity))`)
+                    intensity: intensity_start_band((effective_bytes * 8) as u32, lm)
+                        .unwrap_or(end)
+                        .max(start) as i32,
                     // §A.1 L1 entropy model dual-vs-mid/side verdict
                     // on the unit-norm spectra; 2.5 ms frames always
                     // couple (the listing's rule).
@@ -1146,6 +1164,17 @@ impl CeltRefEncoder {
             self.consec_transient += 1;
         } else {
             self.consec_transient = 0;
+        }
+
+        // Bands outside [start, end) hold their reference reset
+        // values across frames ("in case start or end were to
+        // change"): zero prediction state, floored history.
+        for c in 0..2 {
+            for i in 0..start {
+                self.coarse.energy[c][i] = 0.0;
+                self.old_log_e[c][i] = -28.0;
+                self.old_log_e2[c][i] = -28.0;
+            }
         }
 
         self.rng = enc.range_state();
