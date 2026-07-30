@@ -6,6 +6,41 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-434 — VBR oracle validation + §A.1-exact silence
+  detection**: the staged VBR/CVBR fixture arm
+  (`docs/audio/celt/fixtures/{vbr,cvbr}-lm*`, reference-listing
+  encodes at a 64 kb/s target) now gates both codec directions. The
+  decoder regression covers all ten raw-frame sets (99.4–109.2 dB
+  float SNR, variable frame sizes and 2-byte silence frames
+  included). The encoder's digital-silence rule was corrected to the
+  listing's — every pre-emphasized sample of the *current* frame
+  exactly zero, no overlap-tail window, no threshold — closing a
+  one-frame offset the fixtures exposed; every 2-byte silence frame
+  now lands at exactly the oracle's frame positions on all six sets.
+  The `tests/vbr_oracle.rs` A/B pins mean rate (within 1.9% at 64 k;
+  constrained totals **byte-equal** to the oracle's), per-frame size
+  correlation 0.96–0.99, and SNR at the spent rate within 0.3 dB of
+  the reference; a runtime-gated multi-rate arm holds the same gates
+  at 32/96/128 kb/s (constrained means again byte-equal).
+
+* **Round-434 — Hybrid-mode CELT layer (`start = 17`)**:
+  `CeltRefDecoder::new_with_start` / `CeltRefEncoder::new_with_start`
+  open the frame walk at an arbitrary first coded band with the
+  reference `start != 0` behaviours (no post-filter fields, no pitch
+  prefilter, intensity clamped into the coded window, out-of-range
+  energy state pinned to its reset values each frame). Black-box A/B
+  against listing-built oracle harnesses at start band 17: our decode
+  of oracle hybrid streams 109.7–112.5 dB, cross-decoder on our
+  streams 111.4–128.8 dB, quality parity within 0.1 dB, hybrid-VBR
+  silence positions identical. Registry: new `start_band` option on
+  both factories and `vbr_constrained` on the encoder.
+
+* **Round-434 — high-rate coverage**: 192/384 kb/s CBR sweep (LM 2/3
+  mono + 384 kb/s stereo) — oracle streams decode at 105.7–108.9 dB,
+  and the encoder measures above the listing at every point on the
+  steady tonal window (up to +5.0 dB at LM 2 192 kb/s) with
+  full-file parity.
+
 * **Round-419 — §5.3.1 pitch prefilter signalled by the reference
   encoder**: the encoder now runs the full prefilter chain per frame
   (pitch search over 1024 samples of unfiltered pre-emphasized

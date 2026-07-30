@@ -6,6 +6,40 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**VBR oracle-validated + Hybrid-mode CELT layer, r434.** The staged
+VBR fixture arm (`{vbr,cvbr}-lm*`, reference-listing encodes at a
+64 kb/s target) now gates both directions. Decode: all ten raw-frame
+sets (CBR + VBR + constrained-VBR) reproduce the listing decode at
+99.4–109.2 dB float SNR, variable frame sizes and 2-byte silence
+frames included. Encode: the r419 controller was already
+§A.1-shaped; the fixtures exposed one defect — the digital-silence
+rule — now corrected to the listing's (every pre-emphasized sample
+of the *current* frame exactly zero; the frame after the last
+nonzero sample still carries the pre-emphasis memory discharge).
+With it, `tests/vbr_oracle.rs` measures: 2-byte silence frames at
+**exactly** the oracle's positions on all six sets, mean rate within
+1.9% (55.47/56.60/60.85/69.52 vs 55.48/55.93/61.83/70.83 kb/s across
+the four unconstrained sets), per-frame size correlation
+0.962–0.994, SNR at the spent rate within 0.3 dB — and the
+**constrained-VBR reservoir lands on the oracle's total to the
+byte** (4178/4178 and 4328/4328 B on the staged cvbr sets; ratios
+1.000 again at 32/96/128 kb/s in the runtime-gated multi-rate A/B).
+The **Hybrid-mode CELT layer** (`start = 17`) landed on both sides
+(`new_with_start`, plus the registry `start_band` and
+`vbr_constrained` options): no post-filter fields / no pitch
+prefilter (the exact `start != 0` gates), intensity clamped into the
+coded window, out-of-range energy state pinned to its reference
+reset values. Black-box A/B against listing-built oracle harnesses
+at start band 17: our decode of oracle hybrid streams
+109.7–112.5 dB, cross-decoder on our streams 111.4–128.8 dB, quality
+parity within 0.1 dB, hybrid-VBR silence positions identical.
+High-rate coverage closed the last r417 followup: at 192/384 kb/s
+the oracle streams decode at 105.7–108.9 dB and the encoder measures
+**above** the listing at every point on the steady tonal window
+(49.0 vs 45.1 dB at LM 2 192 kb/s, up to +5.0 dB). Remaining:
+non-48 kHz operating points (custom modes) stay undriven in both
+directions.
+
 **Encoder beats the reference listing at every measured rate, r419.**
 The r417 encoder's remaining rate-distortion gap is closed and
 inverted. The round transcribed the §A.1 listing's entire decision
@@ -37,9 +71,9 @@ landed as `encode_frame_vbr` plus the registry `vbr` option: the
 §A.1 target/drift controller with transient boosts, 2-byte
 digital-silence frames, and the constrained-VBR reservoir — a
 64 kb/s 10 ms tonal stream tracks its target and the mixed test
-signal lands at 55–67 kb/s across LMs. Remaining: Hybrid
-(`start = 17`) / non-48 kHz operating points stay undriven in both
-directions, and the prefilter's pitch search is the crate's
+signal lands at 55–67 kb/s across LMs. Hybrid (`start = 17`) landed
+in r434 (see above); non-48 kHz operating points stay undriven in
+both directions, and the prefilter's pitch search is the crate's
 documented §5.3.1 design rather than the listing's downsampled
 xcorr chain (encoder freedom; parity measured above).
 
