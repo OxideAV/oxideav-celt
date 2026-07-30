@@ -94,12 +94,15 @@ fn decode_fixture(dir: &std::path::Path) -> FixtureResult {
 }
 
 /// Raw-frame reference-decode regression: the staged
-/// `docs/audio/celt/fixtures/ref-lm*` sets carry length-prefixed raw
-/// CELT frames produced by the §A.1 reference listing **encoder**
-/// together with the listing decoder's float decode; this crate's
-/// decoder must reproduce that decode at the decoder-pair numerical
-/// floor (>= 95 dB float SNR, no localized divergence) with no oracle
-/// build required.
+/// `docs/audio/celt/fixtures/{ref,vbr,cvbr}-lm*` sets carry
+/// length-prefixed raw CELT frames produced by the §A.1 reference
+/// listing **encoder** (fixed-size CBR, rate-targeted unconstrained
+/// VBR, and constrained VBR) together with the listing decoder's
+/// float decode; this crate's decoder must reproduce that decode at
+/// the decoder-pair numerical floor (>= 95 dB float SNR, no localized
+/// divergence) with no oracle build required. The VBR arms exercise
+/// variable frame sizes on one stream, including the reference's
+/// 2-byte digital-silence frames.
 #[test]
 fn celt_raw_frame_fixture_reference_exactness() {
     let candidates = [
@@ -117,15 +120,18 @@ fn celt_raw_frame_fixture_reference_exactness() {
         .map(|e| e.path())
         .filter(|p| {
             p.is_dir()
-                && p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("ref-lm"))
+                && p.file_name().is_some_and(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("ref-lm") || n.starts_with("vbr-lm") || n.starts_with("cvbr-lm")
+                })
         })
         .collect();
     entries.sort();
     for d in entries {
         let name = d.file_name().unwrap().to_string_lossy().to_string();
-        // ref-lm{L}-{mono|stereo}-{N}B
-        let lm: u32 = name[6..7].parse().expect("lm digit");
+        // {ref|vbr|cvbr}-lm{L}-{mono|stereo}-...
+        let lm_pos = name.find("lm").expect("lm tag") + 2;
+        let lm: u32 = name[lm_pos..lm_pos + 1].parse().expect("lm digit");
         let channels = if name.contains("stereo") { 2usize } else { 1 };
         let frames = std::fs::read(d.join("frames.bin")).expect("frames.bin");
         let expected: Vec<f32> = std::fs::read(d.join("expected.f32"))
@@ -159,7 +165,10 @@ fn celt_raw_frame_fixture_reference_exactness() {
         );
         measured += 1;
     }
-    assert!(measured >= 4, "expected the four staged raw-frame sets");
+    assert!(
+        measured >= 10,
+        "expected the four CBR + six VBR staged raw-frame sets, saw {measured}"
+    );
 }
 
 #[test]
