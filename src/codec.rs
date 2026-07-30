@@ -46,25 +46,41 @@ const DEFAULT_BIT_RATE: u64 = 96_000;
 pub struct CeltCodecOptions {
     /// CELT frame size in samples at 48 kHz: 120, 240, 480, or 960.
     pub frame_size: u32,
+    /// First coded band (0..21): 0 is pure CELT, 17 the Hybrid-mode
+    /// CELT layer (the stream-level parameter both sides must agree
+    /// on, like `frame_size`).
+    pub start_band: u32,
 }
 
 impl Default for CeltCodecOptions {
     fn default() -> Self {
-        Self { frame_size: 960 }
+        Self {
+            frame_size: 960,
+            start_band: 0,
+        }
     }
 }
 
 impl CodecOptionsStruct for CeltCodecOptions {
-    const SCHEMA: &'static [OptionField] = &[OptionField {
-        name: "frame_size",
-        kind: OptionKind::U32,
-        default: OptionValue::U32(960),
-        help: "CELT frame size in samples at 48 kHz (120, 240, 480, or 960)",
-    }];
+    const SCHEMA: &'static [OptionField] = &[
+        OptionField {
+            name: "frame_size",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(960),
+            help: "CELT frame size in samples at 48 kHz (120, 240, 480, or 960)",
+        },
+        OptionField {
+            name: "start_band",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "first coded band (0..21): 0 = pure CELT, 17 = the Hybrid-mode CELT layer",
+        },
+    ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
         match key {
             "frame_size" => self.frame_size = value.as_u32()?,
+            "start_band" => self.start_band = value.as_u32()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -82,6 +98,13 @@ pub struct CeltEncoderOptions {
     /// digital silence collapsed to 2 bytes) instead of the fixed
     /// CBR size derived from `bit_rate`.
     pub vbr: bool,
+    /// Constrained VBR: with `vbr`, the §A.1 bit reservoir
+    /// additionally bounds the short-term rate above and below the
+    /// target (the reference's default VBR mode for live streams).
+    pub vbr_constrained: bool,
+    /// First coded band (0..21): 0 is pure CELT, 17 the Hybrid-mode
+    /// CELT layer.
+    pub start_band: u32,
 }
 
 impl Default for CeltEncoderOptions {
@@ -89,6 +112,8 @@ impl Default for CeltEncoderOptions {
         Self {
             frame_size: 960,
             vbr: false,
+            vbr_constrained: false,
+            start_band: 0,
         }
     }
 }
@@ -108,12 +133,27 @@ impl CodecOptionsStruct for CeltEncoderOptions {
             help: "variable bitrate around the bit_rate target (frames self-size; \
                    digital silence collapses to 2-byte frames)",
         },
+        OptionField {
+            name: "vbr_constrained",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "with vbr: a bit reservoir bounds the short-term rate around \
+                   the target (constrained VBR)",
+        },
+        OptionField {
+            name: "start_band",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(0),
+            help: "first coded band (0..21): 0 = pure CELT, 17 = the Hybrid-mode CELT layer",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
         match key {
             "frame_size" => self.frame_size = value.as_u32()?,
             "vbr" => self.vbr = value.as_bool()?,
+            "vbr_constrained" => self.vbr_constrained = value.as_bool()?,
+            "start_band" => self.start_band = value.as_u32()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -155,6 +195,16 @@ fn map_err(e: crate::Error) -> CoreError {
     CoreError::invalid(format!("celt: {e}"))
 }
 
+/// Validate the `start_band` option (0..21).
+fn start_band(value: u32) -> CoreResult<usize> {
+    if value >= 21 {
+        return Err(CoreError::invalid(format!(
+            "celt: start_band must be below 21 (got {value})"
+        )));
+    }
+    Ok(value as usize)
+}
+
 // ───────────────────────── decoder ─────────────────────────
 
 /// Packet-to-frame decoder over [`CeltRefDecoder`] (one raw CELT
@@ -164,6 +214,7 @@ pub struct CeltDecoder {
     inner: CeltRefDecoder,
     lm: u32,
     channels: usize,
+    start: usize,
     pending: VecDeque<Frame>,
     /// Running sample position for synthesized pts (1/48000 base),
     /// used when packets carry no pts of their own.
@@ -220,7 +271,8 @@ impl oxideav_core::Decoder for CeltDecoder {
     }
 
     fn reset(&mut self) -> CoreResult<()> {
-        self.inner = CeltRefDecoder::new(self.lm, self.channels).map_err(map_err)?;
+        self.inner =
+            CeltRefDecoder::new_with_start(self.lm, self.channels, self.start).map_err(map_err)?;
         self.pending.clear();
         self.next_pts = 0;
         self.eof = false;
@@ -233,11 +285,13 @@ impl oxideav_core::Decoder for CeltDecoder {
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Decoder>> {
     let opts: CeltCodecOptions = parse_options(&params.options)?;
     let (lm, channels, _frame_size) = stream_config(params, opts.frame_size)?;
+    let start = start_band(opts.start_band)?;
     Ok(Box::new(CeltDecoder {
         id: CodecId::new(CODEC_ID),
-        inner: CeltRefDecoder::new(lm, channels).map_err(map_err)?,
+        inner: CeltRefDecoder::new_with_start(lm, channels, start).map_err(map_err)?,
         lm,
         channels,
+        start,
         pending: VecDeque::new(),
         next_pts: 0,
         eof: false,
@@ -259,6 +313,9 @@ pub struct CeltEncoder {
     /// VBR: `Some(bitrate_bps)` sizes each frame from the §A.1
     /// controller instead of the fixed `frame_bytes`.
     vbr_bitrate: Option<u32>,
+    /// Constrained VBR (the §A.1 bit reservoir bounds the short-term
+    /// rate around the target).
+    vbr_constrained: bool,
     /// Interleaved sample FIFO awaiting a full frame.
     buffer: Vec<f32>,
     ready: VecDeque<Packet>,
@@ -285,7 +342,7 @@ impl CeltEncoder {
             let data = match self.vbr_bitrate {
                 Some(rate) => self
                     .inner
-                    .encode_frame_vbr(&chunk, 1275, rate, false)
+                    .encode_frame_vbr(&chunk, 1275, rate, self.vbr_constrained)
                     .map_err(map_err)?,
                 None => self
                     .inner
@@ -369,6 +426,7 @@ impl oxideav_core::Encoder for CeltEncoder {
 pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Encoder>> {
     let enc_opts: CeltEncoderOptions = parse_options(&params.options)?;
     let (lm, channels, frame_size) = stream_config(params, enc_opts.frame_size)?;
+    let start = start_band(enc_opts.start_band)?;
     let bit_rate = params.bit_rate.unwrap_or(DEFAULT_BIT_RATE);
     let frame_bytes =
         ((bit_rate as u128 * frame_size as u128) / (u128::from(SAMPLE_RATE) * 8)) as usize;
@@ -383,10 +441,15 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
     output_params
         .options
         .insert("frame_size", frame_size.to_string());
+    if start != 0 {
+        output_params
+            .options
+            .insert("start_band", start.to_string());
+    }
 
     Ok(Box::new(CeltEncoder {
         id: CodecId::new(CODEC_ID),
-        inner: CeltRefEncoder::new(lm, channels).map_err(map_err)?,
+        inner: CeltRefEncoder::new_with_start(lm, channels, start).map_err(map_err)?,
         output_params,
         channels,
         frame_size,
@@ -394,6 +457,7 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
         vbr_bitrate: enc_opts
             .vbr
             .then_some(bit_rate.clamp(1, u32::MAX as u64) as u32),
+        vbr_constrained: enc_opts.vbr_constrained,
         buffer: Vec::new(),
         ready: VecDeque::new(),
         position: 0,
@@ -509,6 +573,115 @@ mod tests {
             let Frame::Audio(a) = f else { panic!("audio") };
             assert_eq!(a.samples, 480);
         }
+    }
+
+    /// The `vbr_constrained` encoder option: the reservoir bounds the
+    /// short-term rate, so the constrained stream's total bytes never
+    /// exceed the unconstrained run's on the same input, and it still
+    /// decodes through the registry decoder.
+    #[test]
+    fn registry_vbr_constrained_option() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut totals = Vec::new();
+        for constrained in [false, true] {
+            let mut p = params(1, 480, Some(64_000));
+            p.options.insert("vbr", "true");
+            if constrained {
+                p.options.insert("vbr_constrained", "true");
+            }
+            let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+            for f in 0..30usize {
+                enc.send_frame(&tone_frame(480, 1, f * 480)).expect("send");
+            }
+            enc.flush().expect("flush");
+            let mut total = 0usize;
+            let mut dec = ctx
+                .codecs
+                .first_decoder(&params(1, 480, None))
+                .expect("decoder");
+            loop {
+                match enc.receive_packet() {
+                    Ok(pk) => {
+                        total += pk.data.len();
+                        dec.send_packet(&pk).expect("decode");
+                        dec.receive_frame().expect("frame");
+                    }
+                    Err(CoreError::Eof) => break,
+                    Err(e) => panic!("unexpected encoder error: {e:?}"),
+                }
+            }
+            totals.push(total);
+        }
+        assert!(
+            totals[1] <= totals[0],
+            "constrained VBR spent more than unconstrained: {totals:?}"
+        );
+    }
+
+    /// The `start_band` option (Hybrid-mode CELT layer): a 10 kHz
+    /// tone round-trips through the registry pair at start_band 17,
+    /// and an out-of-range start band is rejected.
+    #[test]
+    fn registry_start_band_option() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut p = params(1, 480, Some(96_000));
+        p.options.insert("start_band", "17");
+        let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+        assert_eq!(
+            enc.output_params().options.get("start_band"),
+            Some("17"),
+            "stream-level start_band advertised"
+        );
+        let frames_n = 12usize;
+        for f in 0..frames_n {
+            // 10 kHz sits in coded band 18 of the hybrid layer.
+            let mut bytes = Vec::with_capacity(480 * 4);
+            for t in 0..480usize {
+                let v = 0.3
+                    * (2.0 * std::f32::consts::PI * 10_000.0 * (f * 480 + t) as f32 / 48_000.0)
+                        .sin();
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+                samples: 480,
+                pts: Some((f * 480) as i64),
+                data: vec![bytes],
+            }))
+            .expect("send");
+        }
+        enc.flush().expect("flush");
+        let mut dec = ctx.codecs.first_decoder(&p).expect("decoder");
+        let mut energy = 0f64;
+        let mut n = 0usize;
+        loop {
+            match enc.receive_packet() {
+                Ok(pk) => {
+                    dec.send_packet(&pk).expect("decode");
+                    let Frame::Audio(a) = dec.receive_frame().expect("frame") else {
+                        panic!("audio")
+                    };
+                    for c in a.data[0].chunks_exact(4) {
+                        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
+                        energy += v * v;
+                        n += 1;
+                    }
+                }
+                Err(CoreError::Eof) => break,
+                Err(e) => panic!("unexpected encoder error: {e:?}"),
+            }
+        }
+        assert_eq!(n, frames_n * 480);
+        assert!(
+            (energy / n as f64).sqrt() > 0.05,
+            "hybrid-layer tone did not survive the registry round trip"
+        );
+
+        let mut bad = params(1, 480, None);
+        bad.options.insert("start_band", "21");
+        assert!(ctx.codecs.first_decoder(&bad).is_err());
+        assert!(ctx.codecs.first_encoder(&bad).is_err());
     }
 
     /// Registry round trip: register, resolve both factories, encode a
