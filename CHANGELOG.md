@@ -4,7 +4,7 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
-## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.10...v0.2.0) - 2026-07-30
+## [0.1.11](https://github.com/OxideAV/oxideav-celt/compare/v0.1.10...v0.1.11) - 2026-07-30
 
 ### Other
 
