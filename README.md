@@ -6,6 +6,41 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**Custom modes (non-48 kHz) COMPLETE, r442.** The crate's last
+"lacks" is closed: `custom_mode::CeltCustomMode` transcribes the
+full Appendix A mode construction — Bark-scaled band-edge derivation
+at the mode's spectral resolution, allocation-matrix interpolation
+over the 400·`eband5ms` Hz grid, `logN`, the overlap window,
+rate-dependent pre/de-emphasis, and the pulse-cost cache + caps
+ladder rebuilt from this crate's own `V(N, K)` recursion — for any
+legal `(rate, frame size)` pair (8–96 kHz, 40–1024 even samples,
+1 ms frame floor, 3.3 ms short-block ceiling). Fed `(48000, 960)`,
+the construction reproduces every staged 48 kHz table bit-exactly
+(pinned by tests), and the whole reference-exact chain (allocation
+walk, band loop, coarse energy, caps, MDCT sizing/windows, VBR rate
+law) now reads geometry from the mode.
+`CeltRefDecoder::new_custom` / `CeltRefEncoder::new_custom` run both
+directions end to end; the registry factories accept
+`sample_rate` + any legal `frame_size`. **Measured (runtime-gated
+black-box A/B against oracle harnesses over the listing's
+custom-mode API, eight configurations 8 k–96 k × mono/stereo at
+fixed rates):** our decode of oracle streams 74.0–120.6 dB float SNR
+against the oracle's own decode, oracle decode of our streams
+80.3–136.5 dB against ours (the decoder pairs' numerical floors —
+symbol-exact interop in both directions), decoded quality within
+±2 dB of the oracle encoder at every point (ahead at nine of
+sixteen), and 44.1 kHz VBR at a 64 kb/s target with **identical
+2-byte silence positions** and stream totals within 0.1%
+(8319/8311 B). The in-repo arm (`tests/custom_modes.rs`) holds
+self round-trips at nine configurations (15.1–50.3 dB
+delay-compensated SNR at ~128–192 kb/s equivalents), the `max_lm`
+ladder, VBR silence collapse, determinism, and decode robustness.
+One documented superset: geometries whose half-short-size is not
+5-smooth (e.g. 44.1 kHz/880, short 110) are constructed and coded by
+this crate's direct-form transform but rejected by the oracle
+binary's transform planner at mode creation, so they are covered by
+the self-consistency arm only.
+
 **VBR oracle-validated + Hybrid-mode CELT layer, r434.** The staged
 VBR fixture arm (`{vbr,cvbr}-lm*`, reference-listing encodes at a
 64 kb/s target) now gates both directions. Decode: all ten raw-frame
@@ -36,9 +71,9 @@ parity within 0.1 dB, hybrid-VBR silence positions identical.
 High-rate coverage closed the last r417 followup: at 192/384 kb/s
 the oracle streams decode at 105.7–108.9 dB and the encoder measures
 **above** the listing at every point on the steady tonal window
-(49.0 vs 45.1 dB at LM 2 192 kb/s, up to +5.0 dB). Remaining:
-non-48 kHz operating points (custom modes) stay undriven in both
-directions.
+(49.0 vs 45.1 dB at LM 2 192 kb/s, up to +5.0 dB). The last
+remaining gap — non-48 kHz operating points — closed in r442 (see
+the status above).
 
 **Encoder beats the reference listing at every measured rate, r419.**
 The r417 encoder's remaining rate-distortion gap is closed and
@@ -72,8 +107,8 @@ landed as `encode_frame_vbr` plus the registry `vbr` option: the
 digital-silence frames, and the constrained-VBR reservoir — a
 64 kb/s 10 ms tonal stream tracks its target and the mixed test
 signal lands at 55–67 kb/s across LMs. Hybrid (`start = 17`) landed
-in r434 (see above); non-48 kHz operating points stay undriven in
-both directions, and the prefilter's pitch search is the crate's
+in r434 (see above), custom modes in r442; the prefilter's pitch
+search is the crate's
 documented §5.3.1 design rather than the listing's downsampled
 xcorr chain (encoder freedom; parity measured above).
 
@@ -117,8 +152,8 @@ requested size and decode finite at every LM × channels
 (`tests/ref_encode_interop.rs` + the in-crate gates). The encode
 gaps this round left — long-frame TF RD pricing, the high-rate
 quality deficit, the always-off anti-collapse request — were closed
-in r419 (see the status above); Hybrid (`start = 17`) / non-48 kHz
-operating points remain undriven in both directions.
+in r419 (see the status above); Hybrid (`start = 17`) landed in
+r434 and non-48 kHz operating points in r442.
 
 **Reference-exact decode, r414.** Real reference-encoded CELT streams
 decode at the float-rounding floor. The RFC 6716 Appendix A reference
@@ -174,8 +209,9 @@ to an instrumented oracle built from the staged listing per §A.1.
 The dynalloc boost loop was corrected to the normative listing on the
 way (1/8-bit symbol-cost gate against the diminishing budget;
 channel-counting quanta width) — the §4.3.3 prose narration slips on
-both points. Remaining decode gaps: Hybrid windows (`start = 17`) and
-non-48 kHz operating points are not driven by the new decoder yet.
+both points. The decode gaps this round left — Hybrid windows
+(`start = 17`, r434) and non-48 kHz operating points (r442) — are
+closed.
 The pre-r414 auto encoders (`pcm_encode`) still write the r408
 walk's wire; the reference-compatible encode arc landed in r417 as
 the separate `ref_encode` module (see the r417 status above).

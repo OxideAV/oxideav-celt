@@ -4,6 +4,59 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-442 — custom modes (non-48 kHz operating points), the
+  crate's last "lacks"**: `custom_mode::CeltCustomMode` transcribes
+  the full Appendix A mode construction (Bark-scaled band-edge
+  derivation at the mode's spectral resolution, allocation-matrix
+  interpolation over the 400·`eband5ms` Hz grid, `logN`, the overlap
+  window, rate-dependent pre/de-emphasis coefficients, and the
+  pulse-cost cache + caps ladder rebuilt from this crate's own
+  `V(N, K)` recursion) for any legal `(rate, frame size)` pair
+  (8–96 kHz, 40–1024 even samples, 1 ms frame floor, 3.3 ms
+  short-block ceiling, the construction's band-growth invariants).
+  Fed `(48000, 960)`, it reproduces every staged 48 kHz table
+  bit-exactly (Table 55 edges, Table 57 allocation, log-n400,
+  cache_index50/cache_bits50, cache_caps50, window, pre-emphasis) —
+  pinned by tests. The reference-exact chain is mode-parameterized
+  end to end: `compute_allocation_exact` and `quant_all_bands` read
+  band edges / allocation matrix / logN / pulse cache from the mode,
+  per-band state widened to `MAX_BANDS = 25` (Bark layouts reach 23
+  bands; the coarse walk's `min(band, 20)` prob-model clamp and the
+  full 25-entry `eMeans` row become load-bearing), caps go i32
+  (custom caps overflow i16), and the synthesis/analysis alignment
+  generalizes (long basis `2·short·2^lm` at the mode overlap; short
+  blocks emit their `[p_s, p_s + short + overlap)` window support at
+  hop `short`; two-tap pre/de-emphasis below 40 kHz; VBR rate law on
+  the mode's own sample rate). `CeltRefDecoder::new_custom` /
+  `CeltRefEncoder::new_custom` expose both directions; the registry
+  factories accept `sample_rate` + any legal `frame_size` (pts
+  timebase, byte budgets, and output parameters at the actual rate;
+  `start_band` stays a standard-mode option).
+
+  **Measured** (runtime-gated black-box A/B against oracle harnesses
+  over the reference listing's custom-mode API,
+  `tests/blackbox_custom_oracle.rs`, eight configurations
+  8 k/160 · 16 k/320 · 16 k/40 (the `eff_ebands < nb_ebands`
+  family) · 24 k/480 · 32 k/640 · 44.1 k/720 · 48 k/1024 · 96 k/960
+  × mono/stereo): our decode of oracle streams 74.0–120.6 dB float
+  SNR against the oracle's own decode, oracle decode of our streams
+  80.3–136.5 dB against ours — symbol-exact interop in both
+  directions — decoded quality within ±2 dB of the oracle encoder
+  at every point (ahead at nine of sixteen), and 44.1 kHz VBR at a
+  64 kb/s target with identical 2-byte silence positions and totals
+  within 0.1% (8319/8311 B). In-repo (`tests/custom_modes.rs`):
+  self round-trips at nine configurations measure 15.1–50.3 dB
+  delay-compensated SNR at ~128–192 kb/s equivalents, plus the
+  `max_lm` ladder, determinism, VBR silence collapse, and
+  arbitrary-byte decode robustness. Documented superset: geometries
+  whose half-short-size is not 5-smooth (e.g. 44.1 kHz/880,
+  short 110) are constructed and coded by this crate's direct-form
+  transform but rejected by the oracle binary's transform planner,
+  so they carry self-consistency coverage only. The standard 48 kHz
+  wire is bit-unchanged (full suite + staged fixture gates).
+
 ## [0.1.11](https://github.com/OxideAV/oxideav-celt/compare/v0.1.10...v0.1.11) - 2026-07-30
 
 ### Other
