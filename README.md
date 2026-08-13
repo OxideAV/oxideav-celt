@@ -36,8 +36,9 @@ totals **byte-equal** (6941/6941 B). The A/B also exposed and fixed
 two §5.3.1 pitch-search defects (high-order-multiple argmax at short
 windows; amplitude-blind comb gain on decays), re-measured green
 against the full 48 kHz oracle battery. The in-repo arm (`tests/custom_modes.rs`) holds
-self round-trips at nine configurations (15.1–50.3 dB
-delay-compensated SNR at ~128–192 kb/s equivalents), the `max_lm`
+self round-trips at nine configurations (15.2–50.1 dB
+delay-compensated SNR at ~128–192 kb/s equivalents, re-measured
+after the pitch fix), the `max_lm`
 ladder, VBR silence collapse, determinism, and decode robustness.
 One documented superset: geometries whose half-short-size is not
 5-smooth (e.g. 44.1 kHz/880, short 110) are constructed and coded by

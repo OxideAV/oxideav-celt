@@ -60,7 +60,7 @@ All notable changes to `oxideav-celt` are recorded here.
   at every point (ahead at nine of sixteen), and 44.1 kHz VBR at a
   64 kb/s target with identical 2-byte silence positions and totals
   within 0.1% (8319/8311 B). In-repo (`tests/custom_modes.rs`):
-  self round-trips at nine configurations measure 15.1–50.3 dB
+  self round-trips at nine configurations measure 15.2–50.1 dB
   delay-compensated SNR at ~128–192 kb/s equivalents, plus the
   `max_lm` ladder, determinism, VBR silence collapse, and
   arbitrary-byte decode robustness. Documented superset: geometries
