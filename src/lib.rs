@@ -414,6 +414,7 @@ pub mod bits_to_pulses;
 #[doc(hidden)]
 pub mod coarse_energy;
 pub mod codec;
+pub mod custom_mode;
 #[doc(hidden)]
 pub mod deemphasis;
 #[doc(hidden)]
