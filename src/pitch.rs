@@ -71,12 +71,13 @@ pub const CONTINUITY_HALF_WIDTH: u16 = 2;
 pub const MIN_PITCH_CORRELATION: f32 = 0.25;
 
 /// Normalized autocorrelation of `signal`'s trailing `window` samples
-/// against the same window shifted `period` samples into the past.
-/// Returns `0.0` when either energy vanishes.
-fn normalized_correlation(signal: &[f32], window: usize, period: usize) -> f32 {
+/// against the same window shifted `period` samples into the past,
+/// together with the two windows' energies. The cosine is `0.0` when
+/// either energy vanishes.
+fn correlation_parts(signal: &[f32], window: usize, period: usize) -> (f32, f64, f64) {
     let n = signal.len();
     if window == 0 || period == 0 || window + period > n {
-        return 0.0;
+        return (0.0, 0.0, 0.0);
     }
     let tail = &signal[n - window..];
     let lagged = &signal[n - window - period..n - period];
@@ -89,9 +90,14 @@ fn normalized_correlation(signal: &[f32], window: usize, period: usize) -> f32 {
         e1 += f64::from(b) * f64::from(b);
     }
     if e0 <= 0.0 || e1 <= 0.0 {
-        return 0.0;
+        return (0.0, e0, e1);
     }
-    (dot / (e0.sqrt() * e1.sqrt())) as f32
+    ((dot / (e0.sqrt() * e1.sqrt())) as f32, e0, e1)
+}
+
+/// Cosine-only view of [`correlation_parts`].
+fn normalized_correlation(signal: &[f32], window: usize, period: usize) -> f32 {
+    correlation_parts(signal, window, period).0
 }
 
 /// Search for the pitch period of `signal`'s trailing `window` samples
@@ -144,10 +150,13 @@ pub fn pitch_search(
 
     // §5.3.1 avoidance of pitch multiples: if a sub-period (candidate
     // fundamental) correlates comparably, use it instead. Probe the
-    // nearest integer around best/k with ±1 slack.
+    // nearest integer around best/k with ±1 slack, for every divisor
+    // whose sub-period stays legal (a strongly periodic signal makes
+    // every multiple correlate near-equally, so the raw argmax can
+    // land many octaves up).
     let mut chosen_t = best_t;
     let mut chosen_c = best_c;
-    for k in (2..=4usize).rev() {
+    for k in (2..=16usize).rev() {
         let centre = best_t / k;
         if centre < min_lag {
             continue;
@@ -185,9 +194,22 @@ pub fn pitch_search(
         }
     }
 
+    // Amplitude-aware gain basis: the comb coefficient that predicts
+    // the frame from its lagged copy is bounded by the amplitude
+    // ratio, so a frame much quieter than the tapped history (a decay
+    // or a stop) must not keep a strong comb — the tap would inject
+    // the louder past. The reported correlation is the cosine scaled
+    // by `min(1, sqrt(E_frame / E_lagged))` (in-crate encoder
+    // freedom; period selection above stays amplitude-blind).
+    let (_, e0, e1) = correlation_parts(signal, window, chosen_t);
+    let amp = if e1 > 0.0 {
+        (e0 / e1).sqrt().min(1.0) as f32
+    } else {
+        1.0
+    };
     Some(PitchEstimate {
         period: chosen_t as u16,
-        correlation: chosen_c.clamp(-1.0, 1.0),
+        correlation: (chosen_c * amp).clamp(-1.0, 1.0),
     })
 }
 
@@ -271,6 +293,55 @@ mod tests {
             est.period as usize <= period + 1,
             "picked a multiple of the fundamental: {}",
             est.period
+        );
+    }
+
+    /// High-order multiples demote too: a short-window scan over a
+    /// long tonal history can argmax many octaves up (measured at a
+    /// 5 ms window over a 109-sample tone: the raw argmax landed at
+    /// 9x the period); the sub-period pass must walk it back down.
+    #[test]
+    fn demotes_high_order_multiples() {
+        let period = 109usize;
+        let n = 1024 + 160;
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32;
+                0.28 * (2.0 * std::f32::consts::PI * t / period as f32).sin()
+                    + 0.18 * (2.0 * std::f32::consts::PI * 3.1 * t / period as f32).sin()
+            })
+            .collect();
+        let est = pitch_search(&signal, 160, None).expect("estimate");
+        assert!(
+            (est.period as usize) < 2 * period,
+            "picked a high-order multiple: {}",
+            est.period
+        );
+    }
+
+    /// The reported correlation is amplitude-aware: a near-silent
+    /// frame after a loud periodic history must not report a strong
+    /// comb (the tap would inject the louder past into the decay).
+    #[test]
+    fn quiet_frame_after_tone_reports_weak_correlation() {
+        let period = 109usize;
+        let n = 1024 + 160;
+        let signal: Vec<f32> = (0..n)
+            .map(|i| {
+                if i < 1024 {
+                    (2.0 * std::f32::consts::PI * i as f32 / period as f32).sin()
+                } else {
+                    // 30 dB down, same shape: cosine correlation is
+                    // near 1, but the comb gain basis must collapse.
+                    0.03 * (2.0 * std::f32::consts::PI * i as f32 / period as f32).sin()
+                }
+            })
+            .collect();
+        let est = pitch_search(&signal, 160, None).expect("estimate");
+        assert!(
+            est.correlation < 0.1,
+            "quiet frame kept correlation {}",
+            est.correlation
         );
     }
 

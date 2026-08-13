@@ -29,14 +29,16 @@ fn oracle_bins() -> Option<(PathBuf, PathBuf)> {
 }
 
 /// `(fs, frame_size, cbr bytes/frame)` A/B points: 8–96 kHz, every
-/// max_lm, the `eff_ebands < nb_ebands` family (16 kHz / 40), and a
-/// non-400×-rate 48 kHz layout.
+/// max_lm (32 kHz appears at both its 20 ms `max_lm = 3` and 5 ms
+/// `max_lm = 1` operating points), the `eff_ebands < nb_ebands`
+/// family (16 kHz / 40), and a non-400×-rate 48 kHz layout.
 const CONFIGS: &[(u32, usize, usize)] = &[
     (8_000, 160, 80),
     (16_000, 320, 120),
     (16_000, 40, 40),
     (24_000, 480, 160),
     (32_000, 640, 200),
+    (32_000, 160, 90),
     (44_100, 720, 160),
     (48_000, 1024, 240),
     (96_000, 960, 160),
@@ -244,8 +246,9 @@ fn custom_mode_oracle_cbr_ab() {
 }
 
 /// VBR A/B at a custom rate: both encoders at the same bit/s target
-/// on the same 44.1 kHz signal — mean rates within 20% and identical
-/// 2-byte digital-silence frame positions.
+/// on the same 44.1 kHz signal, unconstrained **and** constrained —
+/// mean rates within 20% and identical 2-byte digital-silence frame
+/// positions in both modes.
 #[test]
 fn custom_mode_oracle_vbr_ab() {
     let Some((enc_bin, dec_bin)) = oracle_bins() else {
@@ -261,67 +264,69 @@ fn custom_mode_oracle_vbr_ab() {
     let in_f32 = dir.join("vbr-in.f32");
     write_f32(&in_f32, &pcm);
 
-    let ofr = dir.join("vbr-o.frames");
-    let odec = dir.join("vbr-o.f32");
-    run(
-        &enc_bin,
-        &[
-            &fs.to_string(),
-            "1",
-            &frame_size.to_string(),
-            "vbr",
-            &target.to_string(),
-            in_f32.to_str().unwrap(),
-            ofr.to_str().unwrap(),
-        ],
-    );
-    run(
-        &dec_bin,
-        &[
-            &fs.to_string(),
-            "1",
-            &frame_size.to_string(),
-            ofr.to_str().unwrap(),
-            odec.to_str().unwrap(),
-        ],
-    );
-    let oracle_frames = frames_of(&std::fs::read(&ofr).expect("frames"));
+    for (vbr_mode, constrained) in [("vbr", false), ("cvbr", true)] {
+        let ofr = dir.join(format!("{vbr_mode}-o.frames"));
+        let odec = dir.join(format!("{vbr_mode}-o.f32"));
+        run(
+            &enc_bin,
+            &[
+                &fs.to_string(),
+                "1",
+                &frame_size.to_string(),
+                vbr_mode,
+                &target.to_string(),
+                in_f32.to_str().unwrap(),
+                ofr.to_str().unwrap(),
+            ],
+        );
+        run(
+            &dec_bin,
+            &[
+                &fs.to_string(),
+                "1",
+                &frame_size.to_string(),
+                ofr.to_str().unwrap(),
+                odec.to_str().unwrap(),
+            ],
+        );
+        let oracle_frames = frames_of(&std::fs::read(&ofr).expect("frames"));
 
-    let mut enc = CeltRefEncoder::new_custom(&mode, mode.max_lm, 1).expect("enc");
-    let mut our_sizes = Vec::new();
-    for f in 0..frames {
-        let coded = enc
-            .encode_frame_vbr(
-                &pcm[f * frame_size..(f + 1) * frame_size],
-                1275,
-                target,
-                false,
-            )
-            .expect("encode");
-        our_sizes.push(coded.len());
+        let mut enc = CeltRefEncoder::new_custom(&mode, mode.max_lm, 1).expect("enc");
+        let mut our_sizes = Vec::new();
+        for f in 0..frames {
+            let coded = enc
+                .encode_frame_vbr(
+                    &pcm[f * frame_size..(f + 1) * frame_size],
+                    1275,
+                    target,
+                    constrained,
+                )
+                .expect("encode");
+            our_sizes.push(coded.len());
+        }
+        let o_total: usize = oracle_frames.iter().map(Vec::len).sum();
+        let s_total: usize = our_sizes.iter().sum();
+        let o_sil: Vec<usize> = oracle_frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.len() <= 2)
+            .map(|(i, _)| i)
+            .collect();
+        let s_sil: Vec<usize> = our_sizes
+            .iter()
+            .enumerate()
+            .filter(|(_, &l)| l <= 2)
+            .map(|(i, _)| i)
+            .collect();
+        eprintln!(
+            "44.1 kHz {vbr_mode} at {target} b/s: oracle {o_total} B / ours {s_total} B, \
+             silence {o_sil:?} vs {s_sil:?}"
+        );
+        assert_eq!(o_sil, s_sil, "{vbr_mode}: 2-byte silence positions differ");
+        let ratio = s_total as f64 / o_total as f64;
+        assert!(
+            (0.8..1.25).contains(&ratio),
+            "{vbr_mode}: mean-rate ratio {ratio:.3} out of range"
+        );
     }
-    let o_total: usize = oracle_frames.iter().map(Vec::len).sum();
-    let s_total: usize = our_sizes.iter().sum();
-    let o_sil: Vec<usize> = oracle_frames
-        .iter()
-        .enumerate()
-        .filter(|(_, f)| f.len() <= 2)
-        .map(|(i, _)| i)
-        .collect();
-    let s_sil: Vec<usize> = our_sizes
-        .iter()
-        .enumerate()
-        .filter(|(_, &l)| l <= 2)
-        .map(|(i, _)| i)
-        .collect();
-    eprintln!(
-        "44.1 kHz VBR at {target} b/s: oracle {o_total} B / ours {s_total} B, \
-         silence {o_sil:?} vs {s_sil:?}"
-    );
-    assert_eq!(o_sil, s_sil, "2-byte silence positions differ");
-    let ratio = s_total as f64 / o_total as f64;
-    assert!(
-        (0.8..1.25).contains(&ratio),
-        "VBR mean-rate ratio {ratio:.3} out of range"
-    );
 }
