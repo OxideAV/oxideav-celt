@@ -231,13 +231,14 @@ pub fn decode_frame_prefix(
     // after the trim). The loop reads from the decoder.
     let frame_8th =
         i32::try_from(u64::from(frame_bytes) * u64::from(BITS_TO_8TH) * 8).unwrap_or(i32::MAX);
+    let caps32: Vec<i32> = caps.iter().map(|&c| c as i32).collect();
     let boosts = decode_band_boosts(
         dec,
         start as u32,
         end as u32,
         channels as u32,
         &bins,
-        &caps,
+        &caps32,
         frame_8th,
     )
     .ok_or(Error::InvalidParameter)?;

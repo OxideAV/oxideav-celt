@@ -184,13 +184,14 @@ pub fn encode_frame_prefix(
     // Per the §2.3 narrative the loop's `total_bits` initialises to
     // the frame size in 1/8 bits — the raw wire budget.
     let frame_8th = i32::try_from(u64::from(frame_bytes) * 64).unwrap_or(i32::MAX);
+    let caps32: Vec<i32> = caps.iter().map(|&c| c as i32).collect();
     let boosts = encode_band_boosts(
         enc,
         start as u32,
         end as u32,
         channels as u32,
         &bins,
-        &caps,
+        &caps32,
         frame_8th,
         spec.target_boost,
     )?;

@@ -407,13 +407,6 @@ impl CeltCustomMode {
         (lm <= self.max_lm).then_some(self.short_mdct_size << lm)
     }
 
-    /// The band edge (in per-channel MDCT bins) of `band` at shift
-    /// `lm`; `band` may be `nb_ebands` (the exclusive end of the last
-    /// band).
-    pub(crate) fn band_edge(&self, band: usize, lm: u32) -> usize {
-        (self.e_bands[band] as usize) << lm
-    }
-
     /// The width of `band` in per-channel MDCT bins at shift `lm`.
     pub(crate) fn band_bins(&self, band: usize, lm: u32) -> usize {
         ((self.e_bands[band + 1] - self.e_bands[band]) as usize) << lm

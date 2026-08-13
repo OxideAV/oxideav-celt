@@ -288,16 +288,17 @@ pub fn choose_alloc_trim(
 /// quality decision, not a wire requirement — but it is the map the
 /// reference rate-distortion behaviour was tuned around.
 pub fn alloc_trim_analysis(
+    e_bands: &[i16],
     x: &[f32],
     y: Option<&[f32]>,
     band_log_e: &[[f32; crate::custom_mode::MAX_BANDS]; 2],
     end: usize,
     lm: u32,
 ) -> u8 {
-    use crate::band_layout::EBAND_EDGES_5MS;
     let mut trim = 5i32;
     let m = 1usize << lm;
-    let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
+    let nb_ebands = e_bands.len() - 1;
+    let eb = |i: usize| m * e_bands[i] as usize;
     let channels = 1 + usize::from(y.is_some());
     if let Some(y) = y {
         // Inter-channel correlation over the first 8 bands' unit-norm
@@ -325,7 +326,7 @@ pub fn alloc_trim_analysis(
     let mut diff = 0.0f32;
     for ch in band_log_e.iter().take(channels) {
         for (i, &e) in ch.iter().enumerate().take(end.saturating_sub(1)) {
-            diff += e * (2 + 2 * i as i32 - NUM_BANDS as i32) as f32;
+            diff += e * (2 + 2 * i as i32 - nb_ebands as i32) as f32;
         }
     }
     diff /= (2 * channels * (end - 1)) as f32;
@@ -354,10 +355,12 @@ pub fn alloc_trim_analysis(
 /// the low bands that code no theta there). Returns `true` for
 /// **dual** stereo. `x` / `y` are the coded-window unit-norm spectra
 /// (band-contiguous), `m = 1 << LM`.
-pub fn stereo_analysis(x: &[f32], y: &[f32], lm: u32) -> bool {
-    use crate::band_layout::EBAND_EDGES_5MS;
+pub fn stereo_analysis(e_bands: &[i16], x: &[f32], y: &[f32], lm: u32) -> bool {
     let m = 1usize << lm;
-    let span = m * EBAND_EDGES_5MS[13] as usize;
+    // The listing's 13-band window, clamped into layouts with fewer
+    // bands (encoder freedom; the standard layout always has 21).
+    let bands = MID_SIDE_DECISION_BANDS.min(e_bands.len() - 1);
+    let span = m * e_bands[bands] as usize;
     let mut sum_lr = 1e-15f64;
     let mut sum_ms = 1e-15f64;
     for (&l, &r) in x[..span].iter().zip(&y[..span]) {
@@ -372,7 +375,7 @@ pub fn stereo_analysis(x: &[f32], y: &[f32], lm: u32) -> bool {
     if lm <= 1 {
         thetas -= 8;
     }
-    let w = (EBAND_EDGES_5MS[13] as i64) << (lm + 1);
+    let w = (e_bands[bands] as i64) << (lm + 1);
     (w + thetas) as f64 * sum_ms > w as f64 * sum_lr
 }
 

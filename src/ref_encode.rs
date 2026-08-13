@@ -37,31 +37,22 @@
 //! exactly like the reference.
 
 use crate::alloc_exact::{compute_allocation_exact, AllocIo, BITRES, MAX_FINE_BITS};
-use crate::band_cap::{compute_band_caps, encode_band_boosts};
-use crate::band_layout::EBAND_EDGES_5MS;
-use crate::band_minimums::BAND_BINS_LM;
+use crate::band_cap::encode_band_boosts;
 use crate::band_quant::{haar1, quant_all_bands, BandAmps, QuantIo};
 use crate::bit_allocation::encode_alloc_trim;
-use crate::coarse_energy::{quant_coarse_energy_rd, CoarseEnergyState, NUM_BANDS};
+use crate::coarse_energy::{quant_coarse_energy_rd, CoarseEnergyState};
 use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
 use crate::encoder_decisions::{
     alloc_trim_analysis, boost_thresholds, intensity_start_band, stereo_analysis,
 };
-use crate::mdct::{build_low_overlap_window_f32, celt_window_f32, mdct_naive_f32};
+use crate::mdct::{build_low_overlap_window_f32, mdct_naive_f32};
 use crate::pitch::pitch_search;
 use crate::post_filter::POST_FILTER_TAPS_F32;
 use crate::range_encoder::RangeEncoder;
 use crate::ref_decode::E_MEANS;
 use crate::spread::{encode_spread, spreading_decision, Spread};
-use crate::synthesis::mdct_size;
 use crate::tf_change::tf_adjustment;
 use crate::Error;
-
-/// The §4.3.7 overlap length (fixed 120 for the 48 kHz mode).
-const OVERLAP: usize = 120;
-
-/// The §4.3.7.2 pre-emphasis coefficient (48 kHz mode).
-const PREEMPH_COEF: f32 = 0.850_006_1;
 
 /// The reference float-API signal scale (`CELT_SIG_SCALE`).
 const SIG_SCALE: f32 = 32768.0;
@@ -241,7 +232,9 @@ fn tf_l1_metric(tmp: &[f32], n: usize, level: usize, width: usize) -> f32 {
 ///
 /// Returns the per-band toggles plus the metric sum (`tf_sum`, the
 /// VBR boost hint). `tf_select` stays 0, as in the listing encoder.
+#[allow(clippy::too_many_arguments)]
 fn tf_analysis(
+    e_bands: &[i16],
     x: &[f32],
     y: Option<&[f32]>,
     m: usize,
@@ -251,7 +244,7 @@ fn tf_analysis(
     effective_bytes: usize,
 ) -> ([bool; MAX_BANDS], i32) {
     let channels = 1 + usize::from(y.is_some());
-    let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
+    let eb = |i: usize| m * e_bands[i] as usize;
     let mut tf_res = [false; MAX_BANDS];
     let mut tf_sum = 0i32;
     if effective_bytes < 15 * channels {
@@ -355,7 +348,7 @@ fn tf_analysis(
 /// `2^LM` short blocks and a frame is declared transient when a later
 /// block carries at least `TRANSIENT_RATIO` times the energy of every
 /// block before it (a hard onset that a single long MDCT would smear).
-fn detect_transient(chans: &[Vec<f32>], frame: usize, lm: u32) -> bool {
+fn detect_transient(chans: &[Vec<f32>], frame: usize, overlap: usize, lm: u32) -> bool {
     if lm == 0 {
         return false;
     }
@@ -363,7 +356,7 @@ fn detect_transient(chans: &[Vec<f32>], frame: usize, lm: u32) -> bool {
     let sb = frame / blocks;
     const TRANSIENT_RATIO: f32 = 40.0;
     for ch in chans {
-        let cur = &ch[OVERLAP..OVERLAP + frame];
+        let cur = &ch[overlap..overlap + frame];
         let mut max_prev = 1e-9f32;
         for b in 0..blocks {
             let e: f32 = cur[b * sb..(b + 1) * sb].iter().map(|v| v * v).sum();
@@ -382,6 +375,7 @@ fn detect_transient(chans: &[Vec<f32>], frame: usize, lm: u32) -> bool {
 /// overlap history, and the cross-frame folding seed.
 #[derive(Debug)]
 pub struct CeltRefEncoder {
+    mode: CeltCustomMode,
     lm: u32,
     channels: usize,
     /// §4.3.2.1 inter-frame energy prediction over the **quantized**
@@ -453,21 +447,40 @@ impl CeltRefEncoder {
     /// only — the spectrum below the start band is not coded (the
     /// SILK layer's territory).
     pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
-        if lm > 3 || !(1..=2).contains(&channels) || start >= NUM_BANDS {
+        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start)
+    }
+
+    /// Build an encoder for a **custom mode** (an arbitrary
+    /// rate/frame-size geometry from [`CeltCustomMode::new`]) at
+    /// frame-size shift `lm` (`0..=mode.max_lm`). Custom-mode frames
+    /// always start at band 0.
+    pub fn new_custom(mode: &CeltCustomMode, lm: u32, channels: usize) -> Result<Self, Error> {
+        Self::with_mode(mode.clone(), lm, channels, 0)
+    }
+
+    fn with_mode(
+        mode: CeltCustomMode,
+        lm: u32,
+        channels: usize,
+        start: usize,
+    ) -> Result<Self, Error> {
+        if lm > mode.max_lm || !(1..=2).contains(&channels) || start >= mode.eff_ebands {
             return Err(Error::InvalidParameter);
         }
-        let frame = mdct_size(lm).ok_or(Error::InvalidParameter)?;
+        let frame = mode.short_mdct_size << lm;
+        let overlap = mode.overlap;
         let long_window =
-            build_low_overlap_window_f32(frame, OVERLAP).ok_or(Error::InvalidParameter)?;
-        let short_window =
-            build_low_overlap_window_f32(120, OVERLAP).ok_or(Error::InvalidParameter)?;
+            build_low_overlap_window_f32(frame, overlap).ok_or(Error::InvalidParameter)?;
+        let short_window = build_low_overlap_window_f32(mode.short_mdct_size, overlap)
+            .ok_or(Error::InvalidParameter)?;
+        let pf_window = mode.window.clone();
         Ok(Self {
             lm,
             channels,
             coarse: CoarseEnergyState::new(),
             old_log_e: [[-28.0; MAX_BANDS]; 2],
             old_log_e2: [[-28.0; MAX_BANDS]; 2],
-            in_mem: vec![vec![0.0; OVERLAP]; channels],
+            in_mem: vec![vec![0.0; overlap]; channels],
             preemph_mem: [0.0; 2],
             long_window,
             short_window,
@@ -482,28 +495,31 @@ impl CeltRefEncoder {
             prefilter_period: COMB_MIN_PERIOD,
             prefilter_gain: 0.0,
             prefilter_tapset: 0,
-            pf_window: (0..OVERLAP).map(|i| celt_window_f32(i, OVERLAP)).collect(),
+            pf_window,
             vbr_reservoir: 0,
             vbr_drift: 0,
             vbr_offset: 0,
             vbr_count: 0,
             start,
+            mode,
         })
     }
 
     /// The per-channel frame size in samples.
     pub fn frame_size(&self) -> usize {
-        mdct_size(self.lm).expect("lm validated at construction")
+        self.mode.short_mdct_size << self.lm
     }
 
     /// Forward MDCT of one channel's analysis block (`frame + overlap`
     /// pre-emphasized samples) at the decoder's emission alignment.
     fn forward_freq(&self, block: &[f32], is_transient: bool) -> Result<Vec<f32>, Error> {
         let frame = self.frame_size();
+        let overlap = self.mode.overlap;
+        let short = self.mode.short_mdct_size;
         let m = 1usize << self.lm;
         let mut freq = vec![0f32; frame];
         if !is_transient {
-            let p = (frame - OVERLAP) / 2;
+            let p = (frame - overlap) / 2;
             let mut v = vec![0f32; 2 * frame];
             for (j, &s) in block.iter().enumerate() {
                 v[p + j] = s * self.long_window[p + j];
@@ -515,11 +531,19 @@ impl CeltRefEncoder {
                 *f *= 0.5;
             }
         } else {
-            let mut v = vec![0f32; 240];
-            let mut sb = vec![0f32; 120];
+            // Each short block windows its `short + overlap`-sample
+            // support at `[p_s, p_s + short + overlap)` of the
+            // `2*short` basis (`p_s` is 0 when the short size is
+            // divisible by 4).
+            let p_s = (short - overlap) / 2;
+            let mut v = vec![0f32; 2 * short];
+            let mut sb = vec![0f32; short];
             for b in 0..m {
-                for (j, o) in v.iter_mut().enumerate() {
-                    *o = block[b * 120 + j] * self.short_window[j];
+                for o in v.iter_mut() {
+                    *o = 0.0;
+                }
+                for j in 0..(short + overlap) {
+                    v[p_s + j] = block[b * short + j] * self.short_window[p_s + j];
                 }
                 if !mdct_naive_f32(&v, &mut sb) {
                     return Err(Error::InvalidParameter);
@@ -565,7 +589,7 @@ impl CeltRefEncoder {
         }
         let frame = self.frame_size();
         // The target rate in 1/8 bits per frame (`den = Fs >> BITRES`).
-        let den = 48_000i64 >> BITRES;
+        let den = i64::from(self.mode.fs) >> BITRES;
         let vbr_rate =
             ((bitrate_bps as i64 * frame as i64 + (den >> 1)) / den).min(1275 * 64) as i32;
         self.encode_impl(pcm, max_bytes.min(1275), vbr_rate, constrained)
@@ -583,10 +607,12 @@ impl CeltRefEncoder {
         let lm = self.lm;
         let channels = self.channels;
         let frame = self.frame_size();
+        let overlap = self.mode.overlap;
         let m = 1usize << lm;
         let start = self.start;
-        let end = NUM_BANDS;
-        let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
+        let end = self.mode.eff_ebands;
+        let e_bands = self.mode.e_bands.clone();
+        let eb = |i: usize| e_bands[i] as usize;
         let n_coded = m * eb(end);
         if pcm.len() != channels * frame || !(2..=1275).contains(&nb_bytes_in) {
             return Err(Error::InvalidParameter);
@@ -618,11 +644,18 @@ impl CeltRefEncoder {
         for c in 0..channels {
             let mut pre = Vec::with_capacity(COMB_MAX_PERIOD + frame);
             pre.extend_from_slice(&self.pre_hist[c]);
+            // The two-tap pre-emphasis recurrence (below 40 kHz the
+            // second tap and the input scale are non-trivial; the
+            // standard mode reduces to the one-tap 0.85 form).
+            let c0 = self.mode.preemph[0];
+            let c1 = self.mode.preemph[1];
+            let c2 = self.mode.preemph[2];
             let mut mem = self.preemph_mem[c];
             for j in 0..frame {
-                let s = SIG_SCALE * pcm[j * channels + c];
-                pre.push(s - PREEMPH_COEF * mem);
-                mem = s;
+                let xs = c2 * (SIG_SCALE * pcm[j * channels + c]);
+                let inp = xs + mem;
+                pre.push(inp);
+                mem = c1 * inp - c0 * xs;
             }
             self.preemph_mem[c] = mem;
             pres.push(pre);
@@ -734,10 +767,10 @@ impl CeltRefEncoder {
                 prefilter_tapset,
                 &self.pf_window,
             );
-            let mut block = Vec::with_capacity(frame + OVERLAP);
+            let mut block = Vec::with_capacity(frame + overlap);
             block.extend_from_slice(&self.in_mem[c]);
             block.extend_from_slice(&filtered);
-            self.in_mem[c].copy_from_slice(&block[frame..frame + OVERLAP]);
+            self.in_mem[c].copy_from_slice(&block[frame..frame + overlap]);
             let keep = pre.len() - COMB_MAX_PERIOD;
             self.pre_hist[c].copy_from_slice(&pre[keep..]);
             blocks.push(block);
@@ -746,7 +779,7 @@ impl CeltRefEncoder {
         self.prefilter_gain = gain1;
         self.prefilter_tapset = prefilter_tapset;
 
-        let want_transient = detect_transient(&blocks, frame, lm);
+        let want_transient = detect_transient(&blocks, frame, overlap, lm);
 
         let mut is_transient = false;
         if !silence {
@@ -838,6 +871,7 @@ impl CeltRefEncoder {
             // ── Time-frequency parameters (§A.1 lambda-priced
             // Viterbi analysis over both frame kinds) ──
             let (tf_desired, tf_sum) = tf_analysis(
+                &e_bands,
                 &x,
                 (channels == 2).then_some(&y[..]),
                 m,
@@ -866,6 +900,7 @@ impl CeltRefEncoder {
             if tell + 4 <= total_bits {
                 if !is_transient && frame_bytes >= 10 * channels {
                     spread = spreading_decision(
+                        &self.mode.e_bands,
                         &x,
                         (channels == 2).then_some(&y[..]),
                         m,
@@ -881,11 +916,11 @@ impl CeltRefEncoder {
             }
 
             // ── Per-band caps + dynalloc boosts ──
-            let bins: Vec<u32> = BAND_BINS_LM[lm as usize][start..end].to_vec();
-            let mut caps16 = vec![0i16; end - start];
-            if !compute_band_caps(lm, channels == 2, channels as u32, &bins, &mut caps16) {
-                return Err(Error::InvalidParameter);
-            }
+            let bins: Vec<u32> = (start..end)
+                .map(|i| self.mode.band_bins(i, lm) as u32)
+                .collect();
+            let mut caps = [0i32; MAX_BANDS];
+            self.mode.init_caps(lm, channels, &mut caps);
             // §5.3.4.1 boost rule: an interior band whose contrast
             // `D_j = 2E_j - E_{j-1} - E_{j+1}` (averaged across the
             // two channels on stereo frames, as in the §A.1 listing)
@@ -925,7 +960,7 @@ impl CeltRefEncoder {
                 end as u32,
                 channels as u32,
                 &bins,
-                &caps16,
+                &caps[start..end],
                 frame_8th,
                 &want_boost,
             )?;
@@ -939,7 +974,14 @@ impl CeltRefEncoder {
             let trim_gated =
                 enc.tell_frac() as i64 + 48 <= frame_8th as i64 - boosts.total_boost as i64;
             let alloc_trim = if trim_gated {
-                alloc_trim_analysis(&x, (channels == 2).then_some(&y[..]), &targets, end, lm)
+                alloc_trim_analysis(
+                    &self.mode.e_bands,
+                    &x,
+                    (channels == 2).then_some(&y[..]),
+                    &targets,
+                    end,
+                    lm,
+                )
             } else {
                 5
             };
@@ -1007,12 +1049,8 @@ impl CeltRefEncoder {
                     0
                 };
             bits -= anti_collapse_rsv;
-            let mut caps = [0i32; MAX_BANDS];
-            for (c, &v) in caps[start..end].iter_mut().zip(caps16.iter()) {
-                *c = v as i32;
-            }
             let alloc = compute_allocation_exact(
-                CeltCustomMode::standard(),
+                &self.mode,
                 start,
                 end,
                 &offsets,
@@ -1034,7 +1072,9 @@ impl CeltRefEncoder {
                     // §A.1 L1 entropy model dual-vs-mid/side verdict
                     // on the unit-norm spectra; 2.5 ms frames always
                     // couple (the listing's rule).
-                    dual_stereo: channels == 2 && lm != 0 && stereo_analysis(&x, &y, lm),
+                    dual_stereo: channels == 2
+                        && lm != 0
+                        && stereo_analysis(&self.mode.e_bands, &x, &y, lm),
                     prev_coded_bands: self.prev_coded_bands,
                 },
             )?;
@@ -1062,7 +1102,7 @@ impl CeltRefEncoder {
             // ── The §4.3.4 band loop (encode + resynthesis) ──
             let mut seed = self.rng;
             let _walk = quant_all_bands(
-                CeltCustomMode::standard(),
+                &self.mode,
                 QuantIo::Encode(&mut enc),
                 start,
                 end,
@@ -1190,6 +1230,12 @@ mod tests {
     use super::*;
     use crate::ref_decode::CeltRefDecoder;
 
+    /// The standard mode's overlap (test material is 48 kHz).
+    const OVERLAP: usize = 120;
+
+    use crate::band_layout::EBAND_EDGES_5MS;
+    use crate::coarse_energy::NUM_BANDS;
+
     fn tone(frame: usize, channels: usize, frames: usize, amp: f32) -> Vec<f32> {
         let n = frame * frames;
         let mut out = Vec::with_capacity(n * channels);
@@ -1311,7 +1357,16 @@ mod tests {
                 x[eb(i) + j * m] = 0.5;
             }
         }
-        let (choice, tf_sum) = tf_analysis(&x, None, m, true, lm, NUM_BANDS, 160);
+        let (choice, tf_sum) = tf_analysis(
+            &CeltCustomMode::standard().e_bands,
+            &x,
+            None,
+            m,
+            true,
+            lm,
+            NUM_BANDS,
+            160,
+        );
         assert!(
             choice[8..NUM_BANDS].iter().all(|&b| b),
             "block-concentrated run should stay short: {choice:?}"
@@ -1334,7 +1389,16 @@ mod tests {
         for j in 0..(eb(14) - eb(13)) / m {
             x[eb(13) + j * m] = 0.5;
         }
-        let (choice, _) = tf_analysis(&x, None, m, true, lm, NUM_BANDS, 160);
+        let (choice, _) = tf_analysis(
+            &CeltCustomMode::standard().e_bands,
+            &x,
+            None,
+            m,
+            true,
+            lm,
+            NUM_BANDS,
+            160,
+        );
         assert!(
             choice.iter().all(|&b| !b),
             "isolated deviation should be priced away: {choice:?}"
@@ -1342,7 +1406,16 @@ mod tests {
 
         // Below 15*C bytes the analysis is skipped: every band keeps
         // the frame default (short blocks on a transient frame).
-        let (choice, tf_sum) = tf_analysis(&x, None, m, true, lm, NUM_BANDS, 10);
+        let (choice, tf_sum) = tf_analysis(
+            &CeltCustomMode::standard().e_bands,
+            &x,
+            None,
+            m,
+            true,
+            lm,
+            NUM_BANDS,
+            10,
+        );
         assert!(choice[..NUM_BANDS].iter().all(|&b| b));
         assert_eq!(tf_sum, 0);
     }
@@ -1370,7 +1443,16 @@ mod tests {
                 *v = if k % 2 == 0 { 0.5 } else { -0.5 };
             }
         }
-        let (choice, tf_sum) = tf_analysis(&x, None, m, false, lm, NUM_BANDS, 160);
+        let (choice, tf_sum) = tf_analysis(
+            &CeltCustomMode::standard().e_bands,
+            &x,
+            None,
+            m,
+            false,
+            lm,
+            NUM_BANDS,
+            160,
+        );
         assert!(
             choice[10..NUM_BANDS].iter().all(|&b| b),
             "alternating run should time-split: {choice:?}"
@@ -1541,6 +1623,7 @@ mod tests {
                     b
                 }],
                 frame,
+                OVERLAP,
                 3,
             );
         }

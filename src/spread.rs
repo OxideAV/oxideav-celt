@@ -294,6 +294,7 @@ pub fn pre_rotation_stride(n: u32, nb_blocks: u32) -> Option<u32> {
 /// choice for this frame.
 #[allow(clippy::too_many_arguments)]
 pub fn spreading_decision(
+    e_bands: &[i16],
     x: &[f32],
     y: Option<&[f32]>,
     m: usize,
@@ -304,9 +305,9 @@ pub fn spreading_decision(
     tapset_decision: &mut i32,
     update_hf: bool,
 ) -> Spread {
-    use crate::band_layout::EBAND_EDGES_5MS;
-    let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
-    debug_assert!(end > 0 && end < EBAND_EDGES_5MS.len());
+    let nb_ebands = e_bands.len() - 1;
+    let eb = |i: usize| m * e_bands[i] as usize;
+    debug_assert!(end > 0 && end <= nb_ebands);
     if eb(end) - eb(end - 1) <= 8 {
         return Spread::None;
     }
@@ -334,7 +335,7 @@ pub fn spreading_decision(
                 }
             }
             // Only include the four last bands (8 kHz and up).
-            if i > NUM_SPREAD_BANDS - 4 {
+            if i + 4 > nb_ebands {
                 hf_sum += 32 * (tcount[1] + tcount[0]) / n as i32;
             }
             let tmp = i32::from(2 * tcount[2] >= n as i32)
@@ -346,7 +347,7 @@ pub fn spreading_decision(
     }
     if update_hf {
         if hf_sum != 0 {
-            hf_sum /= channels as i32 * (4 - NUM_SPREAD_BANDS as i32 + end as i32);
+            hf_sum /= channels as i32 * (4 - nb_ebands as i32 + end as i32);
         }
         *hf_average = (*hf_average + hf_sum) >> 1;
         let mut hf = *hf_average;
@@ -379,11 +380,6 @@ pub fn spreading_decision(
         Spread::None
     }
 }
-
-/// The band count the [`spreading_decision`] high-frequency arm is
-/// written against (the 21-band Table-55 layout; the "last four
-/// bands" are 8 kHz and up).
-const NUM_SPREAD_BANDS: usize = 21;
 
 #[cfg(test)]
 mod tests {

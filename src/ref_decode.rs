@@ -21,30 +21,28 @@
 //! convention).
 
 use crate::alloc_exact::{compute_allocation_exact, AllocIo, BITRES, MAX_FINE_BITS};
-use crate::band_cap::{compute_band_caps, decode_band_boosts};
-use crate::band_layout::EBAND_EDGES_5MS;
-use crate::band_minimums::BAND_BINS_LM;
+use crate::band_cap::decode_band_boosts;
 use crate::band_quant::{celt_lcg_rand, quant_all_bands, renormalise_vector, QuantIo};
 use crate::bit_allocation::decode_alloc_trim;
-use crate::coarse_energy::{decode_coarse_energy, CoarseEnergyState, NUM_BANDS};
+use crate::coarse_energy::{decode_coarse_energy, CoarseEnergyState};
 use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
-use crate::mdct::{build_low_overlap_window_f32, celt_window_f32, imdct_naive_f32};
+use crate::mdct::{build_low_overlap_window_f32, imdct_naive_f32};
 use crate::range_decoder::RangeDecoder;
 use crate::spread::Spread;
-use crate::synthesis::mdct_size;
 use crate::tf_change::tf_adjustment;
 use crate::Error;
 
 /// Mean band energy in base-2 log-amplitude units (`eMeans`,
-/// Appendix A `quant_bands.c` float table; staged as
-/// `docs/audio/opus/tables/e-means.csv` in Q4 — these are the Q4
-/// values divided by 16). Only the first 21 entries apply to the
-/// 48 kHz mode.
+/// Appendix A `quant_bands.c` float table, all 25 entries; the first
+/// 21 are staged as `docs/audio/opus/tables/e-means.csv` in Q4 —
+/// these are the Q4 values divided by 16). Only the first 21 apply to
+/// the 48 kHz mode; wider Bark-derived custom layouts read the flat
+/// 3.75 tail.
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
-pub const E_MEANS: [f32; NUM_BANDS] = [
+pub const E_MEANS: [f32; MAX_BANDS] = [
     6.437_5, 6.25, 5.75, 5.312_5, 5.062_5, 4.812_5, 4.5, 4.375, 4.875, 4.687_5, 4.562_5, 4.437_5,
-    4.875, 4.625, 4.312_5, 4.5, 4.375, 4.625, 4.75, 4.437_5, 3.75,
+    4.875, 4.625, 4.312_5, 4.5, 4.375, 4.625, 4.75, 4.437_5, 3.75, 3.75, 3.75, 3.75, 3.75,
 ];
 
 /// §4.3.7.1 comb-filter tap shapes (Appendix A `celt.c` `gains`
@@ -66,15 +64,8 @@ pub const COMBFILTER_MINPERIOD: usize = 15;
 #[doc(hidden)]
 pub const MAX_PERIOD: usize = 1024;
 
-/// The §4.3.7 overlap length (fixed 120 for the 48 kHz mode).
-const OVERLAP: usize = 120;
-
 /// The tapset ICDF (`{2, 1, 1}/4`).
 const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
-
-/// The de-emphasis coefficient (Appendix A mode data `preemph[0]` for
-/// 48 kHz).
-const PREEMPH_COEF: f32 = 0.850_006_1;
 
 /// The float-API signal scale (`CELT_SIG_SCALE`).
 const SIG_SCALE: f32 = 32768.0;
@@ -170,6 +161,7 @@ fn tf_decode(
 /// from the two-frame energy history, then renormalize.
 #[allow(clippy::too_many_arguments)]
 fn anti_collapse(
+    e_bands: &[i16],
     x: &mut [f32],
     y: Option<&mut [f32]>,
     collapse_masks: &[u8],
@@ -183,7 +175,7 @@ fn anti_collapse(
     pulses: &[i32; MAX_BANDS],
     mut seed: u32,
 ) {
-    let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
+    let eb = |i: usize| e_bands[i] as usize;
     let chans: [Option<&mut [f32]>; 2] = [Some(x), y];
     let mut chans = chans;
     for i in start..end {
@@ -238,6 +230,7 @@ fn anti_collapse(
 /// Appendix A decode driver carries across frames.
 #[derive(Debug)]
 pub struct CeltRefDecoder {
+    mode: CeltCustomMode,
     lm: u32,
     channels: usize,
     /// First coded band (`0` for pure CELT; `17` for the CELT layer
@@ -286,15 +279,33 @@ impl CeltRefDecoder {
     /// `start..21` only; the spectrum below the start band
     /// synthesizes as zero (the SILK layer's territory).
     pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
-        if lm > 3 || !(1..=2).contains(&channels) || start >= NUM_BANDS {
+        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start)
+    }
+
+    /// Build a decoder for a **custom mode** (an arbitrary
+    /// rate/frame-size geometry from [`CeltCustomMode::new`]) at
+    /// frame-size shift `lm` (`0..=mode.max_lm`). Custom-mode frames
+    /// always start at band 0.
+    pub fn new_custom(mode: &CeltCustomMode, lm: u32, channels: usize) -> Result<Self, Error> {
+        Self::with_mode(mode.clone(), lm, channels, 0)
+    }
+
+    fn with_mode(
+        mode: CeltCustomMode,
+        lm: u32,
+        channels: usize,
+        start: usize,
+    ) -> Result<Self, Error> {
+        if lm > mode.max_lm || !(1..=2).contains(&channels) || start >= mode.eff_ebands {
             return Err(Error::InvalidParameter);
         }
-        let frame = mdct_size(lm).ok_or(Error::InvalidParameter)?;
+        let frame = mode.short_mdct_size << lm;
+        let overlap = mode.overlap;
         let long_window =
-            build_low_overlap_window_f32(frame, OVERLAP).ok_or(Error::InvalidParameter)?;
-        let short_window =
-            build_low_overlap_window_f32(120, OVERLAP).ok_or(Error::InvalidParameter)?;
-        let window: Vec<f32> = (0..OVERLAP).map(|i| celt_window_f32(i, OVERLAP)).collect();
+            build_low_overlap_window_f32(frame, overlap).ok_or(Error::InvalidParameter)?;
+        let short_window = build_low_overlap_window_f32(mode.short_mdct_size, overlap)
+            .ok_or(Error::InvalidParameter)?;
+        let window = mode.window.clone();
         Ok(Self {
             lm,
             channels,
@@ -302,7 +313,7 @@ impl CeltRefDecoder {
             coarse: CoarseEnergyState::new(),
             old_log_e: [[-28.0; MAX_BANDS]; 2],
             old_log_e2: [[-28.0; MAX_BANDS]; 2],
-            overlap_mem: vec![vec![0.0; OVERLAP]; channels],
+            overlap_mem: vec![vec![0.0; overlap]; channels],
             long_window,
             short_window,
             pf_hist: vec![vec![0.0; MAX_PERIOD + 2]; channels],
@@ -315,12 +326,13 @@ impl CeltRefDecoder {
             pf_tapset_old: 0,
             rng: 0,
             window,
+            mode,
         })
     }
 
     /// The per-channel frame size in samples.
     pub fn frame_size(&self) -> usize {
-        mdct_size(self.lm).expect("lm validated at construction")
+        self.mode.short_mdct_size << self.lm
     }
 
     /// Decode one CELT frame into interleaved f32 PCM in `[-1, 1]`
@@ -330,8 +342,9 @@ impl CeltRefDecoder {
         let channels = self.channels;
         let frame = self.frame_size();
         let start = self.start;
-        let end = NUM_BANDS;
-        let n_coded = (1usize << lm) * EBAND_EDGES_5MS[end] as usize;
+        let end = self.mode.eff_ebands;
+        let overlap = self.mode.overlap;
+        let n_coded = (1usize << lm) * self.mode.e_bands[end] as usize;
         if bytes.is_empty() || bytes.len() > 1275 {
             return Err(Error::InvalidParameter);
         }
@@ -402,11 +415,11 @@ impl CeltRefDecoder {
             };
 
             // Per-band caps + dynalloc boosts.
-            let bins: Vec<u32> = BAND_BINS_LM[lm as usize][start..end].to_vec();
-            let mut caps16 = vec![0i16; end - start];
-            if !compute_band_caps(lm, channels == 2, channels as u32, &bins, &mut caps16) {
-                return Err(Error::InvalidParameter);
-            }
+            let bins: Vec<u32> = (start..end)
+                .map(|i| self.mode.band_bins(i, lm) as u32)
+                .collect();
+            let mut caps = [0i32; MAX_BANDS];
+            self.mode.init_caps(lm, channels, &mut caps);
             let frame_8th = (bytes.len() * 8 * 8) as i32;
             let boosts = decode_band_boosts(
                 &mut dec,
@@ -414,7 +427,7 @@ impl CeltRefDecoder {
                 end as u32,
                 channels as u32,
                 &bins,
-                &caps16,
+                &caps[start..end],
                 frame_8th,
             )
             .ok_or(Error::InvalidParameter)?;
@@ -435,12 +448,8 @@ impl CeltRefDecoder {
                     0
                 };
             bits -= anti_collapse_rsv;
-            let mut caps = [0i32; MAX_BANDS];
-            for (c, &v) in caps[start..end].iter_mut().zip(caps16.iter()) {
-                *c = v as i32;
-            }
             let alloc = compute_allocation_exact(
-                CeltCustomMode::standard(),
+                &self.mode,
                 start,
                 end,
                 &offsets,
@@ -468,7 +477,7 @@ impl CeltRefDecoder {
             // The §4.3.4 band loop.
             let mut seed = self.rng;
             let walk = quant_all_bands(
-                CeltCustomMode::standard(),
+                &self.mode,
                 QuantIo::Decode(&mut dec),
                 start,
                 end,
@@ -515,6 +524,7 @@ impl CeltRefDecoder {
 
             if anti_collapse_on {
                 anti_collapse(
+                    &self.mode.e_bands,
                     &mut x,
                     (channels == 2).then_some(&mut y[..]),
                     &walk.collapse_masks,
@@ -552,7 +562,7 @@ impl CeltRefDecoder {
         // Denormalise + inverse MDCT per channel, then the two-stage
         // comb filter over the filtered history.
         let m = 1usize << lm;
-        let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
+        let eb = |i: usize| self.mode.e_bands[i] as usize;
         let mut pcm = vec![0f32; channels * frame];
         let short_size = frame / m;
         self.pf_period = self.pf_period.max(COMBFILTER_MINPERIOD);
@@ -581,9 +591,9 @@ impl CeltRefDecoder {
             // `overlap_mem`. The backward transform carries twice
             // the §4.3.7 half-scale (the listing folds that factor
             // into the window mixing).
-            let mut xbuf = vec![0f32; frame + OVERLAP];
+            let mut xbuf = vec![0f32; frame + overlap];
             if !is_transient {
-                let p = (frame - OVERLAP) / 2;
+                let p = (frame - overlap) / 2;
                 let mut u = vec![0f32; 2 * frame];
                 if !imdct_naive_f32(&freq, &mut u) {
                     return Err(Error::InvalidParameter);
@@ -592,9 +602,12 @@ impl CeltRefDecoder {
                     *o = 2.0 * u[p + j] * self.long_window[p + j];
                 }
             } else {
-                // 2^lm interleaved short blocks at hop 120 with the
-                // full-overlap 240-sample window (P = 0).
+                // 2^lm interleaved short blocks at hop `short_size`;
+                // each emits its window support
+                // `[p_s, p_s + short + overlap)` (`p_s` is 0 on
+                // divisible-by-4 short sizes, 1 otherwise).
                 let blocks = m;
+                let p_s = (short_size - overlap) / 2;
                 let mut block_spec = vec![0f32; short_size];
                 let mut u = vec![0f32; 2 * short_size];
                 for b in 0..blocks {
@@ -604,8 +617,8 @@ impl CeltRefDecoder {
                     if !imdct_naive_f32(&block_spec, &mut u) {
                         return Err(Error::InvalidParameter);
                     }
-                    for (j, &uv) in u.iter().enumerate() {
-                        xbuf[b * short_size + j] += 2.0 * uv * self.short_window[j];
+                    for j in 0..(short_size + overlap) {
+                        xbuf[b * short_size + j] += 2.0 * u[p_s + j] * self.short_window[p_s + j];
                     }
                 }
             }
@@ -613,12 +626,12 @@ impl CeltRefDecoder {
             for (t, (&xv, &ov)) in time
                 .iter_mut()
                 .zip(xbuf.iter().zip(self.overlap_mem[c].iter()))
-                .take(OVERLAP)
+                .take(overlap)
             {
                 *t = xv + ov;
             }
-            time[OVERLAP..frame].copy_from_slice(&xbuf[OVERLAP..frame]);
-            self.overlap_mem[c].copy_from_slice(&xbuf[frame..frame + OVERLAP]);
+            time[overlap..frame].copy_from_slice(&xbuf[overlap..frame]);
+            self.overlap_mem[c].copy_from_slice(&xbuf[frame..frame + overlap]);
 
             // Comb filter over [history | frame].
             let hist_len = self.pf_hist[c].len();
@@ -656,12 +669,16 @@ impl CeltRefDecoder {
             let tail = buf.len() - keep;
             self.pf_hist[c].copy_from_slice(&buf[tail..]);
 
-            // De-emphasis + output scale.
+            // De-emphasis + output scale (two-tap form below 40 kHz;
+            // the standard mode has coef[1] = 0, coef[3] = 1).
+            let c0 = self.mode.preemph[0];
+            let c1 = self.mode.preemph[1];
+            let c3 = self.mode.preemph[3];
             let mut mem = self.deemph_mem[c];
             for (j, &v) in buf[hist_len..].iter().enumerate() {
                 let tmp = v + mem;
-                mem = PREEMPH_COEF * tmp;
-                pcm[j * channels + c] = tmp * (1.0 / SIG_SCALE);
+                mem = c0 * tmp - c1 * v;
+                pcm[j * channels + c] = c3 * tmp * (1.0 / SIG_SCALE);
             }
             self.deemph_mem[c] = mem;
         }
@@ -703,6 +720,11 @@ impl CeltRefDecoder {
         // change"): zero prediction state, floored history.
         for c in 0..2 {
             for i in 0..start {
+                self.coarse.energy[c][i] = 0.0;
+                self.old_log_e[c][i] = -28.0;
+                self.old_log_e2[c][i] = -28.0;
+            }
+            for i in end..self.mode.nb_ebands {
                 self.coarse.energy[c][i] = 0.0;
                 self.old_log_e[c][i] = -28.0;
                 self.old_log_e2[c][i] = -28.0;
