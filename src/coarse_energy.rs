@@ -92,6 +92,7 @@
 //! and SHA-1-verified; no source outside the staged docs was
 //! consulted.
 
+use crate::custom_mode::MAX_BANDS;
 use crate::e_prob_model::{E_PROB_MODEL, NUM_LM_FRAME_SIZES, PRED_INTER, PRED_INTRA};
 use crate::laplace::{ec_laplace_decode, ec_laplace_encode};
 use crate::range_decoder::RangeDecoder;
@@ -176,7 +177,7 @@ const LAPLACE_MIN_BUDGET_BITS: u32 = 15;
 pub struct CoarseEnergyState {
     /// Per-channel, per-band base-2 log-energy from the most recent
     /// frame. Zero on stream open and after any decoder reset.
-    pub energy: [[f32; NUM_BANDS]; MAX_CHANNELS],
+    pub energy: [[f32; MAX_BANDS]; MAX_CHANNELS],
 }
 
 impl CoarseEnergyState {
@@ -184,13 +185,13 @@ impl CoarseEnergyState {
     /// at zero log-energy.
     pub fn new() -> Self {
         Self {
-            energy: [[0.0; NUM_BANDS]; MAX_CHANNELS],
+            energy: [[0.0; MAX_BANDS]; MAX_CHANNELS],
         }
     }
 
     /// Zero the carried energies (§4.5.2 decoder reset).
     pub fn reset(&mut self) {
-        self.energy = [[0.0; NUM_BANDS]; MAX_CHANNELS];
+        self.energy = [[0.0; MAX_BANDS]; MAX_CHANNELS];
     }
 }
 
@@ -237,7 +238,7 @@ pub fn decode_coarse_energy(
 ) -> Result<(), Error> {
     if lm as usize >= NUM_LM_FRAME_SIZES
         || start > end
-        || end > NUM_BANDS
+        || end > MAX_BANDS
         || channels == 0
         || channels > MAX_CHANNELS
     {
@@ -330,7 +331,7 @@ pub fn decode_coarse_energy(
 pub fn encode_coarse_energy(
     enc: &mut RangeEncoder,
     state: &mut CoarseEnergyState,
-    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    target: &[[f32; MAX_BANDS]; MAX_CHANNELS],
     intra: bool,
     lm: u32,
     start: usize,
@@ -340,7 +341,7 @@ pub fn encode_coarse_energy(
 ) -> Result<(), Error> {
     if lm as usize >= NUM_LM_FRAME_SIZES
         || start > end
-        || end > NUM_BANDS
+        || end > MAX_BANDS
         || channels == 0
         || channels > MAX_CHANNELS
     {
@@ -419,7 +420,7 @@ pub fn encode_coarse_energy(
 fn quant_coarse_energy_impl(
     enc: &mut RangeEncoder,
     state: &mut CoarseEnergyState,
-    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    target: &[[f32; MAX_BANDS]; MAX_CHANNELS],
     intra: bool,
     lm: usize,
     start: usize,
@@ -507,7 +508,7 @@ fn quant_coarse_energy_impl(
 /// inter prediction hurt on packet loss" statistic that drives the
 /// delayed-intra state.
 fn loss_distortion(
-    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    target: &[[f32; MAX_BANDS]; MAX_CHANNELS],
     state: &CoarseEnergyState,
     start: usize,
     eff_end: usize,
@@ -549,7 +550,7 @@ fn loss_distortion(
 pub fn quant_coarse_energy_rd(
     enc: &mut RangeEncoder,
     state: &mut CoarseEnergyState,
-    target: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    target: &[[f32; MAX_BANDS]; MAX_CHANNELS],
     lm: u32,
     start: usize,
     end: usize,
@@ -564,7 +565,7 @@ pub fn quant_coarse_energy_rd(
 ) -> Result<bool, Error> {
     if lm as usize >= NUM_LM_FRAME_SIZES
         || start > end
-        || end > NUM_BANDS
+        || end > MAX_BANDS
         || eff_end > end
         || channels == 0
         || channels > MAX_CHANNELS
@@ -687,11 +688,11 @@ mod tests {
     #[test]
     fn new_state_is_all_zero_and_resets() {
         let mut state = CoarseEnergyState::new();
-        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+        assert_eq!(state.energy, [[0.0; MAX_BANDS]; MAX_CHANNELS]);
         assert_eq!(CoarseEnergyState::default().energy, state.energy);
         state.energy[1][20] = -3.5;
         state.reset();
-        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+        assert_eq!(state.energy, [[0.0; MAX_BANDS]; MAX_CHANNELS]);
     }
 
     /// The two-pass RD encode stays in exact decoder lockstep: for a
@@ -706,7 +707,7 @@ mod tests {
             let budget_bytes = [12u32, 96, 40, 200, 24, 160, 64, 250][case as usize];
             let budget = budget_bytes * 8;
             let mut state = CoarseEnergyState::new();
-            let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+            let mut target = [[0.0f32; MAX_BANDS]; MAX_CHANNELS];
             #[allow(clippy::needless_range_loop)] // paired matrix fill
             for c in 0..channels {
                 for b in 0..NUM_BANDS {
@@ -766,7 +767,7 @@ mod tests {
             state.energy[0][b] = 6.0;
         }
         let start_energy = state.energy;
-        let target = [[-28.0f32; NUM_BANDS]; MAX_CHANNELS];
+        let target = [[-28.0f32; MAX_BANDS]; MAX_CHANNELS];
         let mut delayed = 0.0f32;
         let mut enc = RangeEncoder::new();
         quant_coarse_energy_rd(
@@ -808,7 +809,7 @@ mod tests {
         for b in 0..NUM_BANDS {
             state.energy[0][b] = if b % 2 == 0 { 8.0 } else { -8.0 };
         }
-        let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        let mut target = [[0.0f32; MAX_BANDS]; MAX_CHANNELS];
         for (b, t) in target[0].iter_mut().enumerate() {
             *t = if b % 2 == 0 { -6.0 } else { 6.0 };
         }
@@ -851,7 +852,7 @@ mod tests {
         );
         // band window out of range.
         assert_eq!(
-            decode_coarse_energy(&mut dec, &mut state, true, 0, 0, NUM_BANDS + 1, 1),
+            decode_coarse_energy(&mut dec, &mut state, true, 0, 0, MAX_BANDS + 1, 1),
             Err(Error::InvalidParameter)
         );
         // inverted band window.
@@ -869,7 +870,7 @@ mod tests {
             Err(Error::InvalidParameter)
         );
         assert_eq!(dec.tell(), tell_before);
-        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+        assert_eq!(state.energy, [[0.0; MAX_BANDS]; MAX_CHANNELS]);
     }
 
     /// An empty band window decodes nothing and leaves both the
@@ -882,7 +883,7 @@ mod tests {
         let tell_before = dec.tell();
         decode_coarse_energy(&mut dec, &mut state, false, 2, 7, 7, 2).unwrap();
         assert_eq!(dec.tell(), tell_before);
-        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+        assert_eq!(state.energy, [[0.0; MAX_BANDS]; MAX_CHANNELS]);
     }
 
     /// With an empty frame the budget is zero, so every band/channel
@@ -913,7 +914,7 @@ mod tests {
             prev += q - beta * q;
         }
         // Channel 1 was not coded (mono) and stays untouched.
-        assert_eq!(state.energy[1], [0.0; NUM_BANDS]);
+        assert_eq!(state.energy[1], [0.0; MAX_BANDS]);
     }
 
     /// Zero-budget inter mode exercises the time arm: pre-seed the
@@ -934,7 +935,7 @@ mod tests {
         let coef = PRED_COEF_Q15[lm] as f32 / 32768.0;
         let beta = BETA_COEF_Q15[lm] as f32 / 32768.0;
         let mut prev = 0.0_f32;
-        for (band, &seed) in seeded.iter().enumerate() {
+        for (band, &seed) in seeded.iter().enumerate().take(NUM_BANDS) {
             let q = -1.0_f32;
             let old = seed.max(-9.0);
             let expected = coef * old + prev + q;
@@ -956,7 +957,7 @@ mod tests {
         state.energy[0] = std::array::from_fn(|band| 1.0 + band as f32);
         let seeded = state.energy[0];
         decode_coarse_energy(&mut dec, &mut state, true, 3, 17, NUM_BANDS, 1).unwrap();
-        for (band, &seed) in seeded.iter().enumerate() {
+        for (band, &seed) in seeded.iter().enumerate().take(NUM_BANDS) {
             if band < 17 {
                 assert_eq!(state.energy[0][band], seed, "band {band} clobbered");
             } else {
@@ -988,7 +989,7 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_full_laplace() {
         // A representative target envelope (base-2 log energies).
-        let target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [
+        let target: [[f32; MAX_BANDS]; MAX_CHANNELS] = [
             std::array::from_fn(|b| 4.0 - 0.12 * b as f32),
             std::array::from_fn(|b| 3.5 - 0.10 * b as f32),
         ];
@@ -1047,9 +1048,9 @@ mod tests {
     /// round-to-nearest of the prediction error).
     #[test]
     fn encode_reconstruction_is_nearest_step() {
-        let target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [
+        let target: [[f32; MAX_BANDS]; MAX_CHANNELS] = [
             std::array::from_fn(|b| 2.0 + 0.37 * (b as f32).sin()),
-            [0.0; NUM_BANDS],
+            [0.0; MAX_BANDS],
         ];
         let mut enc_state = CoarseEnergyState::new();
         let mut enc = RangeEncoder::new();
@@ -1068,7 +1069,12 @@ mod tests {
         // Reconstruction error per band must not exceed one integer 6 dB
         // step (the coarse resolution); the prediction chain can spread
         // the residual, but each qi is the nearest-integer choice.
-        for (b, (&got, &want)) in enc_state.energy[0].iter().zip(target[0].iter()).enumerate() {
+        for (b, (&got, &want)) in enc_state.energy[0]
+            .iter()
+            .zip(target[0].iter())
+            .enumerate()
+            .take(NUM_BANDS)
+        {
             let err = (got - want).abs();
             assert!(
                 err <= 1.0,
@@ -1082,9 +1088,9 @@ mod tests {
     /// reconstructed state exactly.
     #[test]
     fn encode_decode_roundtrip_low_budget_fallbacks() {
-        let target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [
+        let target: [[f32; MAX_BANDS]; MAX_CHANNELS] = [
             std::array::from_fn(|b| 1.0 - 0.2 * b as f32),
-            [0.0; NUM_BANDS],
+            [0.0; MAX_BANDS],
         ];
         // A 4-byte frame (32 bits): after a few Laplace symbols the
         // budget drops through the 2-bit, 1-bit and no-bit fallbacks.
@@ -1115,7 +1121,7 @@ mod tests {
     /// touching the encoder or the state.
     #[test]
     fn encode_invalid_parameters_rejected() {
-        let target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        let target = [[0.0f32; MAX_BANDS]; MAX_CHANNELS];
         let mut state = CoarseEnergyState::new();
         let mut enc = RangeEncoder::new();
         let tell_before = enc.tell();
@@ -1132,7 +1138,7 @@ mod tests {
             Err(Error::InvalidParameter)
         );
         assert_eq!(enc.tell(), tell_before);
-        assert_eq!(state.energy, [[0.0; NUM_BANDS]; MAX_CHANNELS]);
+        assert_eq!(state.energy, [[0.0; MAX_BANDS]; MAX_CHANNELS]);
     }
 
     /// With a real (non-empty) buffer the full Laplace path runs for

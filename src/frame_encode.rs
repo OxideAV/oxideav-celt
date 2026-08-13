@@ -85,7 +85,7 @@ pub struct FramePrefixSpec<'a> {
     /// Per-channel per-band target log-2 energies (`1.0` = 6 dB) for
     /// the §4.3.2.1 coarse quantization. Channel 1 is ignored for a
     /// mono frame.
-    pub energy_target: &'a [[f32; NUM_BANDS]; MAX_CHANNELS],
+    pub energy_target: &'a [[f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS],
     /// The §4.3.4.5 TF parameters. `tf_select` must be 0 when the
     /// "can it have an impact" gate is closed (`tf_select_decoded` is
     /// recomputed, not trusted).
@@ -484,7 +484,8 @@ fn encode_celt_frame_impl(
 
     // §4.3.6 analysis: split each band into its log-2 energy target and
     // its unit-norm shape.
-    let mut energy_target: [[f32; NUM_BANDS]; MAX_CHANNELS] = coarse_state.energy;
+    let mut energy_target: [[f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS] =
+        coarse_state.energy;
     let mut shapes: Vec<Vec<f32>> = Vec::with_capacity(coded_bands);
     {
         let mut offset = 0usize;
@@ -938,7 +939,8 @@ fn encode_stereo_celt_frame_impl(
     }
 
     // §4.3.6 analysis per channel: log-2 energy targets + unit shapes.
-    let mut energy_target: [[f32; NUM_BANDS]; MAX_CHANNELS] = coarse_state.energy;
+    let mut energy_target: [[f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS] =
+        coarse_state.energy;
     let mut shapes: [Vec<Vec<f32>>; 2] = [
         Vec::with_capacity(coded_bands),
         Vec::with_capacity(coded_bands),
@@ -1256,10 +1258,10 @@ mod tests {
 
     const FRAME_BYTES: u32 = 96;
 
-    fn mono_target() -> [[f32; NUM_BANDS]; MAX_CHANNELS] {
+    fn mono_target() -> [[f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS] {
         [
             std::array::from_fn(|b| 4.0 - 0.11 * b as f32),
-            [0.0; NUM_BANDS],
+            [0.0; crate::custom_mode::MAX_BANDS],
         ]
     }
 
@@ -1377,7 +1379,7 @@ mod tests {
     /// reservations and the intensity/dual fields.
     #[test]
     fn stereo_prefix_roundtrip() {
-        let target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [
+        let target: [[f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS] = [
             std::array::from_fn(|b| 3.0 - 0.1 * b as f32),
             std::array::from_fn(|b| 2.5 - 0.08 * b as f32),
         ];

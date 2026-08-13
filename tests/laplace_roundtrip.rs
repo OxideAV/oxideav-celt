@@ -19,8 +19,8 @@
 
 use oxideav_celt::{
     decode_coarse_energy, ec_laplace_decode, CoarseEnergyState, RangeDecoder, BETA_COEF_Q15,
-    E_PROB_MODEL, INTRA_BETA_Q15, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN, MAX_CHANNELS,
-    NUM_BANDS, PRED_COEF_Q15, PRED_INTER, PRED_INTRA, SMALL_ENERGY_ICDF,
+    E_PROB_MODEL, INTRA_BETA_Q15, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN, MAX_BANDS,
+    MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, PRED_INTER, PRED_INTRA, SMALL_ENERGY_ICDF,
 };
 
 // ---- test-only range encoder (RFC 6716 Appendix A entenc.c) ----
@@ -270,14 +270,14 @@ fn encode_coarse(
 /// mirroring `decode_coarse_energy`'s f32 arithmetic operation for
 /// operation.
 fn reconstruct(
-    prev: &[[f32; NUM_BANDS]; MAX_CHANNELS],
+    prev: &[[f32; MAX_BANDS]; MAX_CHANNELS],
     qis: &[[i32; NUM_BANDS]; MAX_CHANNELS],
     intra: bool,
     lm: usize,
     start: usize,
     end: usize,
     channels: usize,
-) -> [[f32; NUM_BANDS]; MAX_CHANNELS] {
+) -> [[f32; MAX_BANDS]; MAX_CHANNELS] {
     let (coef, beta) = if intra {
         (0.0_f32, INTRA_BETA_Q15 as f32 / 32768.0)
     } else {
@@ -486,7 +486,7 @@ fn coarse_energy_roundtrip_hybrid_window() {
     qis[0][20] = 1;
     let (buf, committed) = encode_coarse(&qis, true, 3, 17, NUM_BANDS, 1, 32);
     let mut state = CoarseEnergyState::new();
-    state.energy[0] = [7.0; NUM_BANDS];
+    state.energy[0] = [7.0; MAX_BANDS];
     let seeded = state.energy;
     let mut dec = RangeDecoder::new(&buf);
     decode_coarse_energy(&mut dec, &mut state, true, 3, 17, NUM_BANDS, 1).unwrap();

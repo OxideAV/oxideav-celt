@@ -535,6 +535,7 @@ pub use coarse_energy::{
     BETA_COEF_Q15, INTRA_ALPHA_Q15, INTRA_BETA_Q15, MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15,
     SMALL_ENERGY_ICDF,
 };
+pub use custom_mode::{CeltCustomMode, MAX_BANDS};
 #[doc(hidden)]
 pub use deemphasis::{
     deemphasize_in_place_f32, preemphasize_in_place_f32, Deemphasis, Preemphasis, ALPHA_P_F32,

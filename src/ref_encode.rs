@@ -43,6 +43,7 @@ use crate::band_minimums::BAND_BINS_LM;
 use crate::band_quant::{haar1, quant_all_bands, BandAmps, QuantIo};
 use crate::bit_allocation::encode_alloc_trim;
 use crate::coarse_energy::{quant_coarse_energy_rd, CoarseEnergyState, NUM_BANDS};
+use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
 use crate::encoder_decisions::{
     alloc_trim_analysis, boost_thresholds, intensity_start_band, stereo_analysis,
 };
@@ -160,8 +161,8 @@ fn tf_encode(
     is_transient: bool,
     lm: u32,
     total_bits: u32,
-    desired: &[bool; NUM_BANDS],
-    tf_res: &mut [i32; NUM_BANDS],
+    desired: &[bool; MAX_BANDS],
+    tf_res: &mut [i32; MAX_BANDS],
 ) -> Result<(), Error> {
     let mut tell = enc.tell();
     let mut logp: u32 = if is_transient { 2 } else { 4 };
@@ -170,7 +171,7 @@ fn tf_encode(
     let budget = total_bits - tf_select_rsv;
     let mut tf_changed = false;
     let mut curr = false;
-    let mut raw = [false; NUM_BANDS];
+    let mut raw = [false; MAX_BANDS];
     for (i, r) in raw.iter_mut().enumerate().take(end).skip(start) {
         if tell + logp <= budget {
             let toggle = desired[i] != curr;
@@ -248,10 +249,10 @@ fn tf_analysis(
     lm: u32,
     end: usize,
     effective_bytes: usize,
-) -> ([bool; NUM_BANDS], i32) {
+) -> ([bool; MAX_BANDS], i32) {
     let channels = 1 + usize::from(y.is_some());
     let eb = |i: usize| m * EBAND_EDGES_5MS[i] as usize;
-    let mut tf_res = [false; NUM_BANDS];
+    let mut tf_res = [false; MAX_BANDS];
     let mut tf_sum = 0i32;
     if effective_bytes < 15 * channels {
         for r in tf_res.iter_mut().take(end) {
@@ -269,7 +270,7 @@ fn tf_analysis(
         3
     };
     let lm = lm as usize;
-    let mut metric = [0i32; NUM_BANDS];
+    let mut metric = [0i32; MAX_BANDS];
     for i in 0..end {
         let n = eb(i + 1) - eb(i);
         let mut tmp: Vec<f32> = x[eb(i)..eb(i + 1)].to_vec();
@@ -310,8 +311,8 @@ fn tf_analysis(
     // level and the Table-60..63 adjustment the toggle would code.
     let tf_select = 0u8;
     let target = |toggle: bool| tf_adjustment(is_transient, tf_select, lm as u8, toggle) as i32;
-    let mut path0 = [false; NUM_BANDS];
-    let mut path1 = [false; NUM_BANDS];
+    let mut path0 = [false; MAX_BANDS];
+    let mut path1 = [false; MAX_BANDS];
     let mut cost0 = 0i32;
     let mut cost1 = if is_transient { 0 } else { lambda };
     for i in 1..end {
@@ -386,8 +387,8 @@ pub struct CeltRefEncoder {
     /// §4.3.2.1 inter-frame energy prediction over the **quantized**
     /// energies — the same values the decoder reconstructs.
     coarse: CoarseEnergyState,
-    old_log_e: [[f32; NUM_BANDS]; 2],
-    old_log_e2: [[f32; NUM_BANDS]; 2],
+    old_log_e: [[f32; MAX_BANDS]; 2],
+    old_log_e2: [[f32; MAX_BANDS]; 2],
     /// Per-channel pre-emphasized input history (`overlap` samples) —
     /// the analysis lookahead delay.
     in_mem: Vec<Vec<f32>>,
@@ -464,8 +465,8 @@ impl CeltRefEncoder {
             lm,
             channels,
             coarse: CoarseEnergyState::new(),
-            old_log_e: [[-28.0; NUM_BANDS]; 2],
-            old_log_e2: [[-28.0; NUM_BANDS]; 2],
+            old_log_e: [[-28.0; MAX_BANDS]; 2],
+            old_log_e2: [[-28.0; MAX_BANDS]; 2],
             in_mem: vec![vec![0.0; OVERLAP]; channels],
             preemph_mem: [0.0; 2],
             long_window,
@@ -631,7 +632,7 @@ impl CeltRefEncoder {
         // after a stereo one predicts from the max"); for a fixed-mono
         // stream this is the identity from the second frame on.
         if channels == 1 {
-            for i in 0..NUM_BANDS {
+            for i in 0..MAX_BANDS {
                 self.coarse.energy[0][i] = self.coarse.energy[0][i].max(self.coarse.energy[1][i]);
             }
         }
@@ -780,8 +781,8 @@ impl CeltRefEncoder {
             // ── Analysis: forward MDCT, band energies, unit shapes ──
             let mut x = vec![0f32; n_coded];
             let mut y = vec![0f32; n_coded];
-            let mut amps: BandAmps = [[0.0; NUM_BANDS]; 2];
-            let mut targets = [[0f32; NUM_BANDS]; 2];
+            let mut amps: BandAmps = [[0.0; MAX_BANDS]; 2];
+            let mut targets = [[0f32; MAX_BANDS]; 2];
             let mut freqs: Vec<Vec<f32>> = Vec::with_capacity(channels);
             for c in 0..channels {
                 let freq = self.forward_freq(&blocks[c], is_transient)?;
@@ -845,7 +846,7 @@ impl CeltRefEncoder {
                 end,
                 effective_bytes,
             );
-            let mut tf_res = [0i32; NUM_BANDS];
+            let mut tf_res = [0i32; MAX_BANDS];
             tf_encode(
                 &mut enc,
                 start,
@@ -928,7 +929,7 @@ impl CeltRefEncoder {
                 frame_8th,
                 &want_boost,
             )?;
-            let mut offsets = [0i32; NUM_BANDS];
+            let mut offsets = [0i32; MAX_BANDS];
             offsets[start..end].copy_from_slice(&boosts.boost);
 
             // ── Allocation trim (§5.3.4.2 at the listing's exact
@@ -1006,11 +1007,12 @@ impl CeltRefEncoder {
                     0
                 };
             bits -= anti_collapse_rsv;
-            let mut caps = [0i32; NUM_BANDS];
+            let mut caps = [0i32; MAX_BANDS];
             for (c, &v) in caps[start..end].iter_mut().zip(caps16.iter()) {
                 *c = v as i32;
             }
             let alloc = compute_allocation_exact(
+                CeltCustomMode::standard(),
                 start,
                 end,
                 &offsets,
@@ -1060,6 +1062,7 @@ impl CeltRefEncoder {
             // ── The §4.3.4 band loop (encode + resynthesis) ──
             let mut seed = self.rng;
             let _walk = quant_all_bands(
+                CeltCustomMode::standard(),
                 QuantIo::Encode(&mut enc),
                 start,
                 end,
@@ -1114,7 +1117,7 @@ impl CeltRefEncoder {
         } else {
             // Silence: floor the prediction state like the decoder.
             for c in 0..2 {
-                for i in 0..NUM_BANDS {
+                for i in 0..MAX_BANDS {
                     self.coarse.energy[c][i] = -28.0;
                 }
             }
@@ -1144,7 +1147,7 @@ impl CeltRefEncoder {
 
         // Mono duplicates its energy row (decoder parity).
         if channels == 1 {
-            for i in 0..NUM_BANDS {
+            for i in 0..MAX_BANDS {
                 self.coarse.energy[1][i] = self.coarse.energy[0][i];
             }
         }
@@ -1155,7 +1158,7 @@ impl CeltRefEncoder {
             self.old_log_e = self.coarse.energy;
         } else {
             for c in 0..2 {
-                for i in 0..NUM_BANDS {
+                for i in 0..MAX_BANDS {
                     self.old_log_e[c][i] = self.old_log_e[c][i].min(self.coarse.energy[c][i]);
                 }
             }

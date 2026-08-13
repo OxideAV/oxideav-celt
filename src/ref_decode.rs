@@ -27,6 +27,7 @@ use crate::band_minimums::BAND_BINS_LM;
 use crate::band_quant::{celt_lcg_rand, quant_all_bands, renormalise_vector, QuantIo};
 use crate::bit_allocation::decode_alloc_trim;
 use crate::coarse_energy::{decode_coarse_energy, CoarseEnergyState, NUM_BANDS};
+use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
 use crate::mdct::{build_low_overlap_window_f32, celt_window_f32, imdct_naive_f32};
 use crate::range_decoder::RangeDecoder;
 use crate::spread::Spread;
@@ -131,7 +132,7 @@ fn tf_decode(
     end: usize,
     is_transient: bool,
     lm: u32,
-    tf_res: &mut [i32; NUM_BANDS],
+    tf_res: &mut [i32; MAX_BANDS],
 ) {
     let budget0 = dec.storage_bits();
     let mut tell = dec.tell();
@@ -141,7 +142,7 @@ fn tf_decode(
     let budget = budget0 - tf_select_rsv;
     let mut tf_changed = false;
     let mut curr = false;
-    let mut raw = [false; NUM_BANDS];
+    let mut raw = [false; MAX_BANDS];
     for r in raw.iter_mut().take(end).skip(start) {
         if tell + logp <= budget {
             curr ^= dec.dec_bit_logp(logp) == 1;
@@ -176,10 +177,10 @@ fn anti_collapse(
     channels: usize,
     start: usize,
     end: usize,
-    log_e: &[[f32; NUM_BANDS]; 2],
-    prev1_log_e: &[[f32; NUM_BANDS]; 2],
-    prev2_log_e: &[[f32; NUM_BANDS]; 2],
-    pulses: &[i32; NUM_BANDS],
+    log_e: &[[f32; MAX_BANDS]; 2],
+    prev1_log_e: &[[f32; MAX_BANDS]; 2],
+    prev2_log_e: &[[f32; MAX_BANDS]; 2],
+    pulses: &[i32; MAX_BANDS],
     mut seed: u32,
 ) {
     let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
@@ -248,8 +249,8 @@ pub struct CeltRefDecoder {
     // internal — exposed for tests/fuzz; not part of the stable API
     #[doc(hidden)]
     pub coarse: CoarseEnergyState,
-    old_log_e: [[f32; NUM_BANDS]; 2],
-    old_log_e2: [[f32; NUM_BANDS]; 2],
+    old_log_e: [[f32; MAX_BANDS]; 2],
+    old_log_e2: [[f32; MAX_BANDS]; 2],
     /// Per-channel §4.3.7 overlap memory (`overlap_mem`, 120 samples).
     overlap_mem: Vec<Vec<f32>>,
     /// The low-overlap long window over the `2 * frame` basis span.
@@ -299,8 +300,8 @@ impl CeltRefDecoder {
             channels,
             start,
             coarse: CoarseEnergyState::new(),
-            old_log_e: [[-28.0; NUM_BANDS]; 2],
-            old_log_e2: [[-28.0; NUM_BANDS]; 2],
+            old_log_e: [[-28.0; MAX_BANDS]; 2],
+            old_log_e2: [[-28.0; MAX_BANDS]; 2],
             overlap_mem: vec![vec![0.0; OVERLAP]; channels],
             long_window,
             short_window,
@@ -339,7 +340,7 @@ impl CeltRefDecoder {
 
         // A mono frame after a stereo one predicts from the max.
         if channels == 1 {
-            for i in 0..NUM_BANDS {
+            for i in 0..MAX_BANDS {
                 self.coarse.energy[0][i] = self.coarse.energy[0][i].max(self.coarse.energy[1][i]);
             }
         }
@@ -355,7 +356,7 @@ impl CeltRefDecoder {
 
         let mut x = vec![0f32; n_coded];
         let mut y = vec![0f32; n_coded];
-        let mut band_e = [[0f32; NUM_BANDS]; 2];
+        let mut band_e = [[0f32; MAX_BANDS]; 2];
         let mut is_transient = false;
         let mut pf_pitch = 0usize;
         let mut pf_gain = 0.0f32;
@@ -389,7 +390,7 @@ impl CeltRefDecoder {
             decode_coarse_energy(&mut dec, &mut self.coarse, intra, lm, start, end, channels)?;
 
             // Time-frequency parameters.
-            let mut tf_res = [0i32; NUM_BANDS];
+            let mut tf_res = [0i32; MAX_BANDS];
             tf_decode(&mut dec, start, end, is_transient, lm, &mut tf_res);
 
             // Spread decision.
@@ -417,7 +418,7 @@ impl CeltRefDecoder {
                 frame_8th,
             )
             .ok_or(Error::InvalidParameter)?;
-            let mut offsets = [0i32; NUM_BANDS];
+            let mut offsets = [0i32; MAX_BANDS];
             offsets[start..end].copy_from_slice(&boosts.boost);
 
             // Allocation trim.
@@ -434,11 +435,12 @@ impl CeltRefDecoder {
                     0
                 };
             bits -= anti_collapse_rsv;
-            let mut caps = [0i32; NUM_BANDS];
+            let mut caps = [0i32; MAX_BANDS];
             for (c, &v) in caps[start..end].iter_mut().zip(caps16.iter()) {
                 *c = v as i32;
             }
             let alloc = compute_allocation_exact(
+                CeltCustomMode::standard(),
                 start,
                 end,
                 &offsets,
@@ -466,6 +468,7 @@ impl CeltRefDecoder {
             // The §4.3.4 band loop.
             let mut seed = self.rng;
             let walk = quant_all_bands(
+                CeltCustomMode::standard(),
                 QuantIo::Decode(&mut dec),
                 start,
                 end,
@@ -540,7 +543,7 @@ impl CeltRefDecoder {
         } else {
             // Silence: zero spectrum, floor energies.
             for c in 0..2 {
-                for i in 0..NUM_BANDS {
+                for i in 0..MAX_BANDS {
                     self.coarse.energy[c][i] = -28.0;
                 }
             }
@@ -678,7 +681,7 @@ impl CeltRefDecoder {
 
         // Mono duplicates its energy row.
         if channels == 1 {
-            for i in 0..NUM_BANDS {
+            for i in 0..MAX_BANDS {
                 self.coarse.energy[1][i] = self.coarse.energy[0][i];
             }
         }
@@ -689,7 +692,7 @@ impl CeltRefDecoder {
             self.old_log_e = self.coarse.energy;
         } else {
             for c in 0..2 {
-                for i in 0..NUM_BANDS {
+                for i in 0..MAX_BANDS {
                     self.old_log_e[c][i] = self.old_log_e[c][i].min(self.coarse.energy[c][i]);
                 }
             }

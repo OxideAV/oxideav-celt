@@ -290,7 +290,7 @@ pub fn choose_alloc_trim(
 pub fn alloc_trim_analysis(
     x: &[f32],
     y: Option<&[f32]>,
-    band_log_e: &[[f32; NUM_BANDS]; 2],
+    band_log_e: &[[f32; crate::custom_mode::MAX_BANDS]; 2],
     end: usize,
     lm: u32,
 ) -> u8 {
@@ -526,7 +526,7 @@ pub fn intensity_start_band(frame_bits: u32, lm: u32) -> Option<usize> {
 #[allow(clippy::too_many_arguments)]
 pub fn choose_intra_mode(
     coarse: &crate::coarse_energy::CoarseEnergyState,
-    energy_target: &[[f32; NUM_BANDS]; crate::coarse_energy::MAX_CHANNELS],
+    energy_target: &[[f32; crate::custom_mode::MAX_BANDS]; crate::coarse_energy::MAX_CHANNELS],
     lm: u32,
     start: usize,
     end: usize,
@@ -830,7 +830,7 @@ mod tests {
         for case in 0..6u32 {
             let lm = case % 4;
             let mut state = CoarseEnergyState::new();
-            let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+            let mut target = [[0.0f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS];
             for (b, slot) in target[0].iter_mut().enumerate() {
                 // A mix of stationary and adversarial cases.
                 let sign = if b % 2 == 0 { 1.0 } else { -1.0 };
@@ -882,7 +882,7 @@ mod tests {
         use crate::range_encoder::RangeEncoder;
 
         let budget = 96u32 * 8;
-        let mut target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        let mut target = [[0.0f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS];
         for (b, slot) in target[0].iter_mut().enumerate() {
             *slot = 5.0 - 0.2 * b as f32;
         }
@@ -905,7 +905,7 @@ mod tests {
     fn intra_mode_rejects_bad_params() {
         use crate::coarse_energy::{CoarseEnergyState, MAX_CHANNELS};
         let state = CoarseEnergyState::new();
-        let target = [[0.0f32; NUM_BANDS]; MAX_CHANNELS];
+        let target = [[0.0f32; crate::custom_mode::MAX_BANDS]; MAX_CHANNELS];
         assert!(choose_intra_mode(&state, &target, 4, 0, NUM_BANDS, 1, 768).is_none());
         assert!(choose_intra_mode(&state, &target, 0, 5, 3, 1, 768).is_none());
         assert!(choose_intra_mode(&state, &target, 0, 0, NUM_BANDS, 0, 768).is_none());

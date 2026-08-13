@@ -24,12 +24,8 @@
 //! `bit-interleave-table.csv`, `bit-deinterleave-table.csv`,
 //! `exp2-table8.csv`).
 
-use crate::alloc_exact::{
-    bits2pulses, cache_row, get_pulses, pulses2bits, BITRES, LOG_N400, QTHETA_OFFSET,
-    QTHETA_OFFSET_TWOPHASE,
-};
-use crate::band_layout::EBAND_EDGES_5MS;
-use crate::coarse_energy::NUM_BANDS;
+use crate::alloc_exact::{get_pulses, BITRES, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE};
+use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
 use crate::pvq::{decode_pulses, encode_pulses, pvq_search};
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
@@ -459,10 +455,11 @@ impl QuantIo<'_, '_> {
 
 /// Per-channel band amplitudes (`bandE`) the encoder's intensity
 /// collapse consults; the decoder never needs them.
-pub type BandAmps = [[f32; NUM_BANDS]; 2];
+pub type BandAmps = [[f32; crate::custom_mode::MAX_BANDS]; 2];
 
 /// Everything that stays constant across one frame's band walk.
 struct FrameCtx<'c> {
+    mode: &'c CeltCustomMode,
     spread: Spread,
     intensity: i32,
     band_amps: Option<&'c BandAmps>,
@@ -622,7 +619,7 @@ fn quant_band(
     let mut split = stereo;
     let mut split_lm = lm;
     if !stereo && lm != -1 && n > 2 {
-        if let Some(cache) = cache_row(band, lm) {
+        if let Some(cache) = ctx.mode.cache_row(band, lm) {
             let max_cost = cache[cache[0] as usize] as i32;
             if b > max_cost + 12 {
                 n >>= 1;
@@ -640,7 +637,7 @@ fn quant_band(
     if split {
         let lm = split_lm;
         // Decide on the resolution of the split parameter theta.
-        let pulse_cap = LOG_N400[band] as i32 + lm * (1 << BITRES);
+        let pulse_cap = ctx.mode.log_n[band] as i32 + lm * (1 << BITRES);
         let offset = (pulse_cap >> 1)
             - if stereo && n == 2 {
                 QTHETA_OFFSET_TWOPHASE
@@ -1003,15 +1000,24 @@ fn quant_band(
         }
     } else {
         // The basic no-split case.
-        let q0 = bits2pulses(band, lm, b.min(16383)).ok_or(Error::NotImplemented)?;
+        let q0 = ctx
+            .mode
+            .bits2pulses(band, lm, b.min(16383))
+            .ok_or(Error::NotImplemented)?;
         let mut q = q0;
-        let mut curr_bits = pulses2bits(band, lm, q).ok_or(Error::NotImplemented)?;
+        let mut curr_bits = ctx
+            .mode
+            .pulses2bits(band, lm, q)
+            .ok_or(Error::NotImplemented)?;
         *remaining_bits -= curr_bits;
         // Never bust the budget.
         while *remaining_bits < 0 && q > 0 {
             *remaining_bits += curr_bits;
             q -= 1;
-            curr_bits = pulses2bits(band, lm, q).ok_or(Error::NotImplemented)?;
+            curr_bits = ctx
+                .mode
+                .pulses2bits(band, lm, q)
+                .ok_or(Error::NotImplemented)?;
             *remaining_bits -= curr_bits;
         }
 
@@ -1124,17 +1130,18 @@ pub struct BandWalkResult {
 /// Returns the per-band collapse masks (the §4.3.5 input).
 #[allow(clippy::too_many_arguments)]
 pub fn quant_all_bands(
+    mode: &CeltCustomMode,
     mut io: QuantIo<'_, '_>,
     start: usize,
     end: usize,
     x: &mut [f32],
     mut y: Option<&mut [f32]>,
-    shape_bits: &[i32; NUM_BANDS],
+    shape_bits: &[i32; MAX_BANDS],
     short_blocks: bool,
     spread: Spread,
     dual_stereo: bool,
     intensity: i32,
-    tf_res: &[i32; NUM_BANDS],
+    tf_res: &[i32; MAX_BANDS],
     total_bits: i32,
     mut balance: i32,
     lm: u32,
@@ -1143,25 +1150,26 @@ pub fn quant_all_bands(
     band_amps: Option<&BandAmps>,
     resynth: bool,
 ) -> Result<BandWalkResult, Error> {
-    if start >= end || end > NUM_BANDS || lm > 3 {
+    if start >= end || end > mode.nb_ebands || lm > mode.max_lm {
         return Err(Error::InvalidParameter);
     }
     let channels = if y.is_some() { 2 } else { 1 };
     let m = 1usize << lm;
-    let eb = |i: usize| EBAND_EDGES_5MS[i] as usize;
+    let eb = |i: usize| mode.e_bands[i] as usize;
     if x.len() < m * eb(end) || y.as_deref().is_some_and(|yy| yy.len() < m * eb(end)) {
         return Err(Error::InvalidParameter);
     }
     let b_frame = if short_blocks { m } else { 1 };
-    let norm_len = m * eb(NUM_BANDS);
+    let norm_len = m * eb(mode.nb_ebands);
     let mut norm = vec![0f32; channels * norm_len];
-    let mut collapse_masks = vec![0u8; channels * NUM_BANDS];
+    let mut collapse_masks = vec![0u8; channels * mode.nb_ebands];
     let mut dual_stereo = dual_stereo;
 
     let mut lowband_offset = 0usize;
     let mut update_lowband = true;
 
     let ctx = FrameCtx {
+        mode,
         spread,
         intensity,
         band_amps,
@@ -1463,21 +1471,22 @@ mod tests {
                 &bins,
                 &mut caps16
             ));
-            let mut caps = [0i32; NUM_BANDS];
+            let mut caps = [0i32; MAX_BANDS];
             for (c, &v) in caps.iter_mut().zip(caps16.iter()) {
                 *c = v as i32;
             }
-            let offsets = [0i32; NUM_BANDS];
-            let mut tf_res = [0i32; NUM_BANDS];
+            let offsets = [0i32; MAX_BANDS];
+            let mut tf_res = [0i32; MAX_BANDS];
             for (i, t) in tf_res.iter_mut().enumerate() {
                 *t = tf_adjustment(transient, 0, lm as u8, i % 5 == 3) as i32;
             }
-            let band_amps: BandAmps = [[1.0; NUM_BANDS]; 2];
+            let band_amps: BandAmps = [[1.0; crate::custom_mode::MAX_BANDS]; 2];
 
             // ---- encode ----
             let mut enc = RangeEncoder::new();
             let total = (frame_bytes as i32) * 64 - enc.tell_frac() as i32 - 1;
             let alloc_enc = compute_allocation_exact(
+                CeltCustomMode::standard(),
                 0,
                 NUM_BANDS,
                 &offsets,
@@ -1496,6 +1505,7 @@ mod tests {
             .expect("encode allocation");
             let mut seed_enc = 42u32;
             let walk_enc = quant_all_bands(
+                CeltCustomMode::standard(),
                 QuantIo::Encode(&mut enc),
                 0,
                 NUM_BANDS,
@@ -1523,6 +1533,7 @@ mod tests {
             let total_dec = (frame_bytes as i32) * 64 - dec.tell_frac() as i32 - 1;
             assert_eq!(total, total_dec);
             let alloc_dec = compute_allocation_exact(
+                CeltCustomMode::standard(),
                 0,
                 NUM_BANDS,
                 &offsets,
@@ -1540,6 +1551,7 @@ mod tests {
             let mut y_dec_v = vec![0f32; n_coded];
             let mut seed_dec = 42u32;
             let walk_dec = quant_all_bands(
+                CeltCustomMode::standard(),
                 QuantIo::Decode(&mut dec),
                 0,
                 NUM_BANDS,

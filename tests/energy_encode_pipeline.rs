@@ -59,7 +59,8 @@ fn analyze_encode_decode_denormalize_pipeline() {
 
     // 1. Analyze into coarse-energy targets + unit shapes.
     let analyzed = analyze_bands_f32(&original, &bins).unwrap();
-    let mut target: [[f32; NUM_BANDS]; MAX_CHANNELS] = [[0.0; NUM_BANDS]; MAX_CHANNELS];
+    let mut target: [[f32; oxideav_celt::MAX_BANDS]; MAX_CHANNELS] =
+        [[0.0; oxideav_celt::MAX_BANDS]; MAX_CHANNELS];
     let mut target_q8 = [0i32; NUM_BANDS];
     for (b, a) in analyzed.iter().enumerate() {
         target[0][b] = a.log_energy;

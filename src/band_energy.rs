@@ -113,7 +113,8 @@ pub fn assemble_band_log_energy_f32(
     if channel >= coarse.energy.len() {
         return None;
     }
-    let mut out = coarse.energy[channel];
+    let mut out = [0f32; NUM_BANDS];
+    out.copy_from_slice(&coarse.energy[channel][..NUM_BANDS]);
     for (b, e) in out.iter_mut().enumerate() {
         let mut corr_q14 = 0i32;
         if let Some(fine) = fine_q14 {
@@ -255,7 +256,7 @@ mod tests {
 
     fn state_with(channel: usize, values: [f32; NUM_BANDS]) -> CoarseEnergyState {
         let mut s = CoarseEnergyState::new();
-        s.energy[channel] = values;
+        s.energy[channel][..NUM_BANDS].copy_from_slice(&values);
         s
     }
 

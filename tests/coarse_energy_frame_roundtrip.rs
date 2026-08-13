@@ -22,7 +22,7 @@
 use oxideav_celt::{
     decode_coarse_energy, decode_spread, decode_tf_parameters, encode_coarse_energy, encode_spread,
     encode_tf_parameters, CeltFrameHeader, CoarseEnergyState, RangeDecoder, RangeEncoder, Spread,
-    TfParameters, MAX_CHANNELS, NUM_BANDS,
+    TfParameters, MAX_BANDS, MAX_CHANNELS, NUM_BANDS,
 };
 
 /// Frame budget in bytes; large enough that every coarse-energy band
@@ -30,14 +30,14 @@ use oxideav_celt::{
 const FRAME_BYTES: usize = 128;
 const BUDGET_BITS: u32 = (FRAME_BYTES as u32) * 8;
 
-fn mono_target() -> [[f32; NUM_BANDS]; MAX_CHANNELS] {
+fn mono_target() -> [[f32; MAX_BANDS]; MAX_CHANNELS] {
     [
         std::array::from_fn(|b| 5.0 - 0.15 * b as f32 + 0.4 * (b as f32 * 0.7).sin()),
-        [0.0; NUM_BANDS],
+        [0.0; MAX_BANDS],
     ]
 }
 
-fn stereo_target() -> [[f32; NUM_BANDS]; MAX_CHANNELS] {
+fn stereo_target() -> [[f32; MAX_BANDS]; MAX_CHANNELS] {
     [
         std::array::from_fn(|b| 4.5 - 0.13 * b as f32),
         std::array::from_fn(|b| 3.9 + 0.11 * b as f32 - 0.3 * (b as f32 * 0.5).cos()),

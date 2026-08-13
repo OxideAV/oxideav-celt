@@ -555,7 +555,7 @@ impl CeltCustomMode {
                     let max_bits;
                     if n0 << i == 1 {
                         // N=1 bands only have a sign bit and fine bits.
-                        max_bits = c * (1 + MAX_FINE_BITS) << BITRES;
+                        max_bits = (c * (1 + MAX_FINE_BITS)) << BITRES;
                     } else {
                         let mut lm0: i32 = 0;
                         // Even-sized bands bigger than N=2 can be
@@ -594,7 +594,7 @@ impl CeltCustomMode {
                         // Cost of a stereo split, if necessary.
                         if c == 2 {
                             mb <<= 1;
-                            let offset = ((self.log_n[j] as i32 + ((i as i32) << BITRES)) >> 1)
+                            let offset = ((self.log_n[j] as i32 + (i << BITRES)) >> 1)
                                 - if n == 2 {
                                     QTHETA_OFFSET_TWOPHASE
                                 } else {
@@ -613,7 +613,7 @@ impl CeltCustomMode {
                         // N=2), offset by log2(N)/2 + FINE_OFFSET.
                         let ndof = c * n + i32::from(c == 2 && n > 2);
                         let mut offset =
-                            ((self.log_n[j] as i32 + ((i as i32) << BITRES)) >> 1) - FINE_OFFSET;
+                            ((self.log_n[j] as i32 + (i << BITRES)) >> 1) - FINE_OFFSET;
                         if n == 2 {
                             offset += (1 << BITRES) >> 2;
                         }
@@ -692,6 +692,7 @@ mod tests {
     /// The construction, fed the standard 48 kHz configuration,
     /// reproduces every staged 48 kHz table bit-exactly.
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn standard_mode_reproduces_staged_tables() {
         let m = CeltCustomMode::new(48_000, 960).expect("standard mode");
         assert_eq!(m.max_lm, 3);
@@ -772,6 +773,7 @@ mod tests {
     /// within [`MAX_BANDS`], every cost run is monotone, and the caps
     /// row layout is complete.
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn constructed_modes_hold_structural_invariants() {
         let configs: &[(u32, usize)] = &[
             (8_000, 160),

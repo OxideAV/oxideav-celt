@@ -25,13 +25,12 @@
 //! `cache-{index,bits}50.csv` ([`crate::pulse_cache`]), and
 //! `log2-frac-table.csv` ([`crate::bit_allocation::LOG2_FRAC_TABLE`]).
 
-use crate::band_layout::EBAND_EDGES_5MS;
 use crate::bit_allocation::LOG2_FRAC_TABLE;
 use crate::coarse_energy::NUM_BANDS;
+use crate::custom_mode::{CeltCustomMode, MAX_BANDS, NB_ALLOC_VECTORS};
 use crate::pulse_cache::{CACHE_BITS50, CACHE_INDEX50};
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::static_alloc::{NUM_Q, STATIC_ALLOC};
 use crate::Error;
 
 /// 1/8-bit resolution shift (RFC 6716 Appendix A `rate.h` `BITRES`).
@@ -161,12 +160,12 @@ pub struct ExactAllocation {
     /// Per-band **shape** allocation in 1/8 bits (absolute band
     /// indexing, `[0; 21]` outside the coded window). This is the
     /// `pulses[]` output the §4.3.4 band loop prices against.
-    pub shape_bits: [i32; NUM_BANDS],
+    pub shape_bits: [i32; MAX_BANDS],
     /// Per-band **fine-energy** allocation in whole bits per channel.
-    pub fine_bits: [i32; NUM_BANDS],
+    pub fine_bits: [i32; MAX_BANDS],
     /// Per-band finalize priority (`false` = priority 0, `true` =
     /// priority 1; RFC 6716 §4.3.2.2).
-    pub fine_priority: [bool; NUM_BANDS],
+    pub fine_priority: [bool; MAX_BANDS],
     /// One-past-last coded band (absolute index, `> start`).
     pub coded_bands: usize,
     /// Leftover 1/8 bits carried into the §4.3.4 band-loop
@@ -185,13 +184,14 @@ pub struct ExactAllocation {
 /// coding, the remaining-bit spread, and the fine/shape split.
 #[allow(clippy::too_many_arguments)]
 fn interp_bits2pulses(
+    mode: &CeltCustomMode,
     start: usize,
     end: usize,
     skip_start: usize,
-    bits1: &[i32; NUM_BANDS],
-    bits2: &[i32; NUM_BANDS],
-    thresh: &[i32; NUM_BANDS],
-    cap: &[i32; NUM_BANDS],
+    bits1: &[i32; MAX_BANDS],
+    bits2: &[i32; MAX_BANDS],
+    thresh: &[i32; MAX_BANDS],
+    cap: &[i32; MAX_BANDS],
     mut total: i32,
     skip_rsv: i32,
     mut intensity_rsv: i32,
@@ -200,7 +200,7 @@ fn interp_bits2pulses(
     lm: u32,
     io: &mut AllocIo<'_, '_>,
 ) -> Result<ExactAllocation, Error> {
-    let eb = |i: usize| EBAND_EDGES_5MS[i] as i32;
+    let eb = |i: usize| mode.e_bands[i] as i32;
     let alloc_floor = channels << BITRES;
     let stereo = i32::from(channels > 1);
     let log_m = (lm << BITRES) as i32;
@@ -229,9 +229,9 @@ fn interp_bits2pulses(
         }
     }
 
-    let mut bits = [0i32; NUM_BANDS];
-    let mut ebits = [0i32; NUM_BANDS];
-    let mut fine_priority = [false; NUM_BANDS];
+    let mut bits = [0i32; MAX_BANDS];
+    let mut ebits = [0i32; MAX_BANDS];
+    let mut fine_priority = [false; MAX_BANDS];
     let mut psum: i32 = 0;
     let mut done = false;
     for j in (start..end).rev() {
@@ -387,7 +387,7 @@ fn interp_bits2pulses(
                 + i32::from(
                     channels == 2 && n > 2 && !dual_stereo_out && (j as i32) < intensity_out,
                 );
-            let nclogn = den * (LOG_N400[j] as i32 + log_m);
+            let nclogn = den * (mode.log_n[j] as i32 + log_m);
             // Offset the fine bits by log2(N)/2 + FINE_OFFSET relative
             // to their fair share of total/N.
             let mut offset = (nclogn >> 1) - den * FINE_OFFSET;
@@ -486,10 +486,11 @@ pub const QTHETA_OFFSET_TWOPHASE: i32 = 16;
 /// `fine energy` section.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_allocation_exact(
+    mode: &CeltCustomMode,
     start: usize,
     end: usize,
-    offsets: &[i32; NUM_BANDS],
-    cap: &[i32; NUM_BANDS],
+    offsets: &[i32; MAX_BANDS],
+    cap: &[i32; MAX_BANDS],
     alloc_trim: i32,
     total: i32,
     channels: i32,
@@ -497,14 +498,14 @@ pub fn compute_allocation_exact(
     mut io: AllocIo<'_, '_>,
 ) -> Result<ExactAllocation, Error> {
     if start >= end
-        || end > NUM_BANDS
+        || end > mode.nb_ebands
         || !(1..=2).contains(&channels)
-        || lm > 3
+        || lm > mode.max_lm
         || !(0..=10).contains(&alloc_trim)
     {
         return Err(Error::InvalidParameter);
     }
-    let eb = |i: usize| EBAND_EDGES_5MS[i] as i32;
+    let eb = |i: usize| mode.e_bands[i] as i32;
 
     let mut total = total.max(0);
     let mut skip_start = start;
@@ -525,8 +526,8 @@ pub fn compute_allocation_exact(
         }
     }
 
-    let mut thresh = [0i32; NUM_BANDS];
-    let mut trim_offset = [0i32; NUM_BANDS];
+    let mut thresh = [0i32; MAX_BANDS];
+    let mut trim_offset = [0i32; MAX_BANDS];
     for j in start..end {
         let n = eb(j + 1) - eb(j);
         // Below this threshold no PVQ bits are allocated.
@@ -547,14 +548,16 @@ pub fn compute_allocation_exact(
 
     // Codepoint search over the Table-57 quality columns.
     let mut lo: i32 = 1;
-    let mut hi: i32 = NUM_Q as i32 - 1;
+    let mut hi: i32 = NB_ALLOC_VECTORS as i32 - 1;
     loop {
         let mid = (lo + hi) >> 1;
         let mut psum: i32 = 0;
         let mut done = false;
         for j in (start..end).rev() {
             let n = eb(j + 1) - eb(j);
-            let mut bitsj = (channels * n * STATIC_ALLOC[j][mid as usize] as i32) << lm >> 2;
+            let mut bitsj =
+                (channels * n * mode.alloc_vectors[mid as usize * mode.nb_ebands + j] as i32) << lm
+                    >> 2;
             if bitsj > 0 {
                 bitsj = 0.max(bitsj + trim_offset[j]);
             }
@@ -579,15 +582,16 @@ pub fn compute_allocation_exact(
     hi = lo;
     lo -= 1;
 
-    let mut bits1 = [0i32; NUM_BANDS];
-    let mut bits2 = [0i32; NUM_BANDS];
+    let mut bits1 = [0i32; MAX_BANDS];
+    let mut bits2 = [0i32; MAX_BANDS];
     for j in start..end {
         let n = eb(j + 1) - eb(j);
-        let mut bits1j = (channels * n * STATIC_ALLOC[j][lo as usize] as i32) << lm >> 2;
-        let mut bits2j = if hi >= NUM_Q as i32 {
+        let mut bits1j =
+            (channels * n * mode.alloc_vectors[lo as usize * mode.nb_ebands + j] as i32) << lm >> 2;
+        let mut bits2j = if hi >= NB_ALLOC_VECTORS as i32 {
             cap[j]
         } else {
-            (channels * n * STATIC_ALLOC[j][hi as usize] as i32) << lm >> 2
+            (channels * n * mode.alloc_vectors[hi as usize * mode.nb_ebands + j] as i32) << lm >> 2
         };
         if bits1j > 0 {
             bits1j = 0.max(bits1j + trim_offset[j]);
@@ -608,6 +612,7 @@ pub fn compute_allocation_exact(
     }
 
     interp_bits2pulses(
+        mode,
         start,
         end,
         skip_start,
@@ -631,7 +636,7 @@ mod tests {
     use crate::band_cap::compute_band_caps;
     use crate::band_minimums::BAND_BINS_LM;
 
-    fn caps_for(lm: u32, channels: i32) -> [i32; NUM_BANDS] {
+    fn caps_for(lm: u32, channels: i32) -> [i32; MAX_BANDS] {
         let bins: Vec<u32> = BAND_BINS_LM[lm as usize].to_vec();
         let mut caps16 = vec![0i16; NUM_BANDS];
         assert!(compute_band_caps(
@@ -641,7 +646,7 @@ mod tests {
             &bins,
             &mut caps16
         ));
-        let mut caps = [0i32; NUM_BANDS];
+        let mut caps = [0i32; MAX_BANDS];
         for (c, &v) in caps.iter_mut().zip(caps16.iter()) {
             *c = v as i32;
         }
@@ -663,10 +668,11 @@ mod tests {
             (2, 0, 260),
         ] {
             let caps = caps_for(lm, channels);
-            let mut offsets = [0i32; NUM_BANDS];
+            let mut offsets = [0i32; MAX_BANDS];
             offsets[3] = 48; // one boosted band pins skip_start
             let mut enc = RangeEncoder::new();
             let enc_alloc = compute_allocation_exact(
+                CeltCustomMode::standard(),
                 0,
                 NUM_BANDS,
                 &offsets,
@@ -686,6 +692,7 @@ mod tests {
             let bytes = enc.finish();
             let mut dec = RangeDecoder::new(&bytes);
             let dec_alloc = compute_allocation_exact(
+                CeltCustomMode::standard(),
                 0,
                 NUM_BANDS,
                 &offsets,
@@ -708,10 +715,11 @@ mod tests {
     fn output_invariants() {
         for &(channels, lm) in &[(1i32, 0u32), (1, 3), (2, 2)] {
             let caps = caps_for(lm, channels);
-            let offsets = [0i32; NUM_BANDS];
+            let offsets = [0i32; MAX_BANDS];
             for total in [0, 8, 64, 300, 1000, 4000, 12000] {
                 let mut enc = RangeEncoder::new();
                 let alloc = compute_allocation_exact(
+                    CeltCustomMode::standard(),
                     0,
                     NUM_BANDS,
                     &offsets,
@@ -788,10 +796,11 @@ mod tests {
         let lm = 2u32;
         let channels = 1i32;
         let caps = caps_for(lm, channels);
-        let mut offsets = [0i32; NUM_BANDS];
+        let mut offsets = [0i32; MAX_BANDS];
         offsets[NUM_BANDS - 1] = 400;
         let mut enc = RangeEncoder::new();
         let alloc = compute_allocation_exact(
+            CeltCustomMode::standard(),
             0,
             NUM_BANDS,
             &offsets,
