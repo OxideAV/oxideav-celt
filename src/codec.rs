@@ -11,11 +11,13 @@
 //! the channel count are stream-level parameters, exactly as in the
 //! RFC 6716 §4.3 operating modes. The wrappers read them from
 //! [`CodecParameters`]: `channels` (1 or 2, default 1),
-//! `sample_rate` (must be 48 000 when set — the only rate the crate's
-//! reference-exact chain drives today), and the `frame_size` codec
-//! option (120 / 240 / 480 / 960 samples, default 960). Each
-//! [`Packet`] carries exactly one raw CELT frame; decoded /
-//! consumed audio is interleaved f32 ([`SampleFormat::F32`]).
+//! `sample_rate` (default 48 000; any legal custom-mode rate in
+//! 8000..=96000 builds the derived [`CeltCustomMode`] geometry), and
+//! the `frame_size` codec option (120 / 240 / 480 / 960 samples at
+//! the standard 48 kHz modes, default 960; any legal custom-mode
+//! frame size otherwise). Each [`Packet`] carries exactly one raw
+//! CELT frame; decoded / consumed audio is interleaved f32
+//! ([`SampleFormat::F32`]).
 //!
 //! The encoder derives its fixed per-frame byte budget from
 //! `CodecParameters::bit_rate` (default 96 000 bit/s), clamped to the
@@ -29,13 +31,15 @@ use oxideav_core::{
     RuntimeContext, SampleFormat, TimeBase,
 };
 
+use crate::custom_mode::CeltCustomMode;
 use crate::ref_decode::CeltRefDecoder;
 use crate::ref_encode::CeltRefEncoder;
 
 /// Registry identifier of this codec.
 pub const CODEC_ID: &str = "celt";
 
-/// The only sample rate the reference-exact chain operates at.
+/// The standard-mode sample rate (the default when the caller sets
+/// none).
 const SAMPLE_RATE: u32 = 48_000;
 
 /// Default encoder bit rate (bit/s) when the caller sets none.
@@ -44,7 +48,8 @@ const DEFAULT_BIT_RATE: u64 = 96_000;
 /// Typed options shared by the decoder and encoder factories.
 #[derive(Debug, Clone)]
 pub struct CeltCodecOptions {
-    /// CELT frame size in samples at 48 kHz: 120, 240, 480, or 960.
+    /// CELT frame size in samples: 120/240/480/960 at the standard
+    /// 48 kHz modes, or any legal custom-mode size at other rates.
     pub frame_size: u32,
     /// First coded band (0..21): 0 is pure CELT, 17 the Hybrid-mode
     /// CELT layer (the stream-level parameter both sides must agree
@@ -67,7 +72,8 @@ impl CodecOptionsStruct for CeltCodecOptions {
             name: "frame_size",
             kind: OptionKind::U32,
             default: OptionValue::U32(960),
-            help: "CELT frame size in samples at 48 kHz (120, 240, 480, or 960)",
+            help: "CELT frame size in samples (120/240/480/960 at 48 kHz; any \
+                   legal custom-mode size at other rates)",
         },
         OptionField {
             name: "start_band",
@@ -91,7 +97,8 @@ impl CodecOptionsStruct for CeltCodecOptions {
 /// plus the rate-control mode.
 #[derive(Debug, Clone)]
 pub struct CeltEncoderOptions {
-    /// CELT frame size in samples at 48 kHz: 120, 240, 480, or 960.
+    /// CELT frame size in samples: 120/240/480/960 at the standard
+    /// 48 kHz modes, or any legal custom-mode size at other rates.
     pub frame_size: u32,
     /// Variable bitrate: when set, each frame's size follows the
     /// signal around the `bit_rate` target (transients boosted,
@@ -124,7 +131,8 @@ impl CodecOptionsStruct for CeltEncoderOptions {
             name: "frame_size",
             kind: OptionKind::U32,
             default: OptionValue::U32(960),
-            help: "CELT frame size in samples at 48 kHz (120, 240, 480, or 960)",
+            help: "CELT frame size in samples (120/240/480/960 at 48 kHz; any \
+                   legal custom-mode size at other rates)",
         },
         OptionField {
             name: "vbr",
@@ -160,35 +168,88 @@ impl CodecOptionsStruct for CeltEncoderOptions {
     }
 }
 
-/// Shared parameter validation: `(lm, channels, frame_size)`.
-/// `frame_size` comes from the caller's already-parsed option struct
-/// (the decoder and encoder schemas differ).
-fn stream_config(params: &CodecParameters, frame_size: u32) -> CoreResult<(u32, usize, usize)> {
-    if let Some(sr) = params.sample_rate {
-        if sr != SAMPLE_RATE {
-            return Err(CoreError::unsupported(format!(
-                "celt: only 48 kHz is supported (got {sr})"
-            )));
-        }
-    }
+/// A resolved stream configuration: standard 48 kHz (with an optional
+/// Hybrid start band) or a derived custom mode.
+struct StreamConfig {
+    /// `Some` for a non-standard rate/frame geometry.
+    mode: Option<CeltCustomMode>,
+    lm: u32,
+    channels: usize,
+    frame_size: usize,
+    sample_rate: u32,
+}
+
+/// Shared parameter validation. `frame_size` comes from the caller's
+/// already-parsed option struct (the decoder and encoder schemas
+/// differ). A 48 kHz stream at the four standard frame sizes runs the
+/// standard mode; any other legal `(sample_rate, frame_size)` pair
+/// derives its [`CeltCustomMode`] geometry.
+fn stream_config(params: &CodecParameters, frame_size: u32) -> CoreResult<StreamConfig> {
+    let sample_rate = params.sample_rate.unwrap_or(SAMPLE_RATE);
     let channels = params.channels.unwrap_or(1);
     if !(1..=2).contains(&channels) {
         return Err(CoreError::unsupported(format!(
             "celt: 1 or 2 channels supported (got {channels})"
         )));
     }
-    let lm = match frame_size {
-        120 => 0u32,
-        240 => 1,
-        480 => 2,
-        960 => 3,
-        other => {
-            return Err(CoreError::invalid(format!(
-                "celt: frame_size must be 120/240/480/960 (got {other})"
-            )))
+    if sample_rate == SAMPLE_RATE && matches!(frame_size, 120 | 240 | 480 | 960) {
+        let lm = match frame_size {
+            120 => 0u32,
+            240 => 1,
+            480 => 2,
+            _ => 3,
+        };
+        return Ok(StreamConfig {
+            mode: None,
+            lm,
+            channels: channels as usize,
+            frame_size: frame_size as usize,
+            sample_rate,
+        });
+    }
+    let mode = CeltCustomMode::new(sample_rate, frame_size as usize).map_err(|_| {
+        CoreError::invalid(format!(
+            "celt: no operating mode for {sample_rate} Hz / {frame_size}-sample frames"
+        ))
+    })?;
+    let lm = mode.max_lm;
+    Ok(StreamConfig {
+        mode: Some(mode),
+        lm,
+        channels: channels as usize,
+        frame_size: frame_size as usize,
+        sample_rate,
+    })
+}
+
+/// Build the inner decoder for a resolved configuration.
+fn build_ref_decoder(cfg: &StreamConfig, start: usize) -> CoreResult<CeltRefDecoder> {
+    match &cfg.mode {
+        Some(m) => {
+            if start != 0 {
+                return Err(CoreError::invalid(
+                    "celt: start_band requires the standard 48 kHz mode",
+                ));
+            }
+            CeltRefDecoder::new_custom(m, cfg.lm, cfg.channels).map_err(map_err)
         }
-    };
-    Ok((lm, channels as usize, frame_size as usize))
+        None => CeltRefDecoder::new_with_start(cfg.lm, cfg.channels, start).map_err(map_err),
+    }
+}
+
+/// Build the inner encoder for a resolved configuration.
+fn build_ref_encoder(cfg: &StreamConfig, start: usize) -> CoreResult<CeltRefEncoder> {
+    match &cfg.mode {
+        Some(m) => {
+            if start != 0 {
+                return Err(CoreError::invalid(
+                    "celt: start_band requires the standard 48 kHz mode",
+                ));
+            }
+            CeltRefEncoder::new_custom(m, cfg.lm, cfg.channels).map_err(map_err)
+        }
+        None => CeltRefEncoder::new_with_start(cfg.lm, cfg.channels, start).map_err(map_err),
+    }
 }
 
 fn map_err(e: crate::Error) -> CoreError {
@@ -212,12 +273,12 @@ fn start_band(value: u32) -> CoreResult<usize> {
 pub struct CeltDecoder {
     id: CodecId,
     inner: CeltRefDecoder,
-    lm: u32,
+    cfg: StreamConfig,
     channels: usize,
     start: usize,
     pending: VecDeque<Frame>,
-    /// Running sample position for synthesized pts (1/48000 base),
-    /// used when packets carry no pts of their own.
+    /// Running sample position for synthesized pts (1 / sample-rate
+    /// base), used when packets carry no pts of their own.
     next_pts: i64,
     eof: bool,
 }
@@ -225,8 +286,9 @@ pub struct CeltDecoder {
 impl std::fmt::Debug for CeltDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CeltDecoder")
-            .field("lm", &self.lm)
+            .field("lm", &self.cfg.lm)
             .field("channels", &self.channels)
+            .field("sample_rate", &self.cfg.sample_rate)
             .finish_non_exhaustive()
     }
 }
@@ -271,8 +333,7 @@ impl oxideav_core::Decoder for CeltDecoder {
     }
 
     fn reset(&mut self) -> CoreResult<()> {
-        self.inner =
-            CeltRefDecoder::new_with_start(self.lm, self.channels, self.start).map_err(map_err)?;
+        self.inner = build_ref_decoder(&self.cfg, self.start)?;
         self.pending.clear();
         self.next_pts = 0;
         self.eof = false;
@@ -284,12 +345,13 @@ impl oxideav_core::Decoder for CeltDecoder {
 /// into the registry by [`register`]).
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Decoder>> {
     let opts: CeltCodecOptions = parse_options(&params.options)?;
-    let (lm, channels, _frame_size) = stream_config(params, opts.frame_size)?;
+    let cfg = stream_config(params, opts.frame_size)?;
     let start = start_band(opts.start_band)?;
+    let channels = cfg.channels;
     Ok(Box::new(CeltDecoder {
         id: CodecId::new(CODEC_ID),
-        inner: CeltRefDecoder::new_with_start(lm, channels, start).map_err(map_err)?,
-        lm,
+        inner: build_ref_decoder(&cfg, start)?,
+        cfg,
         channels,
         start,
         pending: VecDeque::new(),
@@ -307,6 +369,7 @@ pub struct CeltEncoder {
     id: CodecId,
     inner: CeltRefEncoder,
     output_params: CodecParameters,
+    sample_rate: u32,
     channels: usize,
     frame_size: usize,
     frame_bytes: usize,
@@ -349,7 +412,7 @@ impl CeltEncoder {
                     .encode_frame(&chunk, self.frame_bytes)
                     .map_err(map_err)?,
             };
-            let mut packet = Packet::new(0, TimeBase::from_rate(SAMPLE_RATE), data);
+            let mut packet = Packet::new(0, TimeBase::from_rate(self.sample_rate), data);
             packet.pts = Some(self.position);
             packet.dts = packet.pts;
             packet.duration = Some(self.frame_size as i64);
@@ -425,19 +488,20 @@ impl oxideav_core::Encoder for CeltEncoder {
 /// into the registry by [`register`]).
 pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Encoder>> {
     let enc_opts: CeltEncoderOptions = parse_options(&params.options)?;
-    let (lm, channels, frame_size) = stream_config(params, enc_opts.frame_size)?;
+    let cfg = stream_config(params, enc_opts.frame_size)?;
     let start = start_band(enc_opts.start_band)?;
+    let (channels, frame_size, sample_rate) = (cfg.channels, cfg.frame_size, cfg.sample_rate);
     let bit_rate = params.bit_rate.unwrap_or(DEFAULT_BIT_RATE);
     let frame_bytes =
-        ((bit_rate as u128 * frame_size as u128) / (u128::from(SAMPLE_RATE) * 8)) as usize;
+        ((bit_rate as u128 * frame_size as u128) / (u128::from(sample_rate) * 8)) as usize;
     let frame_bytes = frame_bytes.clamp(2, 1275);
 
     let mut output_params = CodecParameters::audio(CodecId::new(CODEC_ID));
-    output_params.sample_rate = Some(SAMPLE_RATE);
+    output_params.sample_rate = Some(sample_rate);
     output_params.channels = Some(channels as u16);
     output_params.sample_format = Some(SampleFormat::F32);
     output_params.bit_rate =
-        Some(frame_bytes as u64 * 8 * u64::from(SAMPLE_RATE) / frame_size as u64);
+        Some(frame_bytes as u64 * 8 * u64::from(sample_rate) / frame_size as u64);
     output_params
         .options
         .insert("frame_size", frame_size.to_string());
@@ -449,8 +513,9 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
 
     Ok(Box::new(CeltEncoder {
         id: CodecId::new(CODEC_ID),
-        inner: CeltRefEncoder::new_with_start(lm, channels, start).map_err(map_err)?,
+        inner: build_ref_encoder(&cfg, start)?,
         output_params,
+        sample_rate,
         channels,
         frame_size,
         frame_bytes,
@@ -475,7 +540,7 @@ pub fn register(ctx: &mut RuntimeContext) {
             .capabilities(
                 CodecCapabilities::audio("celt_sw")
                     .with_lossy(true)
-                    .with_max_sample_rate(SAMPLE_RATE)
+                    .with_max_sample_rate(96_000)
                     .with_max_channels(2),
             )
             .decoder(make_decoder)
@@ -757,7 +822,9 @@ mod tests {
     /// The direct factories reject invalid parameter sets.
     #[test]
     fn factories_validate_parameters() {
-        let mut p = params(1, 960, None);
+        // 44.1 kHz with a 210-sample frame: an LM 0 frame of 4.8 ms
+        // busts the 3.3 ms short-block ceiling (no legal mode).
+        let mut p = params(1, 210, None);
         p.sample_rate = Some(44_100);
         assert!(make_decoder(&p).is_err());
         assert!(make_encoder(&p).is_err());
@@ -765,13 +832,76 @@ mod tests {
         let p = params(3, 960, None);
         assert!(make_decoder(&p).is_err());
 
-        let p = params(1, 300, None);
+        // Odd frame sizes have no mode at any rate.
+        let p = params(1, 301, None);
+        assert!(make_decoder(&p).is_err());
+        assert!(make_encoder(&p).is_err());
+
+        // start_band needs the standard 48 kHz mode.
+        let mut p = params(1, 880, None);
+        p.sample_rate = Some(44_100);
+        p.options.insert("start_band", "17");
         assert!(make_decoder(&p).is_err());
         assert!(make_encoder(&p).is_err());
 
         let mut p = params(1, 960, None);
         p.options.insert("bogus", "1");
         assert!(make_decoder(&p).is_err());
+    }
+
+    /// A non-48 kHz stream configuration derives its custom-mode
+    /// geometry and round-trips through the registry wrappers.
+    #[test]
+    fn registry_custom_rate_round_trip() {
+        let (fs, frame_size) = (44_100u32, 880u32);
+        let mut p = params(1, frame_size, None);
+        p.sample_rate = Some(fs);
+        p.bit_rate = Some(128_000);
+        let mut enc = make_encoder(&p).expect("encoder");
+        assert_eq!(enc.output_params().sample_rate, Some(fs));
+        let mut dec = make_decoder(&p).expect("decoder");
+
+        let frames = 6usize;
+        let n = frame_size as usize * frames;
+        let pcm: Vec<f32> = (0..n)
+            .map(|t| 0.3 * (2.0 * std::f32::consts::PI * 500.0 * t as f32 / fs as f32).sin())
+            .collect();
+        let mut bytes = Vec::with_capacity(n * 4);
+        for v in &pcm {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: n as u32,
+            pts: Some(0),
+            data: vec![bytes],
+        }))
+        .expect("send");
+        enc.flush().expect("flush");
+        let mut out = Vec::new();
+        while let Ok(packet) = enc.receive_packet() {
+            assert_eq!(packet.duration, Some(frame_size as i64));
+            dec.send_packet(&packet).expect("decode");
+            while let Ok(Frame::Audio(a)) = dec.receive_frame() {
+                out.extend(
+                    a.data[0]
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                );
+            }
+        }
+        assert_eq!(out.len(), n);
+        // Delay-compensated fidelity over the adapted tail.
+        let delay = 108usize; // the (44100, 880) mode's overlap
+        let skip = 2 * frame_size as usize;
+        let (mut ee, mut err) = (0f64, 0f64);
+        for i in 0..(n - delay - skip) {
+            let e = pcm[skip + i] as f64;
+            ee += e * e;
+            let d = e - out[skip + delay + i] as f64;
+            err += d * d;
+        }
+        let snr = 10.0 * (ee / err.max(1e-30)).log10();
+        assert!(snr > 15.0, "custom-rate registry loop SNR {snr:.2} dB");
     }
 
     /// Decoder reset wipes cross-frame state: a stream decoded after
