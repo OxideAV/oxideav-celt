@@ -23,15 +23,19 @@ law) now reads geometry from the mode.
 directions end to end; the registry factories accept
 `sample_rate` + any legal `frame_size`. **Measured (runtime-gated
 black-box A/B against oracle harnesses over the listing's
-custom-mode API, eight configurations 8 k–96 k × mono/stereo at
+custom-mode API, nine configurations 8 k–96 k × mono/stereo at
 fixed rates):** our decode of oracle streams 74.0–120.6 dB float SNR
 against the oracle's own decode, oracle decode of our streams
 80.3–136.5 dB against ours (the decoder pairs' numerical floors —
 symbol-exact interop in both directions), decoded quality within
-±2 dB of the oracle encoder at every point (ahead at nine of
-sixteen), and 44.1 kHz VBR at a 64 kb/s target with **identical
-2-byte silence positions** and stream totals within 0.1%
-(8319/8311 B). The in-repo arm (`tests/custom_modes.rs`) holds
+±1.5 dB of the oracle encoder at every point (ahead at ten of
+eighteen, exact parity at the max_lm=1 point), and 44.1 kHz VBR at a
+64 kb/s target with **identical 2-byte silence positions** in both
+modes — unconstrained totals within 0.1% (8316/8311 B), constrained
+totals **byte-equal** (6941/6941 B). The A/B also exposed and fixed
+two §5.3.1 pitch-search defects (high-order-multiple argmax at short
+windows; amplitude-blind comb gain on decays), re-measured green
+against the full 48 kHz oracle battery. The in-repo arm (`tests/custom_modes.rs`) holds
 self round-trips at nine configurations (15.1–50.3 dB
 delay-compensated SNR at ~128–192 kb/s equivalents), the `max_lm`
 ladder, VBR silence collapse, determinism, and decode robustness.

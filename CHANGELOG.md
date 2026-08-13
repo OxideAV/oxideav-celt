@@ -4,6 +4,19 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+* **Round-442 — §5.3.1 pitch search**: the sub-period demotion now
+  walks every legal divisor (2..=16, was 2..=4) so a raw correlation
+  argmax many octaves up demotes to the fundamental, and the reported
+  correlation scales by the least-squares comb-coefficient bound
+  `min(1, sqrt(E_frame / E_lagged))` so a frame much quieter than its
+  tapped history collapses the comb gain (a tone-to-silence edge kept
+  a strong comb whose decoder fade-out replayed the louder past —
+  measured as −7.4 dB aggregate vs the oracle at the (32 kHz, 160)
+  max_lm=1 point, now exact parity at 34.6/34.6 dB). In-crate encoder
+  freedom; the 48 kHz oracle battery re-measures green.
+
 ### Added
 
 * **Round-442 — custom modes (non-48 kHz operating points), the
