@@ -19,6 +19,19 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-451 — reduced-rate oracle A/B**
+  (`tests/blackbox_downsample_oracle.rs`, runtime-gated on
+  `CELT_DS_ENC`/`CELT_DS_DEC` harnesses over the reference
+  listing's standard-mode API at reduced PCM rates): decode
+  lockstep at **108.4–108.6 dB** float SNR at every output rate
+  (24/16/12/8 kHz, 20 ms mono + 10 ms stereo — the decoder pair's
+  numerical floor); Hybrid-layer (start = 17) downsampled decode
+  113.9 dB at 24 kHz and **bit-exact all-zero agreement** at
+  16/12/8 kHz (the coded band sits above the output Nyquist on
+  both sides); encoder-side parity **within 0.1 dB of the listing
+  at every input rate** (18.2/13.8/10.9/7.0 dB vs the oracle's
+  18.3/13.8/10.9/7.0 dB at 24/16/12/8 kHz, 64 kb/s CBR) with
+  cross-decode lockstep at 133.1–133.5 dB (symbol-exact interop).
 * **Round-451 — registry `resample` option**: both factories accept
   `resample=true` to run the standard 48 kHz mode with reduced-rate
   PCM I/O — `sample_rate` (8/12/16/24/48 kHz) becomes the PCM rate
