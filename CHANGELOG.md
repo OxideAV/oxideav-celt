@@ -19,6 +19,15 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-451 — registry `resample` option**: both factories accept
+  `resample=true` to run the standard 48 kHz mode with reduced-rate
+  PCM I/O — `sample_rate` (8/12/16/24/48 kHz) becomes the PCM rate
+  and `frame_size` counts samples at that rate, while the wire stays
+  48 kHz-mode CELT frames (wire-compatible with a plain 48 kHz
+  decode of the same packets). Composes with `start_band`, `vbr`,
+  and `vbr_constrained`; without the option a non-48 kHz
+  `sample_rate` keeps deriving a custom mode. Registry round-trip +
+  validation tests ride along.
 * **Round-451 — encoder-side reduced input rates**: the standard
   48 kHz mode now encodes directly from 24/16/12/8 kHz PCM
   (`CeltRefEncoder::new_upsampled` /

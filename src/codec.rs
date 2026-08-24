@@ -55,6 +55,13 @@ pub struct CeltCodecOptions {
     /// CELT layer (the stream-level parameter both sides must agree
     /// on, like `frame_size`).
     pub start_band: u32,
+    /// Reduced-rate PCM I/O on the **standard 48 kHz mode** (the
+    /// RFC 6716 decoder-side downsampling / encoder-side
+    /// upsampling): `sample_rate` (8/12/16/24/48 kHz) is the PCM
+    /// rate and `frame_size` counts samples at that rate, while the
+    /// wire stays 48 kHz-mode CELT frames. Without it a non-48 kHz
+    /// `sample_rate` derives a custom mode instead.
+    pub resample: bool,
 }
 
 impl Default for CeltCodecOptions {
@@ -62,6 +69,7 @@ impl Default for CeltCodecOptions {
         Self {
             frame_size: 960,
             start_band: 0,
+            resample: false,
         }
     }
 }
@@ -81,12 +89,21 @@ impl CodecOptionsStruct for CeltCodecOptions {
             default: OptionValue::U32(0),
             help: "first coded band (0..21): 0 = pure CELT, 17 = the Hybrid-mode CELT layer",
         },
+        OptionField {
+            name: "resample",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "reduced-rate PCM I/O on the standard 48 kHz mode (RFC 6716 \
+                   downsampled output / upsampled input); sample_rate is the PCM \
+                   rate (8/12/16/24/48 kHz), frame_size counts samples at it",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
         match key {
             "frame_size" => self.frame_size = value.as_u32()?,
             "start_band" => self.start_band = value.as_u32()?,
+            "resample" => self.resample = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -112,6 +129,9 @@ pub struct CeltEncoderOptions {
     /// First coded band (0..21): 0 is pure CELT, 17 the Hybrid-mode
     /// CELT layer.
     pub start_band: u32,
+    /// Reduced-rate PCM input on the standard 48 kHz mode (see
+    /// [`CeltCodecOptions::resample`]).
+    pub resample: bool,
 }
 
 impl Default for CeltEncoderOptions {
@@ -121,6 +141,7 @@ impl Default for CeltEncoderOptions {
             vbr: false,
             vbr_constrained: false,
             start_band: 0,
+            resample: false,
         }
     }
 }
@@ -154,6 +175,14 @@ impl CodecOptionsStruct for CeltEncoderOptions {
             default: OptionValue::U32(0),
             help: "first coded band (0..21): 0 = pure CELT, 17 = the Hybrid-mode CELT layer",
         },
+        OptionField {
+            name: "resample",
+            kind: OptionKind::Bool,
+            default: OptionValue::Bool(false),
+            help: "reduced-rate PCM input on the standard 48 kHz mode (RFC 6716 \
+                   upsampled input); sample_rate is the PCM rate (8/12/16/24/48 \
+                   kHz), frame_size counts samples at it",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
@@ -162,6 +191,7 @@ impl CodecOptionsStruct for CeltEncoderOptions {
             "vbr" => self.vbr = value.as_bool()?,
             "vbr_constrained" => self.vbr_constrained = value.as_bool()?,
             "start_band" => self.start_band = value.as_u32()?,
+            "resample" => self.resample = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -177,6 +207,9 @@ struct StreamConfig {
     channels: usize,
     frame_size: usize,
     sample_rate: u32,
+    /// `48000 / sample_rate` when the standard mode runs with
+    /// reduced-rate PCM I/O (the `resample` option); 1 otherwise.
+    resample_factor: usize,
 }
 
 /// Shared parameter validation. `frame_size` comes from the caller's
@@ -184,13 +217,45 @@ struct StreamConfig {
 /// differ). A 48 kHz stream at the four standard frame sizes runs the
 /// standard mode; any other legal `(sample_rate, frame_size)` pair
 /// derives its [`CeltCustomMode`] geometry.
-fn stream_config(params: &CodecParameters, frame_size: u32) -> CoreResult<StreamConfig> {
+fn stream_config(
+    params: &CodecParameters,
+    frame_size: u32,
+    resample: bool,
+) -> CoreResult<StreamConfig> {
     let sample_rate = params.sample_rate.unwrap_or(SAMPLE_RATE);
     let channels = params.channels.unwrap_or(1);
     if !(1..=2).contains(&channels) {
         return Err(CoreError::unsupported(format!(
             "celt: 1 or 2 channels supported (got {channels})"
         )));
+    }
+    if resample && sample_rate != SAMPLE_RATE {
+        let factor = crate::ref_decode::resampling_factor(sample_rate).ok_or_else(|| {
+            CoreError::invalid(format!(
+                "celt: resample supports 8/12/16/24/48 kHz PCM (got {sample_rate} Hz)"
+            ))
+        })?;
+        let frame48 = frame_size as usize * factor;
+        let lm = match frame48 {
+            120 => 0u32,
+            240 => 1,
+            480 => 2,
+            960 => 3,
+            _ => {
+                return Err(CoreError::invalid(format!(
+                    "celt: resample frame_size must span 2.5/5/10/20 ms at \
+                     {sample_rate} Hz (got {frame_size} samples)"
+                )))
+            }
+        };
+        return Ok(StreamConfig {
+            mode: None,
+            lm,
+            channels: channels as usize,
+            frame_size: frame_size as usize,
+            sample_rate,
+            resample_factor: factor,
+        });
     }
     if sample_rate == SAMPLE_RATE && matches!(frame_size, 120 | 240 | 480 | 960) {
         let lm = match frame_size {
@@ -205,6 +270,7 @@ fn stream_config(params: &CodecParameters, frame_size: u32) -> CoreResult<Stream
             channels: channels as usize,
             frame_size: frame_size as usize,
             sample_rate,
+            resample_factor: 1,
         });
     }
     let mode = CeltCustomMode::new(sample_rate, frame_size as usize).map_err(|_| {
@@ -219,6 +285,7 @@ fn stream_config(params: &CodecParameters, frame_size: u32) -> CoreResult<Stream
         channels: channels as usize,
         frame_size: frame_size as usize,
         sample_rate,
+        resample_factor: 1,
     })
 }
 
@@ -232,6 +299,10 @@ fn build_ref_decoder(cfg: &StreamConfig, start: usize) -> CoreResult<CeltRefDeco
                 ));
             }
             CeltRefDecoder::new_custom(m, cfg.lm, cfg.channels).map_err(map_err)
+        }
+        None if cfg.resample_factor != 1 => {
+            CeltRefDecoder::new_with_start_downsampled(cfg.lm, cfg.channels, start, cfg.sample_rate)
+                .map_err(map_err)
         }
         None => CeltRefDecoder::new_with_start(cfg.lm, cfg.channels, start).map_err(map_err),
     }
@@ -247,6 +318,10 @@ fn build_ref_encoder(cfg: &StreamConfig, start: usize) -> CoreResult<CeltRefEnco
                 ));
             }
             CeltRefEncoder::new_custom(m, cfg.lm, cfg.channels).map_err(map_err)
+        }
+        None if cfg.resample_factor != 1 => {
+            CeltRefEncoder::new_with_start_upsampled(cfg.lm, cfg.channels, start, cfg.sample_rate)
+                .map_err(map_err)
         }
         None => CeltRefEncoder::new_with_start(cfg.lm, cfg.channels, start).map_err(map_err),
     }
@@ -345,7 +420,7 @@ impl oxideav_core::Decoder for CeltDecoder {
 /// into the registry by [`register`]).
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Decoder>> {
     let opts: CeltCodecOptions = parse_options(&params.options)?;
-    let cfg = stream_config(params, opts.frame_size)?;
+    let cfg = stream_config(params, opts.frame_size, opts.resample)?;
     let start = start_band(opts.start_band)?;
     let channels = cfg.channels;
     Ok(Box::new(CeltDecoder {
@@ -488,7 +563,7 @@ impl oxideav_core::Encoder for CeltEncoder {
 /// into the registry by [`register`]).
 pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Encoder>> {
     let enc_opts: CeltEncoderOptions = parse_options(&params.options)?;
-    let cfg = stream_config(params, enc_opts.frame_size)?;
+    let cfg = stream_config(params, enc_opts.frame_size, enc_opts.resample)?;
     let start = start_band(enc_opts.start_band)?;
     let (channels, frame_size, sample_rate) = (cfg.channels, cfg.frame_size, cfg.sample_rate);
     let bit_rate = params.bit_rate.unwrap_or(DEFAULT_BIT_RATE);
@@ -509,6 +584,9 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
         output_params
             .options
             .insert("start_band", start.to_string());
+    }
+    if cfg.resample_factor != 1 {
+        output_params.options.insert("resample", "true".to_string());
     }
 
     Ok(Box::new(CeltEncoder {
@@ -952,5 +1030,98 @@ mod tests {
         let pk = enc.receive_packet().expect("padded final packet");
         assert!(!pk.data.is_empty());
         assert!(matches!(enc.receive_packet(), Err(CoreError::Eof)));
+    }
+    /// The `resample` option: the standard 48 kHz mode with
+    /// reduced-rate PCM I/O — a 16 kHz round trip through the
+    /// registry (320-sample frames = 20 ms), wire-compatible with a
+    /// 48 kHz decode of the same packets.
+    #[test]
+    fn registry_resample_option() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut p = params(1, 320, Some(64_000));
+        p.sample_rate = Some(16_000);
+        p.options.insert("resample", "true");
+        let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+
+        let frames_n = 12usize;
+        for f in 0..frames_n {
+            // 440 Hz at the 16 kHz input rate.
+            let mut bytes = Vec::with_capacity(320 * 4);
+            for t in 0..320usize {
+                let v = 0.3
+                    * (2.0 * std::f32::consts::PI * 440.0 * (f * 320 + t) as f32 / 16_000.0).sin();
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+                samples: 320,
+                pts: Some((f * 320) as i64),
+                data: vec![bytes],
+            }))
+            .expect("send");
+        }
+        enc.flush().expect("flush");
+        let mut packets = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(pk) => packets.push(pk),
+                Err(CoreError::Eof) => break,
+                Err(e) => panic!("unexpected encoder error: {e:?}"),
+            }
+        }
+        assert_eq!(packets.len(), frames_n);
+        // 64 kb/s at 20 ms = 160-byte frames.
+        assert!(packets.iter().all(|pk| pk.data.len() == 160));
+
+        // Decode at 16 kHz output through the registry.
+        let mut dp = params(1, 320, None);
+        dp.sample_rate = Some(16_000);
+        dp.options.insert("resample", "true");
+        let mut dec = ctx.codecs.first_decoder(&dp).expect("decoder");
+        for pk in &packets {
+            dec.send_packet(pk).expect("decode");
+            let Frame::Audio(a) = dec.receive_frame().expect("frame") else {
+                panic!("audio")
+            };
+            assert_eq!(a.samples, 320);
+        }
+
+        // The same packets decode on a plain 48 kHz decoder
+        // (rate-agnostic wire).
+        let mut d48 = ctx
+            .codecs
+            .first_decoder(&params(1, 960, None))
+            .expect("decoder");
+        for pk in &packets {
+            d48.send_packet(pk).expect("decode 48k");
+            let Frame::Audio(a) = d48.receive_frame().expect("frame") else {
+                panic!("audio")
+            };
+            assert_eq!(a.samples, 960);
+        }
+    }
+
+    /// `resample` parameter validation: unsupported PCM rates and
+    /// frame sizes that do not span a standard frame are rejected.
+    #[test]
+    fn registry_resample_validation() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        // 44.1 kHz has no standard-mode factor.
+        let mut p = params(1, 441, None);
+        p.sample_rate = Some(44_100);
+        p.options.insert("resample", "true");
+        assert!(ctx.codecs.first_decoder(&p).is_err());
+        // 16 kHz with a frame that is not 2.5/5/10/20 ms.
+        let mut p = params(1, 300, None);
+        p.sample_rate = Some(16_000);
+        p.options.insert("resample", "true");
+        assert!(ctx.codecs.first_decoder(&p).is_err());
+        // 8 kHz / 10 ms is legal on both sides.
+        let mut p = params(2, 80, None);
+        p.sample_rate = Some(8_000);
+        p.options.insert("resample", "true");
+        assert!(ctx.codecs.first_decoder(&p).is_ok());
+        assert!(ctx.codecs.first_encoder(&p).is_ok());
     }
 }
