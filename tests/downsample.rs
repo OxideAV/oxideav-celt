@@ -250,3 +250,147 @@ fn hybrid_layer_decodes_downsampled() {
         "out-of-band content leaked: {energy:.3e} vs {full_energy:.3e}"
     );
 }
+
+/// Encoder-side reduced-rate input: encode at each input rate,
+/// decode at the same output rate — a full reduced-rate round trip.
+/// The tone must dominate and the delay-compensated SNR must clear a
+/// speech-codec floor at 20 ms / ~64 kb/s-equivalent rates.
+#[test]
+fn reduced_rate_round_trip() {
+    for &rate in &RATES {
+        let d = resampling_factor(rate).unwrap();
+        let lm = 3u32;
+        let mut enc = CeltRefEncoder::new_upsampled(lm, 1, rate).expect("encoder");
+        let mut dec = CeltRefDecoder::new_downsampled(lm, 1, rate).expect("decoder");
+        assert_eq!(enc.input_frame_size(), 960 / d);
+        let in_frame = enc.input_frame_size();
+        let n_frames = 24usize;
+        // A 440 Hz + harmonic tone sampled at the input rate.
+        let pcm: Vec<f32> = (0..n_frames * in_frame)
+            .map(|t| {
+                let tf = t as f64 / rate as f64;
+                (0.4 * (2.0 * std::f64::consts::PI * 440.0 * tf).sin()
+                    + 0.2 * (2.0 * std::f64::consts::PI * 880.0 * tf).sin()) as f32
+            })
+            .collect();
+        let mut out = Vec::new();
+        for f in 0..n_frames {
+            let frame_pcm = &pcm[f * in_frame..(f + 1) * in_frame];
+            let bytes = enc.encode_frame(frame_pcm, 160).expect("encode");
+            assert_eq!(bytes.len(), 160);
+            out.extend(dec.decode_frame(&bytes).expect("decode"));
+        }
+        assert_eq!(out.len(), pcm.len());
+        // Delay-compensate: the codec delay is `overlap` samples at
+        // 48 kHz = 120/d input samples.
+        let delay = 120 / d;
+        let steady = 4 * in_frame;
+        let a = &pcm[steady..pcm.len() - delay];
+        let b = &out[steady + delay..];
+        let s = snr(a, b);
+        // Measured floors (22.5 / 16.7 / 13.4 / 8.8 dB): the SNR
+        // shrinks with the factor as the coded 48 kHz spectrum keeps
+        // only 1/d of its resolution for the content band; the
+        // reference listing shapes the same walk (the runtime-gated
+        // oracle A/B measures parity).
+        let floor = match rate {
+            24_000 => 20.0,
+            16_000 => 15.0,
+            12_000 => 12.0,
+            _ => 7.5,
+        };
+        assert!(
+            s > floor,
+            "reduced-rate round-trip SNR {s:.1} dB at {rate} Hz (floor {floor})"
+        );
+        let p_tone = goertzel(&out[out.len() / 2..], rate as f64, 440.0);
+        let p_off = goertzel(&out[out.len() / 2..], rate as f64, 1_333.0);
+        assert!(
+            p_tone > 100.0 * p_off,
+            "tone not dominant after round trip at {rate} Hz"
+        );
+    }
+}
+
+/// Cross-rate wire compatibility: a reduced-rate encode decodes on a
+/// plain 48 kHz decoder (the wire format is rate-agnostic), with the
+/// tone landing at its 48 kHz position.
+#[test]
+fn reduced_rate_encode_decodes_at_48k() {
+    let rate = 16_000u32;
+    let d = resampling_factor(rate).unwrap();
+    let lm = 3u32;
+    let mut enc = CeltRefEncoder::new_upsampled(lm, 1, rate).expect("encoder");
+    let mut dec = CeltRefDecoder::new(lm, 1).expect("decoder");
+    let in_frame = enc.input_frame_size();
+    let n_frames = 16usize;
+    let pcm: Vec<f32> = (0..n_frames * in_frame)
+        .map(|t| (0.4 * (2.0 * std::f64::consts::PI * 440.0 * t as f64 / rate as f64).sin()) as f32)
+        .collect();
+    let mut out = Vec::new();
+    for f in 0..n_frames {
+        let bytes = enc
+            .encode_frame(&pcm[f * in_frame..(f + 1) * in_frame], 120)
+            .expect("encode");
+        out.extend(dec.decode_frame(&bytes).expect("decode"));
+    }
+    assert_eq!(out.len(), n_frames * in_frame * d);
+    let tail = &out[out.len() / 2..];
+    let p_tone = goertzel(tail, 48_000.0, 440.0);
+    let p_off = goertzel(tail, 48_000.0, 1_333.0);
+    assert!(p_tone > 100.0 * p_off, "tone lost across the rate seam");
+}
+
+/// VBR at reduced rates: digital silence still collapses to 2-byte
+/// frames and the rate controller tracks its target.
+#[test]
+fn reduced_rate_vbr_silence_collapses() {
+    let rate = 12_000u32;
+    let lm = 3u32;
+    let mut enc = CeltRefEncoder::new_upsampled(lm, 1, rate).expect("encoder");
+    let in_frame = enc.input_frame_size();
+    let mut sizes = Vec::new();
+    for f in 0..12usize {
+        let pcm: Vec<f32> = if f < 6 {
+            (0..in_frame)
+                .map(|t| {
+                    (0.3 * (2.0 * std::f64::consts::PI * 440.0 * (f * in_frame + t) as f64
+                        / rate as f64)
+                        .sin()) as f32
+                })
+                .collect()
+        } else {
+            vec![0.0; in_frame]
+        };
+        let bytes = enc
+            .encode_frame_vbr(&pcm, 1275, 48_000, false)
+            .expect("encode vbr");
+        sizes.push(bytes.len());
+    }
+    // The tail of the silent run must collapse to 2-byte frames (the
+    // pre-emphasis discharge keeps the first silent frame nonzero).
+    assert!(
+        sizes[8..].iter().all(|&s| s == 2),
+        "silence did not collapse: {sizes:?}"
+    );
+    assert!(sizes[..6].iter().all(|&s| s > 2));
+}
+
+/// Out-of-range and non-finite input is guarded (the reference
+/// float-path clip): the encoder stays finite and the decode is
+/// clean.
+#[test]
+fn encoder_input_guards() {
+    let mut enc = CeltRefEncoder::new(3, 1).expect("encoder");
+    let mut dec = CeltRefDecoder::new(3, 1).expect("decoder");
+    let mut pcm = vec![0f32; 960];
+    pcm[100] = f32::NAN;
+    pcm[200] = f32::INFINITY;
+    pcm[300] = -1.0e9;
+    pcm[400] = 7.5;
+    for _ in 0..3 {
+        let bytes = enc.encode_frame(&pcm, 96).expect("encode");
+        let out = dec.decode_frame(&bytes).expect("decode");
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+}

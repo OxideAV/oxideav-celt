@@ -430,6 +430,12 @@ pub struct CeltRefEncoder {
     /// First coded band (`0` for pure CELT; `17` for the Hybrid-mode
     /// CELT layer).
     start: usize,
+    /// Input interpolation factor (`upsample`): 1 for 48 kHz input;
+    /// 2/3/4/6 for 24/16/12/8 kHz PCM input to the standard mode.
+    /// The analysis runs at 48 kHz over the zero-stuffed input; the
+    /// MDCT spectrum is rescaled by the factor below the input
+    /// Nyquist and zeroed above it.
+    upsample: usize,
 }
 
 impl CeltRefEncoder {
@@ -447,7 +453,39 @@ impl CeltRefEncoder {
     /// only — the spectrum below the start band is not coded (the
     /// SILK layer's territory).
     pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
-        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start)
+        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start, 1)
+    }
+
+    /// Build a standard-mode encoder whose PCM input is at
+    /// `pcm_rate` (48000, 24000, 16000, 12000, or 8000 Hz) — the
+    /// RFC 6716 encoder-side reduced input rates. Each call still
+    /// codes one 48 kHz-mode CELT frame (`lm` selects 2.5/5/10/20
+    /// ms) from [`Self::input_frame_size`] samples per channel: the
+    /// input is zero-stuffed onto the 48 kHz grid, the spectrum
+    /// below the input Nyquist is rescaled by `48000 / pcm_rate`,
+    /// and everything above it is zeroed.
+    pub fn new_upsampled(lm: u32, channels: usize, pcm_rate: u32) -> Result<Self, Error> {
+        Self::new_with_start_upsampled(lm, channels, 0, pcm_rate)
+    }
+
+    /// [`Self::new_with_start`] with reduced-rate PCM input — the
+    /// Hybrid-layer (`start = 17`) counterpart of
+    /// [`Self::new_upsampled`].
+    pub fn new_with_start_upsampled(
+        lm: u32,
+        channels: usize,
+        start: usize,
+        pcm_rate: u32,
+    ) -> Result<Self, Error> {
+        let upsample =
+            crate::ref_decode::resampling_factor(pcm_rate).ok_or(Error::InvalidParameter)?;
+        Self::with_mode(
+            CeltCustomMode::standard().clone(),
+            lm,
+            channels,
+            start,
+            upsample,
+        )
     }
 
     /// Build an encoder for a **custom mode** (an arbitrary
@@ -455,7 +493,7 @@ impl CeltRefEncoder {
     /// frame-size shift `lm` (`0..=mode.max_lm`). Custom-mode frames
     /// always start at band 0.
     pub fn new_custom(mode: &CeltCustomMode, lm: u32, channels: usize) -> Result<Self, Error> {
-        Self::with_mode(mode.clone(), lm, channels, 0)
+        Self::with_mode(mode.clone(), lm, channels, 0, 1)
     }
 
     fn with_mode(
@@ -463,8 +501,13 @@ impl CeltRefEncoder {
         lm: u32,
         channels: usize,
         start: usize,
+        upsample: usize,
     ) -> Result<Self, Error> {
         if lm > mode.max_lm || !(1..=2).contains(&channels) || start >= mode.eff_ebands {
+            return Err(Error::InvalidParameter);
+        }
+        // The interpolation grid must land on whole input frames.
+        if upsample == 0 || (mode.short_mdct_size << lm) % upsample != 0 {
             return Err(Error::InvalidParameter);
         }
         let frame = mode.short_mdct_size << lm;
@@ -501,13 +544,22 @@ impl CeltRefEncoder {
             vbr_offset: 0,
             vbr_count: 0,
             start,
+            upsample,
             mode,
         })
     }
 
-    /// The per-channel frame size in samples.
+    /// The per-channel frame size in samples **at the mode rate**
+    /// (48 kHz for the standard mode).
     pub fn frame_size(&self) -> usize {
         self.mode.short_mdct_size << self.lm
+    }
+
+    /// The per-channel PCM samples consumed per frame — the frame
+    /// size divided by the input interpolation factor
+    /// (equal to [`Self::frame_size`] at the mode rate).
+    pub fn input_frame_size(&self) -> usize {
+        self.frame_size() / self.upsample
     }
 
     /// Forward MDCT of one channel's analysis block (`frame + overlap`
@@ -557,8 +609,9 @@ impl CeltRefEncoder {
     }
 
     /// Encode one frame of interleaved f32 PCM in `[-1, 1]` (the
-    /// reference float-API input scale; `frame_size() * channels`
-    /// samples) into exactly `frame_bytes` bytes. The decoded output
+    /// reference float-API input scale; `input_frame_size() *
+    /// channels` samples — `frame_size() * channels` at the mode
+    /// rate) into exactly `frame_bytes` bytes. The decoded output
     /// is the input delayed by `overlap` (120) samples.
     pub fn encode_frame(&mut self, pcm: &[f32], frame_bytes: usize) -> Result<Vec<u8>, Error> {
         self.encode_impl(pcm, frame_bytes, 0, false)
@@ -614,7 +667,8 @@ impl CeltRefEncoder {
         let e_bands = self.mode.e_bands.clone();
         let eb = |i: usize| e_bands[i] as usize;
         let n_coded = m * eb(end);
-        if pcm.len() != channels * frame || !(2..=1275).contains(&nb_bytes_in) {
+        let upsample = self.upsample;
+        if pcm.len() != channels * (frame / upsample) || !(2..=1275).contains(&nb_bytes_in) {
             return Err(Error::InvalidParameter);
         }
         let mut frame_bytes = nb_bytes_in;
@@ -652,7 +706,22 @@ impl CeltRefEncoder {
             let c2 = self.mode.preemph[2];
             let mut mem = self.preemph_mem[c];
             for j in 0..frame {
-                let xs = c2 * (SIG_SCALE * pcm[j * channels + c]);
+                // Reduced-rate input lands zero-stuffed on the mode
+                // grid (the last slot of each `upsample` group holds
+                // the sample); non-finite input clears to 0 and the
+                // float input clips at twice full scale (the
+                // reference float-path guards).
+                let x = if (j + 1) % upsample == 0 {
+                    let s = pcm[(j / upsample) * channels + c];
+                    if s.is_finite() {
+                        s.clamp(-2.0, 2.0)
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                let xs = c2 * (SIG_SCALE * x);
                 let inp = xs + mem;
                 pre.push(inp);
                 mem = c1 * inp - c0 * xs;
@@ -818,7 +887,21 @@ impl CeltRefEncoder {
             let mut targets = [[0f32; MAX_BANDS]; 2];
             let mut freqs: Vec<Vec<f32>> = Vec::with_capacity(channels);
             for c in 0..channels {
-                let freq = self.forward_freq(&blocks[c], is_transient)?;
+                let mut freq = self.forward_freq(&blocks[c], is_transient)?;
+                // Reduced-rate input: rescale the spectrum below the
+                // input Nyquist by the interpolation factor (the
+                // zero-stuffing spreads each sample's energy across
+                // `upsample` spectral images) and zero everything
+                // above it.
+                if upsample != 1 {
+                    let bound = frame / upsample;
+                    for f in freq[..bound].iter_mut() {
+                        *f *= upsample as f32;
+                    }
+                    for f in freq[bound..].iter_mut() {
+                        *f = 0.0;
+                    }
+                }
                 let spec = if c == 0 { &mut x } else { &mut y };
                 for i in start..end {
                     let lo = m * eb(i);

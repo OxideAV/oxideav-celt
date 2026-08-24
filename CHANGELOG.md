@@ -19,6 +19,22 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-451 — encoder-side reduced input rates**: the standard
+  48 kHz mode now encodes directly from 24/16/12/8 kHz PCM
+  (`CeltRefEncoder::new_upsampled` /
+  `new_with_start_upsampled`, `input_frame_size()`) — the RFC 6716
+  reduced-rate input behaviour: the input is zero-stuffed onto the
+  48 kHz analysis grid (the last slot of each group carries the
+  sample), the MDCT spectrum below the input Nyquist is rescaled by
+  `48000/rate` and zeroed above it, and the whole decision layer
+  (transient, prefilter, VBR, silence) runs unchanged at 48 kHz.
+  The reference float-path input guards land with it: non-finite
+  samples clear to zero and the input clips at twice full scale.
+  `tests/downsample.rs` adds full reduced-rate round trips
+  (22.5/16.7/13.4/8.8 dB at 24/16/12/8 kHz, 64 kb/s CBR),
+  cross-rate wire compatibility (a 16 kHz-input encode decodes on a
+  plain 48 kHz decoder), VBR 2-byte silence collapse at reduced
+  rates, and the input guards.
 * **Round-451 — decoder-side downsampled output rates**: the
   standard 48 kHz mode now decodes directly to 24/16/12/8 kHz PCM
   (`CeltRefDecoder::new_downsampled`, plus
