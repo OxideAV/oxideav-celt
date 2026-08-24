@@ -256,6 +256,10 @@ pub struct CeltRefDecoder {
     /// of a Hybrid stream, whose bands below 8 kHz are carried by the
     /// SILK layer).
     start: usize,
+    /// One past the last coded band (`21` for fullband; `13`/`17`/
+    /// `19` for the narrowband/wideband/superwideband CELT-mode
+    /// bandwidths).
+    end: usize,
     /// §4.3.2.1 inter-frame energy prediction (`oldBandE`) — carries
     /// the fine/finalize-corrected values per the reference.
     // internal — exposed for tests/fuzz; not part of the stable API
@@ -332,7 +336,36 @@ impl CeltRefDecoder {
     /// `start..21` only; the spectrum below the start band
     /// synthesizes as zero (the SILK layer's territory).
     pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
-        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start, 1)
+        Self::with_mode(
+            CeltCustomMode::standard().clone(),
+            lm,
+            channels,
+            start,
+            0,
+            1,
+        )
+    }
+
+    /// Build a standard-mode decoder over coded bands
+    /// `start..end` — the RFC 6716 §3.1 CELT-mode bandwidths map to
+    /// `end` = 13 (NB, 4 kHz), 17 (WB, 8 kHz), 19 (SWB, 12 kHz),
+    /// 21 (FB); the spectrum above the end band synthesizes as
+    /// zero and its energy state stays pinned to the reference
+    /// reset values.
+    pub fn new_with_bands(
+        lm: u32,
+        channels: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Self, Error> {
+        Self::with_mode(
+            CeltCustomMode::standard().clone(),
+            lm,
+            channels,
+            start,
+            end,
+            1,
+        )
     }
 
     /// Build a standard-mode decoder whose PCM output is at
@@ -356,12 +389,26 @@ impl CeltRefDecoder {
         start: usize,
         pcm_rate: u32,
     ) -> Result<Self, Error> {
+        Self::new_with_config(lm, channels, start, 0, pcm_rate)
+    }
+
+    /// The general standard-mode constructor: coded bands
+    /// `start..end` (`end = 0` selects fullband) with PCM output at
+    /// `pcm_rate` (48000/24000/16000/12000/8000 Hz).
+    pub fn new_with_config(
+        lm: u32,
+        channels: usize,
+        start: usize,
+        end: usize,
+        pcm_rate: u32,
+    ) -> Result<Self, Error> {
         let downsample = resampling_factor(pcm_rate).ok_or(Error::InvalidParameter)?;
         Self::with_mode(
             CeltCustomMode::standard().clone(),
             lm,
             channels,
             start,
+            end,
             downsample,
         )
     }
@@ -371,7 +418,7 @@ impl CeltRefDecoder {
     /// frame-size shift `lm` (`0..=mode.max_lm`). Custom-mode frames
     /// always start at band 0.
     pub fn new_custom(mode: &CeltCustomMode, lm: u32, channels: usize) -> Result<Self, Error> {
-        Self::with_mode(mode.clone(), lm, channels, 0, 1)
+        Self::with_mode(mode.clone(), lm, channels, 0, 0, 1)
     }
 
     fn with_mode(
@@ -379,9 +426,17 @@ impl CeltRefDecoder {
         lm: u32,
         channels: usize,
         start: usize,
+        end: usize,
         downsample: usize,
     ) -> Result<Self, Error> {
-        if lm > mode.max_lm || !(1..=2).contains(&channels) || start >= mode.eff_ebands {
+        // `end = 0` selects the mode default (all effective bands).
+        let end = if end == 0 { mode.eff_ebands } else { end };
+        if lm > mode.max_lm
+            || !(1..=2).contains(&channels)
+            || start >= mode.eff_ebands
+            || end <= start
+            || end > mode.nb_ebands
+        {
             return Err(Error::InvalidParameter);
         }
         // The decimation grid must land on whole output frames.
@@ -419,6 +474,7 @@ impl CeltRefDecoder {
             last_pitch_index: 0,
             plc_lpc: vec![[0.0; crate::plc::LPC_ORDER]; channels],
             downsample,
+            end,
             mode,
         })
     }
@@ -443,7 +499,7 @@ impl CeltRefDecoder {
         let channels = self.channels;
         let frame = self.frame_size();
         let start = self.start;
-        let end = self.mode.eff_ebands;
+        let end = self.end.min(self.mode.eff_ebands);
         let overlap = self.mode.overlap;
         let n_coded = (1usize << lm) * self.mode.e_bands[end] as usize;
         if bytes.is_empty() || bytes.len() > 1275 {
@@ -876,7 +932,7 @@ impl CeltRefDecoder {
         let downsample = self.downsample;
         let m = 1usize << lm;
         let eb = |i: usize| self.mode.e_bands[i] as usize;
-        let end = self.mode.eff_ebands;
+        let end = self.end.min(self.mode.eff_ebands);
         let mut pcm = vec![0f32; channels * (frame / downsample)];
 
         if self.loss_count >= 5 || start != 0 {
@@ -911,9 +967,13 @@ impl CeltRefDecoder {
             let mut seed = self.rng;
             #[allow(clippy::needless_range_loop)] // band_e rows pair with decode_mem channels
             for c in 0..channels {
-                // Uniform pseudo-noise shapes, renormalized per band.
+                // Uniform pseudo-noise shapes, renormalized per
+                // band. The reference fills every effective band
+                // (bounding the spectrum afterwards), so the seed
+                // advances over start..effEBands even when the end
+                // band is lower.
                 let mut x = vec![0f32; frame];
-                for i in start..end {
+                for i in start..self.mode.eff_ebands {
                     let lo = m * eb(i);
                     let hi = m * eb(i + 1);
                     for v in x[lo..hi].iter_mut() {
@@ -929,8 +989,11 @@ impl CeltRefDecoder {
                         freq[j] = x[j] * g;
                     }
                 }
-                if downsample != 1 {
-                    let bound = (m * eb(end)).min(frame / downsample);
+                {
+                    let mut bound = m * eb(end);
+                    if downsample != 1 {
+                        bound = bound.min(frame / downsample);
+                    }
                     freq[bound..].fill(0.0);
                 }
                 // Long-block inverse MDCT into the history tail

@@ -55,6 +55,11 @@ pub struct CeltCodecOptions {
     /// CELT layer (the stream-level parameter both sides must agree
     /// on, like `frame_size`).
     pub start_band: u32,
+    /// One past the last coded band (`start_band + 1 ..= 21`;
+    /// default 21): the RFC 6716 §3.1 CELT-mode bandwidths are 13
+    /// (NB), 17 (WB), 19 (SWB), 21 (FB). A stream-level parameter
+    /// both sides must agree on.
+    pub end_band: u32,
     /// Reduced-rate PCM I/O on the **standard 48 kHz mode** (the
     /// RFC 6716 decoder-side downsampling / encoder-side
     /// upsampling): `sample_rate` (8/12/16/24/48 kHz) is the PCM
@@ -69,6 +74,7 @@ impl Default for CeltCodecOptions {
         Self {
             frame_size: 960,
             start_band: 0,
+            end_band: 21,
             resample: false,
         }
     }
@@ -90,6 +96,13 @@ impl CodecOptionsStruct for CeltCodecOptions {
             help: "first coded band (0..21): 0 = pure CELT, 17 = the Hybrid-mode CELT layer",
         },
         OptionField {
+            name: "end_band",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(21),
+            help: "one past the last coded band (start_band+1..=21): 13 = NB, \
+                   17 = WB, 19 = SWB, 21 = FB",
+        },
+        OptionField {
             name: "resample",
             kind: OptionKind::Bool,
             default: OptionValue::Bool(false),
@@ -103,6 +116,7 @@ impl CodecOptionsStruct for CeltCodecOptions {
         match key {
             "frame_size" => self.frame_size = value.as_u32()?,
             "start_band" => self.start_band = value.as_u32()?,
+            "end_band" => self.end_band = value.as_u32()?,
             "resample" => self.resample = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -129,6 +143,9 @@ pub struct CeltEncoderOptions {
     /// First coded band (0..21): 0 is pure CELT, 17 the Hybrid-mode
     /// CELT layer.
     pub start_band: u32,
+    /// One past the last coded band (see
+    /// [`CeltCodecOptions::end_band`]).
+    pub end_band: u32,
     /// Reduced-rate PCM input on the standard 48 kHz mode (see
     /// [`CeltCodecOptions::resample`]).
     pub resample: bool,
@@ -141,6 +158,7 @@ impl Default for CeltEncoderOptions {
             vbr: false,
             vbr_constrained: false,
             start_band: 0,
+            end_band: 21,
             resample: false,
         }
     }
@@ -176,6 +194,13 @@ impl CodecOptionsStruct for CeltEncoderOptions {
             help: "first coded band (0..21): 0 = pure CELT, 17 = the Hybrid-mode CELT layer",
         },
         OptionField {
+            name: "end_band",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(21),
+            help: "one past the last coded band (start_band+1..=21): 13 = NB, \
+                   17 = WB, 19 = SWB, 21 = FB",
+        },
+        OptionField {
             name: "resample",
             kind: OptionKind::Bool,
             default: OptionValue::Bool(false),
@@ -191,6 +216,7 @@ impl CodecOptionsStruct for CeltEncoderOptions {
             "vbr" => self.vbr = value.as_bool()?,
             "vbr_constrained" => self.vbr_constrained = value.as_bool()?,
             "start_band" => self.start_band = value.as_u32()?,
+            "end_band" => self.end_band = value.as_u32()?,
             "resample" => self.resample = value.as_bool()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
@@ -290,40 +316,34 @@ fn stream_config(
 }
 
 /// Build the inner decoder for a resolved configuration.
-fn build_ref_decoder(cfg: &StreamConfig, start: usize) -> CoreResult<CeltRefDecoder> {
+fn build_ref_decoder(cfg: &StreamConfig, start: usize, end: usize) -> CoreResult<CeltRefDecoder> {
     match &cfg.mode {
         Some(m) => {
-            if start != 0 {
+            if start != 0 || end != 21 {
                 return Err(CoreError::invalid(
-                    "celt: start_band requires the standard 48 kHz mode",
+                    "celt: start_band/end_band require the standard 48 kHz mode",
                 ));
             }
             CeltRefDecoder::new_custom(m, cfg.lm, cfg.channels).map_err(map_err)
         }
-        None if cfg.resample_factor != 1 => {
-            CeltRefDecoder::new_with_start_downsampled(cfg.lm, cfg.channels, start, cfg.sample_rate)
-                .map_err(map_err)
-        }
-        None => CeltRefDecoder::new_with_start(cfg.lm, cfg.channels, start).map_err(map_err),
+        None => CeltRefDecoder::new_with_config(cfg.lm, cfg.channels, start, end, cfg.sample_rate)
+            .map_err(map_err),
     }
 }
 
 /// Build the inner encoder for a resolved configuration.
-fn build_ref_encoder(cfg: &StreamConfig, start: usize) -> CoreResult<CeltRefEncoder> {
+fn build_ref_encoder(cfg: &StreamConfig, start: usize, end: usize) -> CoreResult<CeltRefEncoder> {
     match &cfg.mode {
         Some(m) => {
-            if start != 0 {
+            if start != 0 || end != 21 {
                 return Err(CoreError::invalid(
-                    "celt: start_band requires the standard 48 kHz mode",
+                    "celt: start_band/end_band require the standard 48 kHz mode",
                 ));
             }
             CeltRefEncoder::new_custom(m, cfg.lm, cfg.channels).map_err(map_err)
         }
-        None if cfg.resample_factor != 1 => {
-            CeltRefEncoder::new_with_start_upsampled(cfg.lm, cfg.channels, start, cfg.sample_rate)
-                .map_err(map_err)
-        }
-        None => CeltRefEncoder::new_with_start(cfg.lm, cfg.channels, start).map_err(map_err),
+        None => CeltRefEncoder::new_with_config(cfg.lm, cfg.channels, start, end, cfg.sample_rate)
+            .map_err(map_err),
     }
 }
 
@@ -341,6 +361,16 @@ fn start_band(value: u32) -> CoreResult<usize> {
     Ok(value as usize)
 }
 
+/// Validate the `end_band` option against the start band.
+fn end_band(value: u32, start: usize) -> CoreResult<usize> {
+    if value as usize <= start || value > 21 {
+        return Err(CoreError::invalid(format!(
+            "celt: end_band must be in start_band+1..=21 (got {value})"
+        )));
+    }
+    Ok(value as usize)
+}
+
 // ───────────────────────── decoder ─────────────────────────
 
 /// Packet-to-frame decoder over [`CeltRefDecoder`] (one raw CELT
@@ -351,6 +381,7 @@ pub struct CeltDecoder {
     cfg: StreamConfig,
     channels: usize,
     start: usize,
+    end: usize,
     pending: VecDeque<Frame>,
     /// Running sample position for synthesized pts (1 / sample-rate
     /// base), used when packets carry no pts of their own.
@@ -414,7 +445,7 @@ impl oxideav_core::Decoder for CeltDecoder {
     }
 
     fn reset(&mut self) -> CoreResult<()> {
-        self.inner = build_ref_decoder(&self.cfg, self.start)?;
+        self.inner = build_ref_decoder(&self.cfg, self.start, self.end)?;
         self.pending.clear();
         self.next_pts = 0;
         self.eof = false;
@@ -428,13 +459,15 @@ pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
     let opts: CeltCodecOptions = parse_options(&params.options)?;
     let cfg = stream_config(params, opts.frame_size, opts.resample)?;
     let start = start_band(opts.start_band)?;
+    let end = end_band(opts.end_band, start)?;
     let channels = cfg.channels;
     Ok(Box::new(CeltDecoder {
         id: CodecId::new(CODEC_ID),
-        inner: build_ref_decoder(&cfg, start)?,
+        inner: build_ref_decoder(&cfg, start, end)?,
         cfg,
         channels,
         start,
+        end,
         pending: VecDeque::new(),
         next_pts: 0,
         eof: false,
@@ -571,6 +604,7 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
     let enc_opts: CeltEncoderOptions = parse_options(&params.options)?;
     let cfg = stream_config(params, enc_opts.frame_size, enc_opts.resample)?;
     let start = start_band(enc_opts.start_band)?;
+    let end = end_band(enc_opts.end_band, start)?;
     let (channels, frame_size, sample_rate) = (cfg.channels, cfg.frame_size, cfg.sample_rate);
     let bit_rate = params.bit_rate.unwrap_or(DEFAULT_BIT_RATE);
     let frame_bytes =
@@ -591,13 +625,16 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
             .options
             .insert("start_band", start.to_string());
     }
+    if end != 21 {
+        output_params.options.insert("end_band", end.to_string());
+    }
     if cfg.resample_factor != 1 {
         output_params.options.insert("resample", "true".to_string());
     }
 
     Ok(Box::new(CeltEncoder {
         id: CodecId::new(CODEC_ID),
-        inner: build_ref_encoder(&cfg, start)?,
+        inner: build_ref_encoder(&cfg, start, end)?,
         output_params,
         sample_rate,
         channels,
@@ -1171,5 +1208,43 @@ mod tests {
             }
         }
         assert_eq!(n, 8);
+    }
+    /// The `end_band` option: an NB (end = 13) round trip through
+    /// the registry, plus validation.
+    #[test]
+    fn registry_end_band_option() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut p = params(1, 960, Some(48_000));
+        p.options.insert("end_band", "13");
+        let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+        for f in 0..8usize {
+            enc.send_frame(&tone_frame(960, 1, f * 960)).expect("send");
+        }
+        enc.flush().expect("flush");
+        let mut dp = params(1, 960, None);
+        dp.options.insert("end_band", "13");
+        let mut dec = ctx.codecs.first_decoder(&dp).expect("decoder");
+        loop {
+            match enc.receive_packet() {
+                Ok(pk) => {
+                    dec.send_packet(&pk).expect("decode");
+                    let Frame::Audio(a) = dec.receive_frame().expect("frame") else {
+                        panic!("audio")
+                    };
+                    assert_eq!(a.samples, 960);
+                }
+                Err(CoreError::Eof) => break,
+                Err(e) => panic!("unexpected encoder error: {e:?}"),
+            }
+        }
+        // Validation: end must exceed start and stay within 21.
+        let mut bad = params(1, 960, None);
+        bad.options.insert("end_band", "22");
+        assert!(ctx.codecs.first_decoder(&bad).is_err());
+        let mut bad = params(1, 960, None);
+        bad.options.insert("start_band", "17");
+        bad.options.insert("end_band", "17");
+        assert!(ctx.codecs.first_decoder(&bad).is_err());
     }
 }

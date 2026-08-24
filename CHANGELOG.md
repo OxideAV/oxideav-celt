@@ -19,6 +19,21 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-451 — end-band configurations (the §3.1 CELT-mode
+  bandwidths)**: both drivers now take an end band
+  (`new_with_bands` / the general `new_with_config`; registry
+  option `end_band`) — coded bands `start..end` with `end` = 13
+  (NB), 17 (WB), 19 (SWB), 21 (FB), the spectrum above the end
+  band zero and its energy state pinned to the reference reset
+  values; composes with `start_band` and `resample`.
+  **Oracle-gated** (NB/WB mono + SWB stereo, 20 ms CBR): our
+  decode of listing streams at 107.3-108.6 dB float SNR, our
+  streams symbol-clean through the listing decoder (cross-decode
+  lockstep 133.5-133.9 dB), decoded quality +0.1 to +0.6 dB ahead
+  of the listing encoder at every point. In-repo arm
+  (`tests/end_band.rs`): round trips at all bandwidths x
+  mono/stereo, the NB spectral bound, state pinning, start+end
+  composition, validation.
 * **Round-451 — registry loss packets**: an empty `Packet` through
   the registry decoder is a loss marker — the decoder conceals it
   through `decode_lost` and emits a full frame, resuming live

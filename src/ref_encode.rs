@@ -430,6 +430,9 @@ pub struct CeltRefEncoder {
     /// First coded band (`0` for pure CELT; `17` for the Hybrid-mode
     /// CELT layer).
     start: usize,
+    /// One past the last coded band (`21` for fullband; `13`/`17`/
+    /// `19` for the NB/WB/SWB CELT-mode bandwidths).
+    end: usize,
     /// Input interpolation factor (`upsample`): 1 for 48 kHz input;
     /// 2/3/4/6 for 24/16/12/8 kHz PCM input to the standard mode.
     /// The analysis runs at 48 kHz over the zero-stuffed input; the
@@ -453,7 +456,34 @@ impl CeltRefEncoder {
     /// only — the spectrum below the start band is not coded (the
     /// SILK layer's territory).
     pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
-        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start, 1)
+        Self::with_mode(
+            CeltCustomMode::standard().clone(),
+            lm,
+            channels,
+            start,
+            0,
+            1,
+        )
+    }
+
+    /// Build a standard-mode encoder over coded bands
+    /// `start..end` — the RFC 6716 §3.1 CELT-mode bandwidths map to
+    /// `end` = 13 (NB, 4 kHz), 17 (WB, 8 kHz), 19 (SWB, 12 kHz),
+    /// 21 (FB). Spectrum above the end band is not coded.
+    pub fn new_with_bands(
+        lm: u32,
+        channels: usize,
+        start: usize,
+        end: usize,
+    ) -> Result<Self, Error> {
+        Self::with_mode(
+            CeltCustomMode::standard().clone(),
+            lm,
+            channels,
+            start,
+            end,
+            1,
+        )
     }
 
     /// Build a standard-mode encoder whose PCM input is at
@@ -477,6 +507,19 @@ impl CeltRefEncoder {
         start: usize,
         pcm_rate: u32,
     ) -> Result<Self, Error> {
+        Self::new_with_config(lm, channels, start, 0, pcm_rate)
+    }
+
+    /// The general standard-mode constructor: coded bands
+    /// `start..end` (`end = 0` selects fullband) with PCM input at
+    /// `pcm_rate` (48000/24000/16000/12000/8000 Hz).
+    pub fn new_with_config(
+        lm: u32,
+        channels: usize,
+        start: usize,
+        end: usize,
+        pcm_rate: u32,
+    ) -> Result<Self, Error> {
         let upsample =
             crate::ref_decode::resampling_factor(pcm_rate).ok_or(Error::InvalidParameter)?;
         Self::with_mode(
@@ -484,6 +527,7 @@ impl CeltRefEncoder {
             lm,
             channels,
             start,
+            end,
             upsample,
         )
     }
@@ -493,7 +537,7 @@ impl CeltRefEncoder {
     /// frame-size shift `lm` (`0..=mode.max_lm`). Custom-mode frames
     /// always start at band 0.
     pub fn new_custom(mode: &CeltCustomMode, lm: u32, channels: usize) -> Result<Self, Error> {
-        Self::with_mode(mode.clone(), lm, channels, 0, 1)
+        Self::with_mode(mode.clone(), lm, channels, 0, 0, 1)
     }
 
     fn with_mode(
@@ -501,9 +545,17 @@ impl CeltRefEncoder {
         lm: u32,
         channels: usize,
         start: usize,
+        end: usize,
         upsample: usize,
     ) -> Result<Self, Error> {
-        if lm > mode.max_lm || !(1..=2).contains(&channels) || start >= mode.eff_ebands {
+        // `end = 0` selects the mode default (all effective bands).
+        let end = if end == 0 { mode.eff_ebands } else { end };
+        if lm > mode.max_lm
+            || !(1..=2).contains(&channels)
+            || start >= mode.eff_ebands
+            || end <= start
+            || end > mode.nb_ebands
+        {
             return Err(Error::InvalidParameter);
         }
         // The interpolation grid must land on whole input frames.
@@ -544,6 +596,7 @@ impl CeltRefEncoder {
             vbr_offset: 0,
             vbr_count: 0,
             start,
+            end,
             upsample,
             mode,
         })
@@ -661,7 +714,7 @@ impl CeltRefEncoder {
         let overlap = self.mode.overlap;
         let m = 1usize << lm;
         let start = self.start;
-        let end = self.mode.eff_ebands;
+        let end = self.end.min(self.mode.eff_ebands);
         let e_bands = self.mode.e_bands.clone();
         let eb = |i: usize| e_bands[i] as usize;
         let n_coded = m * eb(end);

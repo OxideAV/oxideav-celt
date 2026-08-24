@@ -5,9 +5,10 @@
 //!
 //! Runtime-gated on `CELT_DS_ENC` / `CELT_DS_DEC` pointing at the
 //! oracle harness binaries
-//! (`celt_ds_enc <ch> <frame48> <rate> <start> <cbr|vbr|cvbr> <arg>
-//! <in.f32> <out.frames>`, `celt_ds_dec <ch> <frame48> <rate>
-//! <start> <in.frames> <out.f32>`); passes with a note when unset.
+//! (`celt_ds_enc <ch> <frame48> <rate> <start> <end> <cbr|vbr|cvbr>
+//! <arg> <in.f32> <out.frames>`, `celt_ds_dec <ch> <frame48> <rate>
+//! <start> <end> <in.frames> <out.f32>`; `end` 0 = default); passes
+//! with a note when unset.
 
 use oxideav_celt::ref_decode::{resampling_factor, CeltRefDecoder};
 use oxideav_celt::ref_encode::CeltRefEncoder;
@@ -147,6 +148,7 @@ fn downsampled_decode_lockstep() {
                 &frame.to_string(),
                 "48000",
                 "0",
+                "0",
                 "cbr",
                 &bytes.to_string(),
                 in_f.to_str().unwrap(),
@@ -165,6 +167,7 @@ fn downsampled_decode_lockstep() {
                     &channels.to_string(),
                     &frame.to_string(),
                     &rate.to_string(),
+                    "0",
                     "0",
                     frames_f.to_str().unwrap(),
                     ora_f.to_str().unwrap(),
@@ -226,6 +229,7 @@ fn upsampled_encode_parity() {
                 &frame.to_string(),
                 &rate.to_string(),
                 "0",
+                "0",
                 "cbr",
                 "160",
                 in_f.to_str().unwrap(),
@@ -251,6 +255,7 @@ fn upsampled_encode_parity() {
                     "1",
                     &frame.to_string(),
                     &rate.to_string(),
+                    "0",
                     "0",
                     st.to_str().unwrap(),
                     out.to_str().unwrap(),
@@ -329,6 +334,7 @@ fn hybrid_downsampled_decode_lockstep() {
             &frame.to_string(),
             "48000",
             "17",
+            "0",
             "cbr",
             "80",
             in_f.to_str().unwrap(),
@@ -346,6 +352,7 @@ fn hybrid_downsampled_decode_lockstep() {
                 &frame.to_string(),
                 &rate.to_string(),
                 "17",
+                "0",
                 frames_f.to_str().unwrap(),
                 ora_f.to_str().unwrap(),
             ],
@@ -408,6 +415,7 @@ fn plc_decode_lockstep() {
                 &frame.to_string(),
                 "48000",
                 "0",
+                "0",
                 "cbr",
                 &bytes.to_string(),
                 in_f.to_str().unwrap(),
@@ -433,6 +441,7 @@ fn plc_decode_lockstep() {
                 &channels.to_string(),
                 &frame.to_string(),
                 &rate.to_string(),
+                "0",
                 "0",
                 lossy.to_str().unwrap(),
                 ora_f.to_str().unwrap(),
@@ -462,6 +471,128 @@ fn plc_decode_lockstep() {
         assert!(
             s > 60.0,
             "concealment diverged at lm={lm} ch={channels} rate={rate}: {s:.1} dB"
+        );
+    }
+}
+
+/// End-band (Opus CELT-mode bandwidth) A/B: the NB/WB/SWB
+/// configurations (end = 13/17/19) both directions — our decode of
+/// oracle streams at the decoder pair's noise floor, our streams
+/// symbol-clean through the oracle decoder, quality parity.
+#[test]
+fn end_band_bandwidths_ab() {
+    let Some((enc_bin, dec_bin)) = oracle_bins() else {
+        eprintln!("CELT_DS_ENC/CELT_DS_DEC not set; skipping downsample oracle A/B");
+        return;
+    };
+    let dir = std::env::temp_dir().join("celt-ds-oracle-ab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    let lm = 3u32;
+    let frame = 120usize << lm;
+    let n = 24 * frame;
+
+    for &(end, channels, bytes) in &[(13usize, 1usize, 80usize), (17, 1, 120), (19, 2, 200)] {
+        let pcm48 = test_signal_48k(n, channels);
+        let in_f = dir.join(format!("eb-in-{end}-{channels}.f32"));
+        write_f32(&in_f, &pcm48);
+
+        // Oracle encode at this end band.
+        let ora_st = dir.join(format!("eb-ora-{end}-{channels}.frames"));
+        run(
+            &enc_bin,
+            &[
+                &channels.to_string(),
+                &frame.to_string(),
+                "48000",
+                "0",
+                &end.to_string(),
+                "cbr",
+                &bytes.to_string(),
+                in_f.to_str().unwrap(),
+                ora_st.to_str().unwrap(),
+            ],
+        );
+        let ora_frames = frames_of(&std::fs::read(&ora_st).unwrap());
+
+        // Our decode of the oracle stream.
+        let mut dec = CeltRefDecoder::new_with_bands(lm, channels, 0, end).expect("decoder");
+        let mut ours_dec = Vec::new();
+        for f in &ora_frames {
+            ours_dec.extend(dec.decode_frame(f).expect("decode"));
+        }
+        let ora_dec_f = dir.join(format!("eb-oradec-{end}-{channels}.f32"));
+        run(
+            &dec_bin,
+            &[
+                &channels.to_string(),
+                &frame.to_string(),
+                "48000",
+                "0",
+                &end.to_string(),
+                ora_st.to_str().unwrap(),
+                ora_dec_f.to_str().unwrap(),
+            ],
+        );
+        let ora_dec = read_f32(&ora_dec_f);
+        let s_dec = snr(&ora_dec, &ours_dec);
+
+        // Our encode; oracle cross-decodes it.
+        let mut enc = CeltRefEncoder::new_with_bands(lm, channels, 0, end).expect("encoder");
+        let our_frames: Vec<Vec<u8>> = pcm48
+            .chunks_exact(frame * channels)
+            .map(|c| enc.encode_frame(c, bytes).expect("encode"))
+            .collect();
+        let our_st = dir.join(format!("eb-our-{end}-{channels}.frames"));
+        std::fs::write(&our_st, to_stream(&our_frames)).expect("write");
+        let our_dec_f = dir.join(format!("eb-ourdec-{end}-{channels}.f32"));
+        run(
+            &dec_bin,
+            &[
+                &channels.to_string(),
+                &frame.to_string(),
+                "48000",
+                "0",
+                &end.to_string(),
+                our_st.to_str().unwrap(),
+                our_dec_f.to_str().unwrap(),
+            ],
+        );
+        let our_cross = read_f32(&our_dec_f);
+        let mut dec2 = CeltRefDecoder::new_with_bands(lm, channels, 0, end).expect("decoder");
+        let mut our_own = Vec::new();
+        for f in &our_frames {
+            our_own.extend(dec2.decode_frame(f).expect("decode"));
+        }
+        let s_lock = snr(&our_own, &our_cross);
+
+        // Quality parity vs the input over the in-band content
+        // (delay-compensated, steady tail).
+        let steady = 4 * frame * channels;
+        let delay = 120 * channels;
+        let q = |decoded: &[f32]| -> f64 {
+            snr(
+                &pcm48[steady..pcm48.len() - delay],
+                &decoded[steady + delay..],
+            )
+        };
+        let q_ora = q(&ora_dec);
+        let q_our = q(&our_cross);
+        eprintln!(
+            "end-band {end} ch={channels}: decode lockstep {s_dec:.1} dB, \
+             encode cross-lockstep {s_lock:.1} dB, quality {q_our:.1} vs {q_ora:.1} dB"
+        );
+        assert!(
+            s_dec > 90.0,
+            "end-band decode diverged at end={end} ch={channels}: {s_dec:.1} dB"
+        );
+        assert!(
+            s_lock > 90.0,
+            "end-band stream not symbol-clean at end={end} ch={channels}: {s_lock:.1} dB"
+        );
+        assert!(
+            q_our > q_ora - 1.5,
+            "end-band quality behind at end={end} ch={channels}: {q_our:.1} vs {q_ora:.1}"
         );
     }
 }
