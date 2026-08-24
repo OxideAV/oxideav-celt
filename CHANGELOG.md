@@ -19,6 +19,29 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-451 — packet-loss concealment (`decode_lost`)**: the
+  reference concealment walk lands — pitch-locked LPC
+  extrapolation for the first five losses of a run (2:1
+  pitch-analysis downsampling with the damped 4th-order whitener,
+  the coarse/fine/interpolated 67-480 Hz pitch search, a 24th-order
+  Levinson fit on the windowed history, per-cycle decay matching,
+  the 0.8 fade on repeat losses, the energy explosion guard, and
+  the TDAC blend + carry pre-filter that folds the concealment into
+  the next frame), then comfort noise for longer runs and
+  Hybrid-layer streams (decayed band energies toward the long-term
+  `backgroundLogE` floor, seeded band-shape noise). The decoder
+  state now mirrors the reference layout (a per-channel
+  2048-sample synthesized history + overlap carry), and live decode
+  maintains the background floor and resets the loss counter.
+  In-repo arm (`tests/plc.rs`): tone-continuing single-loss
+  concealment at 3 geometries, decaying 12-loss runs, the Hybrid
+  noise arm, downsampled-rate concealment, determinism.
+  **Oracle-gated**: a lossy-stream A/B (singles, a double, and a
+  7-frame run) holds 82.3 / 69.0 / 82.4 dB float SNR (20 ms mono,
+  10 ms stereo, 20 ms mono at 16 kHz output) against the listing
+  decoder over the concealed stretches included — branch and pitch
+  decisions lockstep, residual at the recursive chain's float
+  accumulation floor.
 * **Round-451 — reduced-rate oracle A/B**
   (`tests/blackbox_downsample_oracle.rs`, runtime-gated on
   `CELT_DS_ENC`/`CELT_DS_DEC` harnesses over the reference

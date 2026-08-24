@@ -375,3 +375,93 @@ fn hybrid_downsampled_decode_lockstep() {
         );
     }
 }
+
+/// Concealment lockstep: the same stream with a loss pattern
+/// (single losses, a double, and a 7-frame run through the
+/// comfort-noise arm) decodes through both decoders — concealed
+/// frames included — at the decoder pair's float-noise floor. Also
+/// exercised at a reduced output rate.
+#[test]
+fn plc_decode_lockstep() {
+    let Some((enc_bin, dec_bin)) = oracle_bins() else {
+        eprintln!("CELT_DS_ENC/CELT_DS_DEC not set; skipping downsample oracle A/B");
+        return;
+    };
+    let dir = std::env::temp_dir().join("celt-ds-oracle-ab");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    for &(lm, channels, bytes, rate) in &[
+        (3u32, 1usize, 160usize, 48_000u32),
+        (2, 2, 180, 48_000),
+        (3, 1, 160, 16_000),
+    ] {
+        let frame = 120usize << lm;
+        let n = 40 * frame;
+        let pcm48 = test_signal_48k(n, channels);
+        let in_f = dir.join(format!("plc-in-{lm}-{channels}-{rate}.f32"));
+        write_f32(&in_f, &pcm48);
+        let enc_st = dir.join(format!("plc-st-{lm}-{channels}-{rate}.frames"));
+        run(
+            &enc_bin,
+            &[
+                &channels.to_string(),
+                &frame.to_string(),
+                "48000",
+                "0",
+                "cbr",
+                &bytes.to_string(),
+                in_f.to_str().unwrap(),
+                enc_st.to_str().unwrap(),
+            ],
+        );
+        let mut frames = frames_of(&std::fs::read(&enc_st).unwrap());
+        // Loss pattern: singles at 6 and 13, a double at 20/21, and
+        // a 7-frame run from 28 (deep into the noise arm).
+        for &i in &[6usize, 13, 20, 21] {
+            frames[i].clear();
+        }
+        for f in frames.iter_mut().skip(28).take(7) {
+            f.clear();
+        }
+        let lossy = dir.join(format!("plc-lossy-{lm}-{channels}-{rate}.frames"));
+        std::fs::write(&lossy, to_stream(&frames)).expect("write lossy");
+
+        let ora_f = dir.join(format!("plc-ora-{lm}-{channels}-{rate}.f32"));
+        run(
+            &dec_bin,
+            &[
+                &channels.to_string(),
+                &frame.to_string(),
+                &rate.to_string(),
+                "0",
+                lossy.to_str().unwrap(),
+                ora_f.to_str().unwrap(),
+            ],
+        );
+        let oracle = read_f32(&ora_f);
+
+        let mut dec = CeltRefDecoder::new_downsampled(lm, channels, rate).expect("decoder");
+        let mut ours = Vec::new();
+        for f in &frames {
+            if f.is_empty() {
+                ours.extend(dec.decode_lost().expect("conceal"));
+            } else {
+                ours.extend(dec.decode_frame(f).expect("decode"));
+            }
+        }
+        assert_eq!(ours.len(), oracle.len());
+        let s = snr(&oracle, &ours);
+        let max_diff = ours
+            .iter()
+            .zip(oracle.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!(
+            "plc lockstep lm={lm} ch={channels} rate={rate}: {s:.1} dB, max diff {max_diff:.3e}"
+        );
+        assert!(
+            s > 60.0,
+            "concealment diverged at lm={lm} ch={channels} rate={rate}: {s:.1} dB"
+        );
+    }
+}

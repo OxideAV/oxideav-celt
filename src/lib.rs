@@ -445,6 +445,7 @@ pub mod mdct;
 pub mod pcm_encode;
 #[doc(hidden)]
 pub mod pitch;
+mod plc;
 #[doc(hidden)]
 pub mod post_filter;
 #[doc(hidden)]
