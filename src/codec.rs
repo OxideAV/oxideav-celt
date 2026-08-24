@@ -377,7 +377,13 @@ impl oxideav_core::Decoder for CeltDecoder {
         if self.eof {
             return Err(CoreError::invalid("celt: send_packet after flush"));
         }
-        let pcm = self.inner.decode_frame(&packet.data).map_err(map_err)?;
+        // An empty packet marks a lost frame: conceal it (§4.3
+        // packet-loss concealment) instead of decoding.
+        let pcm = if packet.data.is_empty() {
+            self.inner.decode_lost().map_err(map_err)?
+        } else {
+            self.inner.decode_frame(&packet.data).map_err(map_err)?
+        };
         let samples = (pcm.len() / self.channels) as u32;
         let mut bytes = Vec::with_capacity(pcm.len() * 4);
         for v in &pcm {
@@ -1123,5 +1129,47 @@ mod tests {
         p.options.insert("resample", "true");
         assert!(ctx.codecs.first_decoder(&p).is_ok());
         assert!(ctx.codecs.first_encoder(&p).is_ok());
+    }
+    /// An empty packet is a lost frame: the registry decoder
+    /// conceals it (finite full-length PCM) and resumes on the next
+    /// real packet.
+    #[test]
+    fn registry_empty_packet_conceals() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut enc = ctx
+            .codecs
+            .first_encoder(&params(1, 480, Some(96_000)))
+            .expect("encoder");
+        for f in 0..8usize {
+            enc.send_frame(&tone_frame(480, 1, f * 480)).expect("send");
+        }
+        enc.flush().expect("flush");
+        let mut dec = ctx
+            .codecs
+            .first_decoder(&params(1, 480, None))
+            .expect("decoder");
+        let mut n = 0usize;
+        loop {
+            match enc.receive_packet() {
+                Ok(pk) => {
+                    n += 1;
+                    if n == 5 {
+                        // Drop this packet: send a loss marker.
+                        let lost = Packet::new(0, TimeBase::from_rate(48_000), Vec::new());
+                        dec.send_packet(&lost).expect("conceal");
+                    } else {
+                        dec.send_packet(&pk).expect("decode");
+                    }
+                    let Frame::Audio(a) = dec.receive_frame().expect("frame") else {
+                        panic!("audio")
+                    };
+                    assert_eq!(a.samples, 480);
+                }
+                Err(CoreError::Eof) => break,
+                Err(e) => panic!("unexpected encoder error: {e:?}"),
+            }
+        }
+        assert_eq!(n, 8);
     }
 }

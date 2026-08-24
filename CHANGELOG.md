@@ -19,6 +19,10 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-451 — registry loss packets**: an empty `Packet` through
+  the registry decoder is a loss marker — the decoder conceals it
+  through `decode_lost` and emits a full frame, resuming live
+  decode on the next real packet.
 * **Round-451 — packet-loss concealment (`decode_lost`)**: the
   reference concealment walk lands — pitch-locked LPC
   extrapolation for the first five losses of a run (2:1
