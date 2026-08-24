@@ -174,9 +174,7 @@ fn custom_mode_vbr_tracks_target_and_silence() {
     let frames = 40usize;
     let mut pcm = test_signal(fs, 1, frame_size * frames);
     // Digital silence over frames 25..32.
-    for v in pcm[25 * frame_size..32 * frame_size].iter_mut() {
-        *v = 0.0;
-    }
+    pcm[25 * frame_size..32 * frame_size].fill(0.0);
     let mut enc = CeltRefEncoder::new_custom(&mode, mode.max_lm, 1).expect("encoder");
     let mut dec = CeltRefDecoder::new_custom(&mode, mode.max_lm, 1).expect("decoder");
     let mut total = 0usize;

@@ -591,9 +591,7 @@ impl CeltRefEncoder {
             let mut v = vec![0f32; 2 * short];
             let mut sb = vec![0f32; short];
             for b in 0..m {
-                for o in v.iter_mut() {
-                    *o = 0.0;
-                }
+                v.fill(0.0);
                 for j in 0..(short + overlap) {
                     v[p_s + j] = block[b * short + j] * self.short_window[p_s + j];
                 }
@@ -898,9 +896,7 @@ impl CeltRefEncoder {
                     for f in freq[..bound].iter_mut() {
                         *f *= upsample as f32;
                     }
-                    for f in freq[bound..].iter_mut() {
-                        *f = 0.0;
-                    }
+                    freq[bound..].fill(0.0);
                 }
                 let spec = if c == 0 { &mut x } else { &mut y };
                 for i in start..end {
@@ -1430,9 +1426,7 @@ mod tests {
         // Bands 0..8: energy spread evenly across all four short
         // blocks (uniform in time — recombining is sparsest).
         let mut x = vec![0f32; n_coded];
-        for v in x[..eb(8)].iter_mut() {
-            *v = 0.25;
-        }
+        x[..eb(8)].fill(0.25);
         // Bands 8..21: all energy in short block 0 (interleaved
         // layout: coefficient `b + j*m` belongs to block `b`).
         for i in 8..NUM_BANDS {
@@ -1466,9 +1460,7 @@ mod tests {
         // neighbors) saves at most |metric| = LM but pays two lambda
         // switches: the Viterbi keeps it on the frame default.
         let mut x = vec![0.25f32; n_coded];
-        for v in x[eb(13)..eb(14)].iter_mut() {
-            *v = 0.0;
-        }
+        x[eb(13)..eb(14)].fill(0.0);
         for j in 0..(eb(14) - eb(13)) / m {
             x[eb(13) + j * m] = 0.5;
         }

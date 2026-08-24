@@ -1031,9 +1031,7 @@ fn quant_band(
                 let cm_mask = (1u32 << b_blocks) - 1;
                 fill &= cm_mask;
                 if fill == 0 {
-                    for v in x.iter_mut() {
-                        *v = 0.0;
-                    }
+                    x.fill(0.0);
                 } else {
                     match lowband.as_deref() {
                         None => {

@@ -757,9 +757,7 @@ mod tests {
         // bins = 40 and E = 5, so sqrt(2)/45 > 1/40 ⇒ dual.
         assert_eq!(span, 40);
         let mut r = l.clone();
-        for v in r[..span].iter_mut() {
-            *v = 0.0;
-        }
+        r[..span].fill(0.0);
         assert_eq!(choose_mid_side_stereo(&l, &r, lm, 0), Some(false));
 
         // Manual L1 evaluation agrees with the verdict on a mixed

@@ -655,9 +655,7 @@ impl CeltRefDecoder {
             // already zeroes above `M·eBands[end]`).
             if downsample != 1 {
                 let bound = (m * eb(end)).min(frame / downsample);
-                for f in freq[bound..].iter_mut() {
-                    *f = 0.0;
-                }
+                freq[bound..].fill(0.0);
             }
             // The inverse MDCT + overlap-add at the reference
             // emission alignment: the long basis spans `2*frame`

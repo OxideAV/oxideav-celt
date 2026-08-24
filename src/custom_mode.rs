@@ -545,10 +545,9 @@ impl CeltCustomMode {
             for c in 1..=2i32 {
                 for j in 0..nb {
                     let mut n0 = (e[j + 1] - e[j]) as i32;
-                    let max_bits;
-                    if n0 << i == 1 {
+                    let max_bits = if n0 << i == 1 {
                         // N=1 bands only have a sign bit and fine bits.
-                        max_bits = (c * (1 + MAX_FINE_BITS)) << BITRES;
+                        (c * (1 + MAX_FINE_BITS)) << BITRES
                     } else {
                         let mut lm0: i32 = 0;
                         // Even-sized bands bigger than N=2 can be
@@ -615,8 +614,8 @@ impl CeltCustomMode {
                         let qb = ((num + (den >> 1)) / den).min(MAX_FINE_BITS);
                         debug_assert!(qb >= 0);
                         mb += (c * qb) << BITRES;
-                        max_bits = mb;
-                    }
+                        mb
+                    };
                     let width = c * (((e[j + 1] - e[j]) as i32) << i);
                     let cap = 4 * max_bits / width - 64;
                     if !(0..256).contains(&cap) {
