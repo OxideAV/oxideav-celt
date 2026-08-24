@@ -19,6 +19,21 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-451 — decoder-side downsampled output rates**: the
+  standard 48 kHz mode now decodes directly to 24/16/12/8 kHz PCM
+  (`CeltRefDecoder::new_downsampled`, plus
+  `new_with_start_downsampled` for the Hybrid layer) — the RFC 6716
+  reduced-rate output behaviour: the decode walk and synthesis run
+  at 48 kHz, the denormalised spectrum is bounded to the output
+  Nyquist (`bound = min(M·eBands[end], N/downsample)`) before the
+  inverse MDCT, and the de-emphasis keeps every `48000/rate`-th
+  sample. `output_frame_size()` reports the per-frame PCM span. The
+  in-repo arm (`tests/downsample.rs`) pins the factor table, output
+  sizing at every LM, bit-identical energy state against the 48 kHz
+  decode, in-band equivalence with the decimated 48 kHz output
+  (> 30 dB on band-limited content, the residual being genuine
+  above-Nyquist energy), tone survival at every rate, Hybrid-layer
+  out-of-band collapse, and decode robustness on random payloads.
 * **Round-442 — custom modes (non-48 kHz operating points), the
   crate's last "lacks"**: `custom_mode::CeltCustomMode` transcribes
   the full Appendix A mode construction (Bark-scaled band-edge

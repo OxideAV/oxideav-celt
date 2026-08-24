@@ -263,6 +263,27 @@ pub struct CeltRefDecoder {
     /// Per-frame §4.3.5 noise seed (the range coder's final `rng`).
     rng: u32,
     window: Vec<f32>,
+    /// Output decimation factor (`downsample`): 1 for 48 kHz output;
+    /// 2/3/4/6 for 24/16/12/8 kHz PCM output from the standard mode.
+    /// The synthesis runs at 48 kHz; the coded spectrum is bounded to
+    /// the output Nyquist and the de-emphasis keeps every
+    /// `downsample`-th sample.
+    downsample: usize,
+}
+
+/// The standard-mode output decimation factor for a PCM rate
+/// (`resampling_factor`): 48 kHz → 1, 24 kHz → 2, 16 kHz → 3,
+/// 12 kHz → 4, 8 kHz → 6. Other rates have no factor (custom modes
+/// run their own geometry instead).
+pub fn resampling_factor(rate: u32) -> Option<usize> {
+    match rate {
+        48_000 => Some(1),
+        24_000 => Some(2),
+        16_000 => Some(3),
+        12_000 => Some(4),
+        8_000 => Some(6),
+        _ => None,
+    }
 }
 
 impl CeltRefDecoder {
@@ -279,7 +300,38 @@ impl CeltRefDecoder {
     /// `start..21` only; the spectrum below the start band
     /// synthesizes as zero (the SILK layer's territory).
     pub fn new_with_start(lm: u32, channels: usize, start: usize) -> Result<Self, Error> {
-        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start)
+        Self::with_mode(CeltCustomMode::standard().clone(), lm, channels, start, 1)
+    }
+
+    /// Build a standard-mode decoder whose PCM output is at
+    /// `pcm_rate` (48000, 24000, 16000, 12000, or 8000 Hz) — the
+    /// RFC 6716 decoder-side output rates. The frame is still a
+    /// 48 kHz-mode CELT frame (`lm` selects 2.5/5/10/20 ms); the
+    /// synthesis runs at 48 kHz with the spectrum bounded to the
+    /// output Nyquist, and the de-emphasis emits every
+    /// `48000 / pcm_rate`-th sample —
+    /// [`Self::output_frame_size`] samples per channel per frame.
+    pub fn new_downsampled(lm: u32, channels: usize, pcm_rate: u32) -> Result<Self, Error> {
+        Self::new_with_start_downsampled(lm, channels, 0, pcm_rate)
+    }
+
+    /// [`Self::new_with_start`] with downsampled PCM output — the
+    /// Hybrid-layer (`start = 17`) counterpart of
+    /// [`Self::new_downsampled`].
+    pub fn new_with_start_downsampled(
+        lm: u32,
+        channels: usize,
+        start: usize,
+        pcm_rate: u32,
+    ) -> Result<Self, Error> {
+        let downsample = resampling_factor(pcm_rate).ok_or(Error::InvalidParameter)?;
+        Self::with_mode(
+            CeltCustomMode::standard().clone(),
+            lm,
+            channels,
+            start,
+            downsample,
+        )
     }
 
     /// Build a decoder for a **custom mode** (an arbitrary
@@ -287,7 +339,7 @@ impl CeltRefDecoder {
     /// frame-size shift `lm` (`0..=mode.max_lm`). Custom-mode frames
     /// always start at band 0.
     pub fn new_custom(mode: &CeltCustomMode, lm: u32, channels: usize) -> Result<Self, Error> {
-        Self::with_mode(mode.clone(), lm, channels, 0)
+        Self::with_mode(mode.clone(), lm, channels, 0, 1)
     }
 
     fn with_mode(
@@ -295,8 +347,13 @@ impl CeltRefDecoder {
         lm: u32,
         channels: usize,
         start: usize,
+        downsample: usize,
     ) -> Result<Self, Error> {
         if lm > mode.max_lm || !(1..=2).contains(&channels) || start >= mode.eff_ebands {
+            return Err(Error::InvalidParameter);
+        }
+        // The decimation grid must land on whole output frames.
+        if downsample == 0 || (mode.short_mdct_size << lm) % downsample != 0 {
             return Err(Error::InvalidParameter);
         }
         let frame = mode.short_mdct_size << lm;
@@ -326,13 +383,22 @@ impl CeltRefDecoder {
             pf_tapset_old: 0,
             rng: 0,
             window,
+            downsample,
             mode,
         })
     }
 
-    /// The per-channel frame size in samples.
+    /// The per-channel frame size in samples **at the mode rate**
+    /// (48 kHz for the standard mode).
     pub fn frame_size(&self) -> usize {
         self.mode.short_mdct_size << self.lm
+    }
+
+    /// The per-channel PCM samples emitted per frame — the frame
+    /// size divided by the output decimation factor
+    /// (equal to [`Self::frame_size`] at the mode rate).
+    pub fn output_frame_size(&self) -> usize {
+        self.frame_size() / self.downsample
     }
 
     /// Decode one CELT frame into interleaved f32 PCM in `[-1, 1]`
@@ -563,7 +629,8 @@ impl CeltRefDecoder {
         // comb filter over the filtered history.
         let m = 1usize << lm;
         let eb = |i: usize| self.mode.e_bands[i] as usize;
-        let mut pcm = vec![0f32; channels * frame];
+        let downsample = self.downsample;
+        let mut pcm = vec![0f32; channels * (frame / downsample)];
         let short_size = frame / m;
         self.pf_period = self.pf_period.max(COMBFILTER_MINPERIOD);
         self.pf_period_old = self.pf_period_old.max(COMBFILTER_MINPERIOD);
@@ -580,6 +647,16 @@ impl CeltRefDecoder {
             for (i, &g) in band_e[c].iter().enumerate().take(end).skip(start) {
                 for j in m * eb(i)..m * eb(i + 1) {
                     freq[j] = spec[j] * g;
+                }
+            }
+            // Downsampled output bounds the spectrum to the output
+            // Nyquist before the inverse transform (`bound =
+            // min(M·eBands[end], N/downsample)`; the coded top
+            // already zeroes above `M·eBands[end]`).
+            if downsample != 1 {
+                let bound = (m * eb(end)).min(frame / downsample);
+                for f in freq[bound..].iter_mut() {
+                    *f = 0.0;
                 }
             }
             // The inverse MDCT + overlap-add at the reference
@@ -674,11 +751,16 @@ impl CeltRefDecoder {
             let c0 = self.mode.preemph[0];
             let c1 = self.mode.preemph[1];
             let c3 = self.mode.preemph[3];
+            // The filter always runs at the mode rate over all
+            // `frame` samples; downsampled output stores every
+            // `downsample`-th result (the first of each group).
             let mut mem = self.deemph_mem[c];
             for (j, &v) in buf[hist_len..].iter().enumerate() {
                 let tmp = v + mem;
                 mem = c0 * tmp - c1 * v;
-                pcm[j * channels + c] = c3 * tmp * (1.0 / SIG_SCALE);
+                if j % downsample == 0 {
+                    pcm[(j / downsample) * channels + c] = c3 * tmp * (1.0 / SIG_SCALE);
+                }
             }
             self.deemph_mem[c] = mem;
         }
