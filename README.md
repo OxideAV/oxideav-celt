@@ -6,6 +6,47 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
+**Reduced-rate I/O + bandwidths + loss concealment, r451.** The
+standard 48 kHz mode now runs the full RFC 6716 operating envelope:
+
+- **Downsampled output / reduced-rate input (8/12/16/24 kHz PCM)** —
+  `CeltRefDecoder::new_downsampled` bounds the spectrum to the
+  output Nyquist and decimates the de-emphasis;
+  `CeltRefEncoder::new_upsampled` zero-stuffs the input onto the
+  48 kHz analysis grid and rescales the spectrum below the input
+  Nyquist (the reference float-path input guards — non-finite → 0,
+  clip at twice full scale — land with it). **Measured
+  (runtime-gated A/B against listing-built standard-mode oracle
+  harnesses):** decode lockstep **108.4–108.6 dB** float SNR at
+  every output rate (20 ms mono + 10 ms stereo); Hybrid-layer
+  (start = 17) downsampled decode 113.9 dB at 24 kHz and
+  **bit-exact all-zero** at 16/12/8 kHz; encoder parity **within
+  0.1 dB of the listing at every input rate** (18.2/13.8/10.9/7.0
+  vs 18.3/13.8/10.9/7.0 dB at 24/16/12/8 kHz, 64 kb/s CBR) with
+  cross-decode lockstep at 133.1–133.5 dB.
+- **End-band configurations (the §3.1 CELT-mode bandwidths)** —
+  `new_with_bands` (both sides): coded bands `start..end`, `end` =
+  13 (NB) / 17 (WB) / 19 (SWB) / 21 (FB). **Measured:** decode of
+  listing streams 107.3–108.6 dB, our streams symbol-clean through
+  the listing decoder (133.5–133.9 dB cross-decode lockstep),
+  decoded quality +0.1 to +0.6 dB ahead of the listing encoder at
+  every point (NB/WB mono, SWB stereo).
+- **Packet-loss concealment** (`decode_lost`) — the reference
+  concealment walk: pitch-locked LPC extrapolation (2:1 pitch
+  downsampling, coarse/fine 67–480 Hz search, 24th-order Levinson
+  fit, per-cycle decay, TDAC blend + carry pre-filter) for the
+  first five losses; comfort noise toward the long-term
+  `backgroundLogE` floor for longer runs and Hybrid streams. The
+  decoder state now mirrors the reference layout (per-channel
+  2048-sample synthesized history + overlap carry). **Measured:**
+  lossy-stream A/B (singles, a double, a 7-frame run) holds
+  82.3/69.0/82.4 dB against the listing decoder with the concealed
+  stretches included — branch/pitch decisions in lockstep, the
+  residual at the recursive chain's float accumulation floor.
+- **Registry**: `resample`, `end_band`, and empty-packet loss
+  markers (concealment through the codec API), composing with
+  `start_band`/`vbr`/`vbr_constrained`.
+
 **Custom modes (non-48 kHz) COMPLETE, r442.** The crate's last
 "lacks" is closed: `custom_mode::CeltCustomMode` transcribes the
 full Appendix A mode construction — Bark-scaled band-edge derivation
