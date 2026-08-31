@@ -6,701 +6,114 @@ Pure-Rust CELT (the MDCT path of Opus, RFC 6716).
 
 ## Status
 
-**Reduced-rate I/O + bandwidths + loss concealment, r451.** The
-standard 48 kHz mode now runs the full RFC 6716 operating envelope:
+The crate carries the full CELT codec arc — a **reference-exact
+decoder**, a **reference-compatible encoder that measures ahead of
+the reference**, and the oxideav-core registry wiring — transcribed
+from RFC 6716 (including the Appendix A reference listing, which is
+embedded in the staged RFC text itself, extracted per §A.1 and
+SHA-1-verified) and validated black-box against oracle binaries
+built from that listing.
 
-- **Downsampled output / reduced-rate input (8/12/16/24 kHz PCM)** —
-  `CeltRefDecoder::new_downsampled` bounds the spectrum to the
-  output Nyquist and decimates the de-emphasis;
-  `CeltRefEncoder::new_upsampled` zero-stuffs the input onto the
-  48 kHz analysis grid and rescales the spectrum below the input
-  Nyquist (the reference float-path input guards — non-finite → 0,
-  clip at twice full scale — land with it). **Measured
-  (runtime-gated A/B against listing-built standard-mode oracle
-  harnesses):** decode lockstep **108.4–108.6 dB** float SNR at
-  every output rate (20 ms mono + 10 ms stereo); Hybrid-layer
-  (start = 17) downsampled decode 113.9 dB at 24 kHz and
-  **bit-exact all-zero** at 16/12/8 kHz; encoder parity **within
-  0.1 dB of the listing at every input rate** (18.2/13.8/10.9/7.0
-  vs 18.3/13.8/10.9/7.0 dB at 24/16/12/8 kHz, 64 kb/s CBR) with
-  cross-decode lockstep at 133.1–133.5 dB.
-- **End-band configurations (the §3.1 CELT-mode bandwidths)** —
-  `new_with_bands` (both sides): coded bands `start..end`, `end` =
-  13 (NB) / 17 (WB) / 19 (SWB) / 21 (FB). **Measured:** decode of
-  listing streams 107.3–108.6 dB, our streams symbol-clean through
-  the listing decoder (133.5–133.9 dB cross-decode lockstep),
-  decoded quality +0.1 to +0.6 dB ahead of the listing encoder at
-  every point (NB/WB mono, SWB stereo).
-- **Packet-loss concealment** (`decode_lost`) — the reference
-  concealment walk: pitch-locked LPC extrapolation (2:1 pitch
-  downsampling, coarse/fine 67–480 Hz search, 24th-order Levinson
-  fit, per-cycle decay, TDAC blend + carry pre-filter) for the
-  first five losses; comfort noise toward the long-term
-  `backgroundLogE` floor for longer runs and Hybrid streams. The
-  decoder state now mirrors the reference layout (per-channel
-  2048-sample synthesized history + overlap carry). **Measured:**
-  lossy-stream A/B (singles, a double, a 7-frame run) holds
-  82.3/69.0/82.4 dB against the listing decoder with the concealed
-  stretches included — branch/pitch decisions in lockstep, the
-  residual at the recursive chain's float accumulation floor.
-- **Registry**: `resample`, `end_band`, and empty-packet loss
-  markers (concealment through the codec API), composing with
-  `start_band`/`vbr`/`vbr_constrained`.
+* **Decode — reference-exact** (`ref_decode::CeltRefDecoder`): the
+  complete Table-56 walk with every budget gate at its exact
+  position, the exact §4.3.3 allocation (`alloc_exact`), the exact
+  §4.3.4 band loop with coded split angles, folding, collapse masks
+  and the stereo mid/side / intensity / dual paths (`band_quant`),
+  the absolute `eMeans` energy scale, the exact §4.3.5
+  anti-collapse, the two-stage §4.3.7.1 comb filter, and the
+  §4.3.7.2 de-emphasis. **Measured:** the staged reference-encoded
+  fixtures decode at the decoder pair's float-rounding floor
+  (90.4 / 87.6 dB s16 SNR; 118 / 99 dB float-vs-float), a generated
+  2.5/5/10/20 ms x mono/stereo sweep at 132.9–137.0 dB float SNR,
+  symbol-level traces bit-identical to an instrumented listing
+  build.
+* **Encode — reference-compatible, ahead of the listing**
+  (`ref_encode::CeltRefEncoder`): the exact encode-direction mirror
+  of the decoder's gated walk driving the same exact allocation and
+  band machinery, plus the full §5.3 decision layer — lambda-priced
+  Viterbi TF analysis, two-pass coarse-energy RD, alloc-trim /
+  spreading / dual-stereo analyses, Table-66 intensity threshold,
+  transient detection, the anti-collapse request rule, and the
+  complete §5.3.1 pitch-prefilter chain (the crate's documented
+  pitch search; encoder freedom with parity measured). **Measured
+  (re-verified r454 against a freshly built listing oracle):**
+  cross-decoder lockstep 99.4–133.1 dB float SNR on every LM x
+  channels combo, and decoded quality **above** the §A.1 listing
+  encoder at every measured CBR point — 10 ms mono 30.7 / 36.7 /
+  43.5 dB vs 21.4 / 33.8 / 42.0 at 40/80/160 B per frame, 20 ms
+  mono 24.3 / 29.2 / 34.9 vs 14.4 / 27.5 / 31.9, 10 ms stereo
+  15.9 / 23.8 / 29.9 vs 12.7 / 23.5 / 29.7 — with high-rate
+  coverage to 384 kb/s (above the listing at every point).
+* **Rate control**: CBR at any 2..=1275-byte budget (exact-size
+  frames, decode-finite at every LM x channels); the §A.1 VBR
+  controller (`encode_frame_vbr`) with transient boosts, drift
+  integrator, and 2-byte digital-silence frames at **exactly** the
+  oracle's positions; constrained VBR whose reservoir lands on the
+  oracle's stream total **to the byte** on the staged cvbr sets
+  (ratios 1.000 again at 32/96/128 kb/s in the multi-rate A/B).
+* **Operating envelope** (both directions unless noted): the §3.1
+  CELT-mode bandwidths (`end_band` 13 = NB / 17 = WB / 19 = SWB /
+  21 = FB; decoded quality +0.1 to +0.6 dB ahead of the listing at
+  every measured point); the Hybrid-mode CELT layer (`start = 17`:
+  no post-filter fields, no pitch prefilter, quality parity within
+  0.1 dB, hybrid-VBR silence positions identical); reduced-rate PCM
+  I/O at 8/12/16/24 kHz (decoder-side downsampling / encoder-side
+  upsampling with the reference input guards; decode lockstep
+  108.4–108.6 dB, encoder parity within 0.1 dB of the listing at
+  every input rate); Appendix-A **custom modes** for any legal
+  geometry (8–96 kHz, 40–1024 even samples): mode construction
+  reproduces every staged 48 kHz table bit-exactly, nine-point
+  oracle A/B symbol-exact both directions with quality within
+  ±1.5 dB (ahead at ten of eighteen), 44.1 kHz constrained-VBR
+  totals byte-equal; and **packet-loss concealment**
+  (`decode_lost`: the reference pitch-locked LPC extrapolation for
+  the first five losses, comfort noise toward the background floor
+  beyond and on Hybrid streams; lossy-stream A/B holds
+  69.0–82.4 dB with the concealed stretches included).
+* **Registry** (`codec`): `register` plus the direct `make_decoder`
+  / `make_encoder` factories (the workspace dual-API convention) —
+  one raw CELT frame per packet, interleaved-f32 frames, options
+  `frame_size`, `start_band`, `end_band`, `resample`, `vbr`,
+  `vbr_constrained`; empty packets conceal through `decode_lost`.
 
-**Custom modes (non-48 kHz) COMPLETE, r442.** The crate's last
-"lacks" is closed: `custom_mode::CeltCustomMode` transcribes the
-full Appendix A mode construction — Bark-scaled band-edge derivation
-at the mode's spectral resolution, allocation-matrix interpolation
-over the 400·`eband5ms` Hz grid, `logN`, the overlap window,
-rate-dependent pre/de-emphasis, and the pulse-cost cache + caps
-ladder rebuilt from this crate's own `V(N, K)` recursion — for any
-legal `(rate, frame size)` pair (8–96 kHz, 40–1024 even samples,
-1 ms frame floor, 3.3 ms short-block ceiling). Fed `(48000, 960)`,
-the construction reproduces every staged 48 kHz table bit-exactly
-(pinned by tests), and the whole reference-exact chain (allocation
-walk, band loop, coarse energy, caps, MDCT sizing/windows, VBR rate
-law) now reads geometry from the mode.
-`CeltRefDecoder::new_custom` / `CeltRefEncoder::new_custom` run both
-directions end to end; the registry factories accept
-`sample_rate` + any legal `frame_size`. **Measured (runtime-gated
-black-box A/B against oracle harnesses over the listing's
-custom-mode API, nine configurations 8 k–96 k × mono/stereo at
-fixed rates):** our decode of oracle streams 74.0–120.6 dB float SNR
-against the oracle's own decode, oracle decode of our streams
-80.3–136.5 dB against ours (the decoder pairs' numerical floors —
-symbol-exact interop in both directions), decoded quality within
-±1.5 dB of the oracle encoder at every point (ahead at ten of
-eighteen, exact parity at the max_lm=1 point), and 44.1 kHz VBR at a
-64 kb/s target with **identical 2-byte silence positions** in both
-modes — unconstrained totals within 0.1% (8316/8311 B), constrained
-totals **byte-equal** (6941/6941 B). The A/B also exposed and fixed
-two §5.3.1 pitch-search defects (high-order-multiple argmax at short
-windows; amplitude-blind comb gain on decays), re-measured green
-against the full 48 kHz oracle battery. The in-repo arm (`tests/custom_modes.rs`) holds
-self round-trips at nine configurations (15.2–50.1 dB
-delay-compensated SNR at ~128–192 kb/s equivalents, re-measured
-after the pitch fix), the `max_lm`
-ladder, VBR silence collapse, determinism, and decode robustness.
-One documented superset: geometries whose half-short-size is not
-5-smooth (e.g. 44.1 kHz/880, short 110) are constructed and coded by
-this crate's direct-form transform but rejected by the oracle
-binary's transform planner at mode creation, so they are covered by
-the self-consistency arm only.
+**Performance (r454).** `benches/decode.rs` holds the decode
+baseline: with the standard-mode IMDCT cosine basis cached
+(bit-identical by construction — `tests/imdct_basis.rs` pins it
+bitwise), whole-stream decode measures ~971 K samples/s on 20 ms
+mono CBR (~20x realtime at 48 kHz), ~499 K/s on 20 ms stereo,
+~8.1 M/s on 2.5 ms mono, and ~1.9 M/s on an alternating
+decode/conceal walk (arm64, release; ~5.8x over the direct-form
+r451 decoder).
 
-**VBR oracle-validated + Hybrid-mode CELT layer, r434.** The staged
-VBR fixture arm (`{vbr,cvbr}-lm*`, reference-listing encodes at a
-64 kb/s target) now gates both directions. Decode: all ten raw-frame
-sets (CBR + VBR + constrained-VBR) reproduce the listing decode at
-99.4–109.2 dB float SNR, variable frame sizes and 2-byte silence
-frames included. Encode: the r419 controller was already
-§A.1-shaped; the fixtures exposed one defect — the digital-silence
-rule — now corrected to the listing's (every pre-emphasized sample
-of the *current* frame exactly zero; the frame after the last
-nonzero sample still carries the pre-emphasis memory discharge).
-With it, `tests/vbr_oracle.rs` measures: 2-byte silence frames at
-**exactly** the oracle's positions on all six sets, mean rate within
-1.9% (55.47/56.60/60.85/69.52 vs 55.48/55.93/61.83/70.83 kb/s across
-the four unconstrained sets), per-frame size correlation
-0.962–0.994, SNR at the spent rate within 0.3 dB — and the
-**constrained-VBR reservoir lands on the oracle's total to the
-byte** (4178/4178 and 4328/4328 B on the staged cvbr sets; ratios
-1.000 again at 32/96/128 kb/s in the runtime-gated multi-rate A/B).
-The **Hybrid-mode CELT layer** (`start = 17`) landed on both sides
-(`new_with_start`, plus the registry `start_band` and
-`vbr_constrained` options): no post-filter fields / no pitch
-prefilter (the exact `start != 0` gates), intensity clamped into the
-coded window, out-of-range energy state pinned to its reference
-reset values. Black-box A/B against listing-built oracle harnesses
-at start band 17: our decode of oracle hybrid streams
-109.7–112.5 dB, cross-decoder on our streams 111.4–128.8 dB, quality
-parity within 0.1 dB, hybrid-VBR silence positions identical.
-High-rate coverage closed the last r417 followup: at 192/384 kb/s
-the oracle streams decode at 105.7–108.9 dB and the encoder measures
-**above** the listing at every point on the steady tonal window
-(49.0 vs 45.1 dB at LM 2 192 kb/s, up to +5.0 dB). The last
-remaining gap — non-48 kHz operating points — closed in r442 (see
-the status above).
+**Boundaries and freedoms** (all documented in place): the §5.3.1
+pitch search and a handful of §5.3 decision maps are in-crate
+encoder freedom (RFC 6716 grants them; parity is measured above);
+custom-mode geometries whose half-short-size is not 5-smooth are
+constructed and coded by this crate but rejected by the oracle
+binary's transform planner, so they are covered by the
+self-consistency arm only; the pre-r414 auto codec (`pcm_encode`
+and the §4.3-prose module chain, retained as documented building
+blocks — see the API reference below) writes its own in-crate wire
+with its own documented interop caveats.
 
-**Encoder beats the reference listing at every measured rate, r419.**
-The r417 encoder's remaining rate-distortion gap is closed and
-inverted. The round transcribed the §A.1 listing's entire decision
-layer — the lambda-priced Viterbi **TF analysis** (long *and*
-transient frames now take time/frequency splits), the two-pass
-badness-driven **coarse-energy RD** (`quant_coarse_energy_rd`: intra
-and inter both encoded, lower clamping distortion wins, decay bound +
-end-of-budget clamps, delayed-intra statistic), the
-**alloc-trim / spreading / dual-stereo** analyses, stereo-averaged
-dynalloc contrast, and the consecutive-transient anti-collapse rule —
-and then found the actual ~3 dB culprit by symbol-level A/B: the
-allocations already matched; the listing's advantage was the **§5.3.1
-pitch prefilter** (post-filter noise shaping). The encoder now runs
-the full prefilter chain (pitch search over 1024 samples of
-unfiltered pre-emphasized history, the §A.1 gain/threshold envelope,
-Table-56 octave/period/gain/tapset fields, and the comb prefilter —
-the FIR inverse of the decoder's post-filter with the squared-window
-parameter transition).
+## Fuzzing
 
-**Measured (r419, oracle sweep at matched CBR rates):** every mono
-LM × rate point now measures **above** the §A.1 listing encoder —
-+1.2 to +11.0 dB (5 ms mono: 35.7/45.2/51.0 dB vs 27.8/39.1/49.5 at
-40/80/160 B; 10 ms mono: 31.0/37.1/43.2 vs 21.4/33.8/42.0; 20 ms
-mono: 25.4/29.5/35.9 vs 14.4/27.5/31.9) — and stereo +0.2 to
-+3.2 dB (10 ms stereo: 15.9/23.8/29.9 vs 12.7/23.5/29.7).
-Cross-decoder lockstep holds at 99.4–133 dB float SNR across all
-eight LM × channel combos (max per-sample diff ≤ 1.1e-5). **VBR**
-landed as `encode_frame_vbr` plus the registry `vbr` option: the
-§A.1 target/drift controller with transient boosts, 2-byte
-digital-silence frames, and the constrained-VBR reservoir — a
-64 kb/s 10 ms tonal stream tracks its target and the mixed test
-signal lands at 55–67 kb/s across LMs. Hybrid (`start = 17`) landed
-in r434 (see above), custom modes in r442; the prefilter's pitch
-search is the crate's
-documented §5.3.1 design rather than the listing's downsampled
-xcorr chain (encoder freedom; parity measured above).
-
-**Reference-compatible encode + registry wiring, r417.** The crate
-now carries the full codec arc: the r414 reference-exact decoder is
-joined by a **reference-compatible encoder**
-(`ref_encode::CeltRefEncoder`) and both are registered into the
-oxideav-core runtime (`codec` module: `register` plus the direct
-`make_decoder` / `make_encoder` factories, per the workspace
-dual-API convention — one raw CELT frame per packet, interleaved-f32
-audio frames, stream shape from `CodecParameters` + the
-schema-declared `frame_size` option).
-
-The encoder is the exact mirror of the decoder's Table-56 walk —
-every symbol the decoder reads under a budget gate is written under
-the identical gate — driving the exact §4.3.3 allocation walk and
-the exact §4.3.4 band loop in their encode direction on the absolute
-`eMeans` energy scale, with the §5.3 decisions wired: §5.3.3
-two-pass intra selection, §5.3.4.1 contrast band boosts, §5.3.4.2
-tilt/correlation trim, §5.3.5 Table-66 intensity threshold + L1
-mid/side-vs-dual verdict, transient detection, and a transient-frame
-per-band §4.3.4.5 TF decision. The analysis front end (§4.3.7.2
-pre-emphasis at the reference signal scale + the forward MDCT at the
-decoder's exact emission alignment, long and short blocks)
-reconstructs at 143–150 dB unquantized; the encoder carries the
-reference's 120-sample lookahead.
-
-**Measured (r417, runtime-gated black-box):** against decoder and
-encoder oracles built from the RFC 6716 §A reference listing
-(extracted per §A.1 from the staged RFC text, SHA-1-verified), every
-stream this encoder emits decodes **identically** through the
-crate's decoder and the listing decoder across 2.5/5/10/20 ms ×
-mono/stereo — cross-decoder float SNR 99.4–133.0 dB (the decoder
-pair's own numerical floor, measured identically on listing-encoded
-streams; max per-sample diff ≤ 1.1e-5) — and a 40/80/160 B/frame
-rate sweep measures decode quality within −3.5 dB of the listing
-encoder at high rates while **beating it at the low end** (20 ms
-mono 40 B: 21.3 dB vs 14.4 dB; 10 ms stereo 40 B: 13.2 dB vs
-12.7 dB). Byte budgets from 2 to 1275 encode to exactly the
-requested size and decode finite at every LM × channels
-(`tests/ref_encode_interop.rs` + the in-crate gates). The encode
-gaps this round left — long-frame TF RD pricing, the high-rate
-quality deficit, the always-off anti-collapse request — were closed
-in r419 (see the status above); Hybrid (`start = 17`) landed in
-r434 and non-48 kHz operating points in r442.
-
-**Reference-exact decode, r414.** Real reference-encoded CELT streams
-decode at the float-rounding floor. The RFC 6716 Appendix A reference
-listing — embedded in the staged RFC text itself and extracted per
-§A.1 (SHA-1-verified against the value §A.1 prints) — pins the three
-predicates the staged behavioral chapter's §10 could only bound, and
-three new modules transcribe it end to end:
-
-* `alloc_exact` — the exact §4.3.3 allocation walk: codepoint search,
-  1/64 interpolation, concurrent top-down skip decoding with the
-  exact candidate predicate (`band_bits >= max(thresh, alloc_floor +
-  8)`) and the boosted-band `skip_start` floor, intensity / dual
-  placement with the shrinking intensity reservation, the exact
-  fine/shape split (fair-share offset on `logN`, the second/third
-  fine-bit offset steps, divide-with-rounding, the bust guard, the
-  `MAX_FINE_BITS` cap), the exact priority-0/1 predicate, and the
-  balance — plus the §4.3.4.1 pseudo-pulse machinery (`get_pulses`,
-  nearest-cost `bits2pulses` with ties down, `pulses2bits`).
-* `band_quant` — the exact §4.3.4 band loop: per-band bit targets
-  `clamp(pulses[i] + balance/min(3, codedBands − i))` with the
-  tell-coupled running balance, the §4.3.4.4 split recursion with the
-  coded split angle (step / uniform / triangular PDFs, `compute_qn`,
-  `bitexact_cos` / `bitexact_log2tan` / `isqrt32` — all
-  integer-exact), the §4.3.4.5 Haar recombine/time transforms with
-  the `ordery` Hadamard reordering, the §4.3.4.3 spreading rotation,
-  spectral folding with the LCG noise fill and collapse masks, and
-  the stereo mid/side, intensity, inversion, and N = 2 special
-  paths — decode and encode directions.
-* `ref_decode` (`CeltRefDecoder`) — the unified mono + stereo
-  end-to-end frame decoder: every Table-56 budget gate at its exact
-  position (silence, post-filter, transient, intra, tf, spread,
-  dynalloc, trim, anti-collapse reservation), the absolute `eMeans`
-  energy scale (`bandE = 2^(bandLogE + eMeans)` — retiring the r408
-  empirical `+14.0` bridge and the LM 0 open item), the exact §4.3.5
-  anti-collapse over the two-frame energy history, the reference
-  synthesis alignment (the long basis emits its low-overlap window
-  support `[P, P + frame + overlap)`, `P = (frame − overlap)/2`, at
-  twice the §4.3.7 half-scale; interleaved short blocks at hop 120),
-  the two-stage §4.3.7.1 comb filter with the parameter pipeline, and
-  the §4.3.7.2 de-emphasis at the reference output scale (1/32768).
-
-**Measured** (runtime-gated black-box harnesses; validator binaries
-invoked as opaque processes only): the two staged reference-encoded
-fixtures decode at **90.4 dB / 87.6 dB SNR** against their staged
-reference decodes (the s16 comparison floor; **118 / 99 dB**
-float-vs-float), least-squares gain 1.000000; a generated sweep over
-2.5/5/10/20 ms × mono/stereo (tones, hard transients, near-silence,
-noise) measures **132.9–137.0 dB float SNR** on all eight combos
-(`tests/ref_decode_fixtures.rs`, `tests/blackbox_ref_decode.rs`).
-Symbol-level traces (allocation vectors, per-band bit targets, split
-angles, leaf pulse counts, collapse masks, balance) are bit-identical
-to an instrumented oracle built from the staged listing per §A.1.
-The dynalloc boost loop was corrected to the normative listing on the
-way (1/8-bit symbol-cost gate against the diminishing budget;
-channel-counting quanta width) — the §4.3.3 prose narration slips on
-both points. The decode gaps this round left — Hybrid windows
-(`start = 17`, r434) and non-48 kHz operating points (r442) — are
-closed.
-The pre-r414 auto encoders (`pcm_encode`) still write the r408
-walk's wire; the reference-compatible encode arc landed in r417 as
-the separate `ref_encode` module (see the r417 status above).
-
-**§4.3.3 reallocation walk + wire-interop energy convention, r408.**
-The full bit-allocation walk of RFC 6716 §4.3.3 is implemented per the
-staged clean-room behavioral chapter
-(`docs/audio/celt/spec/celt-reallocation-walk.md`): the outer bisection
-over the 11 Table-57 quality codepoints, the 1/64-step interpolation on
-the cap-clamped bracketing vectors, the concurrent top-down **skip
-decoding** (one `{1,1}/2` symbol per viable candidate, silent folds
-below the §2.6 minimum, the lowest band never skipped), the intensity /
-dual-stereo placement over the post-skip window, the cap-bounded final
-reallocation, the fine-energy vs. shape split, the priority-0/1 stamp,
-and the balance. The Table-56 `skip`/`intensity`/`dual` symbols moved
-out of the frame prefix into the walk (the prefix ends at `alloc.
-trim`), the dynalloc/trim/reservation budget threading follows the §2
-narrative exactly, and every frame driver (mono + stereo, explicit +
-auto) runs the walk on the live range coder. The wire also carries the
-interop **absolute energy convention**: coarse targets are coded
-mean-removed against the staged `eMeans` table in 6 dB base-2
-log-amplitude steps on the reference spectral scale (calibrated
-black-box: the per-band offset between reference-encoder streams and
-this crate's analyzer is flat at `14.0 ± 0.2` log2 across all bands and
-the 5/10/20 ms sizes).
-
-**Black-box reference validation (r408).** Two runtime-gated harnesses
-measure interop against reference binaries run as opaque processes:
-`tests/blackbox_opusdec.rs` muxes this crate's frames into Ogg-Opus and
-decodes them with `opusdec` — the output **level** now lands within
-±1.4 dB of the encoder input at LM 1–3 (it was 40–100 dB off before the
-convention landed; asserted at ±6 dB), while the shape **SNR** still
-measures ≈ −3 dB: the per-band pulse counts diverge from the reference
-allocator's, which is exactly the behavioral chapter's §10 residual gap
-(the bit-exact fine-split constants, skip predicate composition, and
-priority predicate are pinned only by reference bit-exactness and need
-a captured single-frame allocation trace to close). The LM 0 level
-shows a further band-dependent offset the flat bridge does not model
-(open item). `tests/fixture_survey.rs` walks real reference streams
-through the prefix + walk: 51/51 frames of the staged mono fixture walk
-cleanly, with the 440 Hz fixture's energy decoding into band 2 and
-consistent inter-frame prediction.
-
-**Transient (short-block) frames + anti-collapse + finalize, r406.**
-The §4.3 walk now runs past the fine-energy boundary on **both** frame
-kinds: transient frames decode and encode end to end (the §4.3.1
-short-block WOLA placement is *derived* from the \[PRINCEN86\]
-aliasing-cancellation requirement against the §4.3.7 low-overlap long
-window — `short_block_geometry` documents the derivation — so long and
-transient frames alternate freely on one stream), the §4.3.5
-anti-collapse bit is coded/decoded at its Table-56 position with the
-injection implemented as documented in-crate arithmetic over a
-two-frame per-band energy history, and the §4.3.2.2 **finalize**
-backfill spends the leftover raw bits (one extra fine-energy bit per
-band per channel, depth-aware, priorities derived in-crate from the
-shape allocation) on both sides of the wire. The encoder searches the
-PVQ codebook against the inverse-§4.3.4.5-TF-transformed shapes and
-reconstructs through the forward transform, so every codec-loop
-bit-exactness identity holds across mixed long/transient streams at
-every `LM` (transient tonal fidelity: rel ~0.044, corr ~0.9990 at
-`lm=3`/160 B — on par with the long-MDCT loop). Sections below
-describing transient/anti-collapse/finalize as rejected or gap-blocked
-predate r406 where not yet reworded.
-
-**Decoder building blocks, in progress.** The range decoder and the
-full CELT control-symbol decode path (frame-prefix → coarse energy →
-fine energy → time-frequency parameters → spreading → bit allocation)
-are implemented bit-exactly per RFC 6716, along with the PVQ shape
-decoder, spreading rotation, Hadamard TF transforms, band
-denormalization, post-filter, de-emphasis, and the inverse MDCT /
-overlap-add synthesis. The `decode_frame_prefix` driver chains every
-control symbol in RFC 6716 Table 56 order up to the `fine energy`
-symbol; the `LongMdctSynthesis` spine places a decoded residual
-spectrum into the full `120 << lm`-bin MDCT spectrum and runs the
-§4.3.7 inverse MDCT + weighted overlap-add.
-
-**End-to-end PCM (mono, long MDCT).** `decode_celt_frame` now chains
-the whole documented decode pipeline into a single call that turns a
-CELT range-coded frame into time-domain PCM: Table 56 prefix → §4.3.2.2
-fine energy → §4.3.2 per-band Q8 envelope assembly → §4.3.4 residual
-(shape) decode → §4.3.6/§4.3.7 long-MDCT synthesis → §4.3.7.1
-post-filter → §4.3.7.2 de-emphasis. A streaming `CeltDecodeState`
-carries the cross-frame overlap tail, post-filter history,
-de-emphasis memory, and §4.3.2.1 coarse-energy prediction for gapless
-playback. The per-band pulse counts (`band_k`) and fine-bit counts
-(`fine_bits`) are inputs — the same RFC-deferred boundary the residual
-loop already draws — so the driver stays inside fully-specified §4.3
-territory.
-
-**Stereo synthesis (per-channel spectra → interleaved PCM).** The
-§4.3.6 denormalization and the §4.3.7 inverse MDCT + weighted
-overlap-add are per-channel and fully specified by RFC 6716, as is the
-§4.3.2 per-channel energy envelope (`assemble_band_log_energy_q8`
-already accepts channel `0`/`1`). `StereoLongMdctSynthesis` and the
-streaming `StereoCeltDecodeState` / `synthesize_stereo_frame` run that
-per-channel chain for two channels — two independent IMDCT + WOLA spines
-with their own overlap tails, per-channel §4.3.7.1 post-filter history
-plus previous-frame parameters (for the §4.3.7.1 gain-transition
-crossfade), and per-channel §4.3.7.2 de-emphasis memory — and interleave the result
-into one L/R/L/R PCM buffer. They take the two channels' decoded
-denormalized spectra as input, drawing the boundary at the §4.3.4.4
-`itheta` mid/side coupling docs gap (the same input-boundary the mono
-spine draws for `band_k`). `tests/stereo_synthesis.rs` drives the whole
-documented per-channel stereo chain (energy → denormalize → synthesize)
-end-to-end.
-
-**Stereo frame decode (bitstream prefix + coarse energy → interleaved
-PCM).** `StereoCeltDecodeState::decode_stereo_frame` is the stereo
-counterpart of `decode_celt_frame`: it decodes the stereo Table 56
-control prefix and **both channels' §4.3.2.1 coarse energy** from the
-range-coded bitstream (the stereo coarse channel interleave *is*
-specified — `decode_coarse_energy` with `channels = 2`), composes each
-channel's §4.3.2 Q8 envelope (bitstream coarse + caller-supplied fine
-corrections), and runs the per-channel §4.3.6 → §4.3.7 synthesis on the
-two denormalized residual spectra to emit interleaved PCM. The shared
-`CoarseEnergyState` carries both channels' inter-frame coarse-energy
-prediction; `reset()` zeroes it alongside the per-channel overlap /
-de-emphasis / post-filter memory. The per-channel residual spectra and
-the main fine-energy corrections are inputs — the §4.3.4.4 `itheta`
-coupling and the main §4.3.2.2 fine-energy channel interleave are the
-docs-gap boundaries, the same shape the mono path keeps for `band_k`.
-
-Not yet implemented: the reference-exact §4.3.3 reallocation loop that
-produces `band_k` / `fine_bits` (the `interp_bits2pulses` bisection
-with concurrent skip-bit decoding — the in-crate derivation covers the
-documented arithmetic with documented in-crate fine/shape-split and
-skip-floor rules), the §4.3.4.4 split-gain band-split path (the
-quantized split-gain precision/PDF is deferred to the reference), and
-the §4.3.4.4 stereo `itheta` mid/side bitstream coupling (the stereo
-codec uses the uncoupled dual path instead — see below); the stereo
-decoders reject a joint-coded (non-dual) or intensity-coded prefix
-with `Error::NotImplemented` rather than mis-parse it. Since r406,
-transient (short-block) frames and the §4.3.5 anti-collapse pass are
-implemented (see the r406 status above).
-
-**End-to-end mono frame encode (spectrum → bytes → PCM), r382.** The
-encode direction now closes the loop: `encode_celt_frame` chains §4.3.6
-band analysis (per-band log-2 energy + unit shape, the `band_analysis`
-module) → the full Table-56 prefix encode (`encode_frame_prefix`:
-header → **§4.3.2.1 coarse energy** → TF → spread → **§4.3.3 dynalloc
-band boosts** → band-allocation fields, threading the reservation/boost
-budget through the §5.1.6/§4.1.6 `tell_frac` lockstep so every gate
-fires identically on both sides) → §4.3.2.2 fine-energy quantization +
-raw-bit encode → §4.3.4.2 PVQ shape search + encode per band → the
-§5.1.5 **fixed-size frame assembly** (`RangeEncoder::finish_to_size`:
-range symbols from the front, raw bits at the frame end, zero fill
-between). A `decode_celt_frame` pass over the produced bytes
-reconstructs the encoder's residual spectrum **bit-exactly** and emits
-PCM; `encode_celt_frame_auto` → `decode_celt_frame_auto` is a fully
-self-contained codec loop where both sides derive `band_k` from the
-bit-identical prefix (no allocation exchanged out of band), proven
-across multi-frame streams at every `LM`. The r382 encode primitives
-underneath: `ec_laplace_encode` (the §4.3.2.1 Laplace symbol encode —
-the mirror-image interval construction documented in the clean-room
-narrative §5), `encode_coarse_energy` (nearest-6 dB-step
-prediction-error quantization through the same budget-keyed dispatch
-the decoder runs), `encode_band_boosts` (the gate-respecting §4.3.3
-dynalloc inverse), and `quantize_fine_energy_f32` (f32-residual fine
-quantization). Earlier rounds supplied the §4.3.4.2 PVQ index
-encode/search (`encode_pulses_to_index`, `pvq_search`, `encode_shape`),
-the §5.1 range encoder, and the per-symbol control-field encoders
-(`encode_prefix`, `encode_tf_parameters`, `encode_spread`,
-`encode_band_allocation`, `encode_fine_energy`).
-`tests/frame_encode_decode.rs` and `tests/control_encode_roundtrip.rs`
-pin the full-loop and per-symbol round-trips. The frame encoder pins
-spread = `None` and all-zero `tf_changes` (legal encoder choices; a
-non-identity spread/TF needs the inverse §4.3.4.3/§4.3.4.5 orthonormal
-transforms before the PVQ search — fully specified, not yet
-implemented).
-
-**PCM→MDCT analysis front end + PCM codec loop, r385.** The encoder
-now consumes real time-domain PCM: `encode_celt_frame_pcm_auto` →
-`decode_celt_frame_auto` is a fully self-contained **PCM → bytes →
-PCM** mono codec loop (one frame — `120 << lm` samples — of
-algorithmic delay). Each encode front-end stage is the documented
-inverse of its decode back-end mirror, pinned by an *unquantized*
-identity test at every `LM`:
-
-* `Preemphasis` — the §4.3.7.2 FIR `A(z) = 1 - alpha_p*z^-1`, the
-  exact inverse of the `Deemphasis` pole (pre→de and de→pre are both
-  the identity across frame splits with state carry).
-* `MdctAnalysis` — the streaming windowed forward MDCT, mirror of
-  `MdctSynthesis`: `[history | input]` sliding block at hop `N`, the
-  same power-complementary §4.3.7 window, one-frame-delay perfect
-  reconstruction through the synthesis side ([PRINCEN86] TDAC).
-* `LongMdctAnalysis` + `extract_coded_spectrum` (module `analysis`) —
-  the fixed-`lm` spine, mirror of `LongMdctSynthesis`:
-  `120 << lm`-sample frames → coded-window spectrum in the
-  band-contiguous residual layout (`extract_coded_spectrum` is the
-  exact inverse of `place_residual_spectrum`; the `20 << lm` bins
-  above the Table-55 coding top are dropped — the bins the decoder
-  reconstructs as zero).
-* `CeltEncodeState` + `encode_celt_frame_pcm[_auto]` (module
-  `pcm_encode`) — the top-level PCM driver, the encode-side mirror of
-  `CeltDecodeState`: carries the pre-emphasis FIR tap, the MDCT
-  analysis history, and the §4.3.2.1 coarse prediction across frames;
-  any error leaves the streaming state untouched. Since r393 a
-  signalled post-filter is honoured (the §5.3.1 pitch pre-filter is
-  applied after pre-emphasis; see below).
-* `encoder_decisions::choose_band_boosts` — the §5.3.4.1 band-boost
-  rule (`D_j = 2E_j - E_{j-1} - E_{j+1}` vs `(t1, t2) = (2, 4)` for
-  `LM >= 1` / `(3, 5)` below, one §4.3.3 dynalloc quantum per boost),
-  applied automatically by `encode_celt_frame_auto`
-  (`encode_celt_frame_auto_boosted` overrides it). The §5.3.4.2 trim
-  deviation stays a docs gap (direction + bound given, no
-  tilt→deviation map).
-* `encoder_decisions::choose_intra_mode` — the §5.3.3 two-pass
-  intra/inter coarse-mode selection: encode the coarse energy both
-  ways on scratch states (each pass paying its own `{7,1}/8` intra
-  flag) and pick the cheaper `tell_frac`, ties to inter.
-* **Silence frames** — a silence header encodes the full Table-56
-  prefix (coarse prediction stays in lockstep across the run) but no
-  shape symbols; the decoder's silence branch synthesizes the zero
-  spectrum and plays out its overlap tail toward true silence.
-  Whether the reference wire format truncates the walk after the
-  silence bit is not pinned by RFC prose (interop caveat; the in-crate
-  loop is self-consistent).
-* `StereoPcmAnalysis` — the per-channel stereo front end (independent
-  pre-emphasis + analysis memory per channel), emitting the two
-  coded-window spectra `synthesize_stereo_frame` consumes — the same
-  §4.3.4.4 `itheta` boundary the stereo decode draws, approached from
-  the encode side.
-
-`tests/pcm_codec_loop.rs` pins the story end-to-end: the unquantized
-front↔back identity at every `LM`, decoder PCM ≡ synthesis of the
-encoder's bit-exact reconstruction, waveform fidelity on a tonal
-signal (steady-state relative L2 error < 0.8, correlation > 0.6 with
-no fine bits spent), and spectral closure (re-analyzing the decoded
-PCM recovers the encoder's reconstructed spectra one frame delayed).
-Remaining encode-side gap: the codec-registration entry point; the
-§5.3.1 pitch pre-filter landed in r393 (below) and the transient
-(short-block) analysis landed in r406 (the §4.3.1 geometry is derived,
-not deferred — see the r406 status).
-
-**Stereo PCM codec loop (dual/uncoupled path), r389.** The stereo
-dimension now closes the same loop the mono side closed in r385:
-`encode_stereo_celt_frame_pcm_auto` →
-`StereoCeltDecodeState::decode_stereo_frame_auto` is a fully
-self-contained **interleaved stereo PCM → bytes → PCM** codec, with
-no out-of-band data. The wire is the RFC 6716 Table-56 stereo layout
-over the *uncoupled* path ("dual stereo: encodes the left and right
-channels separately"):
-
-* the stereo prefix (both channels' §4.3.2.1 coarse energy — the
-  within-band channel interleave the RFC *does* specify — plus the
-  `dual = 1` and intensity-"never applies" selectors; a frame whose
-  §4.3.3 budget gates cannot carry them is rejected with
-  `NotImplemented` rather than mis-encoded as the joint layout,
-  which is the §4.3.4.4 docs gap);
-* §4.3.2.2 fine energy walked band-major, channel 0 then channel 1
-  within each band — an in-crate wire convention mirroring the
-  specified coarse interleave (the RFC does not pin the main
-  fine-energy channel order; interop caveat, like the silence-frame
-  caveat);
-* the dual residual (`decode_stereo_residual_bands` /
-  `encode_stereo_celt_frame`): one PVQ index per channel per band at
-  a **shared** `K`, shared spread/TF (Table 56 codes one of each per
-  frame), each channel denormalized against its own §4.3.2 envelope;
-* the shared `K` derived on both sides from the bit-identical prefix
-  (`derive_band_pulses_dual`: the §4.3.3 combined column search with
-  the stereo scaling, each band's allocation split evenly per
-  channel, one §4.3.4.1 bits-to-pulses pass).
-
-`StereoCeltEncodeState` carries the per-channel front end
-(`StereoPcmAnalysis`) plus the shared two-channel coarse prediction;
-`tests/stereo_pcm_codec_loop.rs` pins the loop at every `LM` (coarse
-lockstep, decoded PCM ≡ synthesis of the encoder's bit-exact
-per-channel reconstructions), per-channel waveform fidelity on
-distinct L/R tones (relative L2 < 0.8, correlation > 0.6, channels
-unswapped), a stereo silence run decaying in lockstep, byte
-determinism + reset, and the explicit-allocation
-(`decode_stereo_frame_coded`) round trip.
-
-**Allocation-seam correctness fixes, r389.** Driving two PVQ indices
-per band exposed two latent mono-era defects, both fixed:
-
-* the §4.3.4.1 band loops updated the balance accumulator with the
-  *adjusted* target, double-counting the granted share (surplus never
-  depleted; aggregate spend could exceed the §4.3.3 budget). They now
-  update with the raw target per `BalanceAccumulator::update`'s
-  documented contract, restoring `sum(bits_used) <= sum(raw_target)`
-  (new conservation property test);
-* the pulse derivations cap the arithmetic §4.3.3 budget by the
-  re-measured wire remainder
-  (`FramePrefix::{tell_frac_after_prefix, frame_bytes}`; the
-  arithmetic budget never pays for the boost/trim/skip/intensity/dual
-  symbols themselves). r389 also had to swap the staged `cache_bits50`
-  curve for the §4.1.5 worst-case estimator because the then-current
-  trace's `band*5 + LM` mapping mispriced symbols (a 2-bin band's
-  `K = 40` index at 7 eighth-bits vs ~59 measured) — the docs question
-  filed then was resolved by the corrected **LM-major** trace (#184),
-  and r393 restored the cache as the cost model (see below).
-
-**§5.3 encoder decisions, r389.** Alongside the r385 §5.3.4.1 boost
-rule and §5.3.3 intra/inter selection, the crate now carries:
-
-* `choose_alloc_trim` (§5.3.4.2), wired through the mono and stereo
-  auto encoders: default 5, ±2 from the least-squares spectral tilt
-  (low-heavy raises, high-heavy lowers; `TRIM_TILT_GAIN = 4`,
-  saturating at 3 dB/band), and up to −4 from the normalized
-  first-8-bands inter-channel correlation (`round(4·r²)`) on stereo
-  frames. The RFC pins the envelope (default, directions, bounds) but
-  not the maps — the maps are documented in-crate encoder freedom,
-  and the coded trim keeps the decoder in lockstep by construction.
-* `choose_mid_side_stereo` (§5.3.5): the literal
-  `L1_ms/(bins+E) < L1_lr/bins` verdict over the first 13 bands
-  (`E = 13` for `LM > 1`, else 5; orthonormal `(l±r)/√2` rotation
-  documented as the in-crate scaling reading). Decision-only: the
-  encoders can honour just the dual verdict until the §4.3.4.4
-  `itheta` gap closes (§5.3.5 sanctions either choice on any frame).
-* `intensity_start_band` (§5.3.5 Table 66): the bitrate→first-
-  intensity-band map with the 80-bit/frame coarse subtraction; the
-  RFC's printed "84-84" row is read as the 68–84 gap it leaves
-  (apparent erratum). Decision-only for the same reason.
-
-**§5.3.1 pitch pre-filter + pitch search, r393.**
-`apply_pitch_prefilter_transition_f32` is the exact FIR inverse of the
-decoder's §4.3.7.1 post-filter transition ("applied in such a way as
-to be the inverse of the decoder's post-filter"): the post-filter
-recursion `y = x + L[y_past]` inverts to `x = in - L[in_past]` over
-the pristine input history, with the same squared-window parameter
-crossfade — pinned by a multi-frame identity test. `pitch_search` /
-`choose_post_filter_params` (module `pitch`) implement the two §5.3.1
-criteria the RFC states — continuity and avoidance of pitch multiples
-— as a normalized-autocorrelation scan with a sub-period demotion
-pass and a previous-period preference window (the algorithm and
-thresholds are documented in-crate encoder freedom; §5.3 grants it).
-`encode_celt_frame_pcm_auto` honours a signalled post-filter
-(`PostFilter::from_period` derives the wire octave), closing the
-§5.3.1/§4.3.7.1 loop end to end on the mono path; the stereo PCM
-drivers still reject one (per-channel front-end wiring, not a docs
-gap). Two latent decode-side §4.3.7.1 history defects fixed along the
-way: the cross-frame history was stored in forward order (the
-transition contract is most-recent-first) at one-frame depth (too
-short for legal periods up to 1022 at small LMs) — now
-most-recent-first at `POST_FILTER_PERIOD_MAX + 2` on both decode
-paths.
-
-**Corrected pulse cache + allocation pricing to exhaustion, r393.**
-The docs trace correction (#184) established the `cache_index50` /
-`cache_bits50` pair is indexed **LM-major** — `(LM+1)*21 + band`
-across rows `LM ∈ {-1..3}` — and r393 rebuilt the whole pricing stack
-on it:
-
-* `pulse_cache` under the corrected mapping: every coded `(band, LM)`
-  tuple resolves to a single-`N` cost curve (the 8 sentinels are
-  exactly bands 0–7 of the `LM = -1` half-block row), and the trace
-  §2.3 `qbits[K] + 1` retrieval convention is validated against the
-  crate's own §4.3.4.2 `V(N, K)` recursion: retrieved cost
-  `== ceil(8*log2 V(N, K))` for every `K <= 16` (single exception
-  `N=11, K=9`, one eighth-bit high) and `>=` for all `K` — a tight,
-  never-under-pricing upper bound (the high-`K` surplus is the
-  §4.3.4.4 splitting-aware accounting). `V(2,40)` regression pinned.
-* `cached_bits_to_pulses_extended` / `cost_exact_8th`: exact
-  monolithic pricing past the run's `maxK` (floored for monotonicity)
-  for the in-crate single-block wire, so high-rate frames keep the
-  pulse depth the estimator wire had.
-* The derivations (`derive_band_pulses[_dual]`, all four auto codec
-  paths) price on the cache with a **provably fitting budget**: the
-  measured §5.1.4 `enc_uint` cost exceeds `ceil(8*log2 ft)` by at most
-  one eighth-bit, so one eighth-bit per coded PVQ symbol is
-  provisioned. Byte-budget sweeps (mono 20–200 B, stereo 32–200 B,
-  every `LM`) pin exact-size encode + decode. Two latent
-  `RangeEncoder::finish_to_size` defects the sweeps exposed are fixed
-  (§5.1.5 merge-guard panic; a wasted trailing zero-`rem` padding
-  byte per tight frame).
-* **§4.3.3 hard-minimum skip floor**
-  (`bits_to_pulses_band_loop_cached_thresh`): a band whose adjusted
-  target falls below `thresh[band] = max((24*N)/16, 8*channels)` is
-  skipped and its raw target credited forward through the §4.3.4.1
-  balance — the RFC's own redistribution instrument; the skip-bit
-  *wire* symbols stay inside the deferred reallocation gap.
-* **In-crate fine/shape split** (`derive_band_allocation[_dual]` →
-  `DerivedAllocation`): `fine = min(MAX_FINE_BITS,
-  bits/(8*channels*(N+1)))` split off each band's combined allocation
-  before bits-to-pulses (skipped bands reclaim their fine bits), spent
-  as real §4.3.2.2 fine-energy refinement by all four auto paths —
-  both sides derive the identical split from the bit-identical
-  prefix. The coarse-only 6 dB envelope had been the loop's dominant
-  error: tonal codec-loop steady-state relative L2 error drops
-  **3–16x** (lm=1/40 B: 0.107 → 0.0065; lm=3/160 B: 0.124 → 0.039)
-  with correlation ≈ 1.000, and the fidelity assertions are tightened
-  to lock it in.
-
-**Range encoder (RFC 6716 §5.1).** `RangeEncoder` is the bit-packer for
-the CELT/SILK encode path, the exact inverse of `RangeDecoder`. It keeps
-the §5.1 four-tuple state `(val, rng, rem, ext)` and exposes `encode`
-(§5.1.1 generic `(fl, fh, ft)` symbol), `encode_bin` (§5.1.2.1),
-`enc_bit_logp` (§5.1.2.2), `enc_icdf` (§5.1.2.3, reusing the decoder's
-icdf tables), `enc_bits` (§5.1.3 raw bits from the end), `enc_uint`
-(§5.1.4, with the `ftb > 8` range-coded-top-8-bits + raw-remainder
-split), and `finish` (§5.1.5 `ec_enc_done`: the maximal-trailing-zeros
-`end` selection, carry flush, and range/raw byte merge). Renormalization
-(§5.1.1.1) drives the §5.1.1.2 carry-propagation / output-buffering
-scheme (the deferred `rem`/`ext` byte accounting). `tell()` / `tell_frac()`
-(§5.1.6) report the **same** budget the decoder reports after the same
-symbols — the §5.1 / §4.1.6 lockstep hook that CELT bit allocation
-depends on. Verified by full round-trips through `RangeDecoder`
-(`tests/range_codec_roundtrip.rs`): every symbol type, the large-`ft`
-split path, mixed interleaved streams, and 1000-op deterministic random
-streams recover bit-exactly with matching `rng`/`tell`/`tell_frac` at
-every step.
-
-**Documented allocation→pulses seam.** `tests/allocation_to_pulses.rs`
-composes the fully-specified §4.3.3 modules on *both sides* of the one
-remaining allocation docs gap (`interp_bits2pulses`: the reallocation +
-concurrent skip + fine/shape split): `decode_frame_prefix` →
-`find_combined_alloc` (the §4.3.3 column search "nearest but not
-exceeding … subject to tilt, boosts, [and] band maximums") →
-`bits_to_pulses_band_loop_cached` (§4.3.4.1 bit-exact `cache_bits50`
-pulse counts). For pure-CELT mono the derived `band_k` drives the full
-`decode_celt_frame` pipeline to finite PCM, deterministically, with the
-total pulse count monotone in the frame budget — demonstrating the
-`band_k` the residual loop takes as input *can* be produced from the
-documented modules wherever §4.3.3 is not deferred. The fine/shape
-split and the hard-minimum skip now carry documented in-crate rules
-(r393, below); the reference-exact `interp_bits2pulses` reallocation
-walk (its interpolation-fraction bisection, concurrent skip-bit
-decoding, and priority determination) remains the genuine docs gap.
-
-**Caller-input-free mono decode (`decode_celt_frame_auto`).** The
-documented allocation→pulses seam is now a public API, not just a test
-composition. `derive_band_pulses(prefix, lm, channels, stereo)` runs the
-§4.3.3 column search over a decoded `FramePrefix`'s post-boost budget,
-then the §4.3.4.1 bits-to-pulses loop (threading the balance accumulator
-across the coded-band window in spec order), and returns the per-band
-pulse counts — clamping each `K` to the largest value whose PVQ codebook
-`V(N, K)` stays representable in the single-block decode (a larger `K` is
-the deferred §4.3.4.4 split regime). `decode_celt_frame_auto(state,
-frame_bytes, start, end)` chains the whole thing: decode the prefix,
-derive the pulse counts and fine-energy bits (r393's
-`derive_band_allocation`), and run `decode_celt_frame` — a mono CELT
-frame (long or, since r406, transient) → PCM with **no
-caller-supplied `band_k` / `fine_bits`**. It is the deepest
-caller-input-free decode the wall permits: every step is RFC-specified
-except the deferred fine/shape split, carried by the documented
-in-crate rule. An out-of-range window or a band that hits the
-§4.3.4.4 split gap (or a decoded `tf_change` its short-block geometry
-cannot carry) is surfaced as `Error::NotImplemented` /
-`InvalidParameter`, never mis-decoded. The
-derivation is deterministic (identical bytes → identical pulse counts →
-identical PCM) and matches the manual `decode_frame_prefix` →
-`derive_band_pulses` → `decode_celt_frame` compose exactly.
+`fuzz/` carries five coverage-guided libfuzzer targets (see
+`fuzz/Cargo.toml` for the inventory): raw-frame **decode** across
+the band windows on a stateful decoder, **PLC loss sequences**
+through every concealment regime, a contract-valid **encode ->
+decode round trip** (CBR/VBR/constrained-VBR x band window x
+reduced-rate I/O — `expect` fires only on a real defect), Appendix-A
+**custom-mode construction** over arbitrary geometry, and a
+**full-rate <-> reduced-rate decode differential** (verdict lockstep
++ factor-exact output lengths, concealment included). The corpora
+seed from the staged fixture streams; the daily `Fuzz` workflow
+splits a 30-minute budget across the targets, and each target ran
+bounded (>= 20 min, rss-limited) at standup. First campaign finding,
+fixed with a pinned regression (`tests/hostile_streams.rs`): the
+float decode path was missing the RFC 8251 sec 8 "Cap on Band
+Energy", so a hostile coarse-energy walk overflowed to inf and
+poisoned the PCM and decoder state with NaN.
 
 The module-by-module API surface is documented below.
 
@@ -1715,10 +1128,10 @@ criterion, LCG generator, and injection arithmetic are documented
 in-crate decoder decisions (module `anti_collapse`). Both decoder
 states carry the two-frame per-band energy history and the seed.
 
-The codec-registration entry points with the runtime still return
-`Error::NotImplemented`; the mono MDCT-domain frame encoder is
-`encode_celt_frame` / `encode_celt_frame_auto` (see the encode status
-section above).
+The runtime registration for the reference codec lives in the
+`codec` module (see Status above); within this legacy chain the mono
+MDCT-domain frame encoder is `encode_celt_frame` /
+`encode_celt_frame_auto`.
 
 ## Clean-room provenance
 
