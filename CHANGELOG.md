@@ -29,6 +29,19 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-454 — decode hot spot: cached IMDCT cosine basis
+  (bit-identical, ~5.8x)**: the direct-form inverse MDCT re-derived
+  its `f64` cosine factors on every frame — the trig evaluation
+  dominated the whole decoder. `mdct::imdct_cached_f32` now shares a
+  lazily-built process-wide basis for the standard-mode sizes
+  (bounded allowlist; ~14.7 MB at LM 3, built once — custom-mode
+  geometries keep the direct loop), preserving the exact factors and
+  accumulation order, so the output is bit-identical
+  (`tests/imdct_basis.rs` pins it bitwise). Measured
+  (`benches/decode.rs`): 20 ms mono 168 K -> 971 K samples/s
+  (~3.5x -> ~20x realtime), stereo 86 K -> 499 K/s, 2.5 ms mono
+  1.34 M -> 8.08 M/s, decode/conceal walk 331 K -> 1.89 M/s.
+
 * **Round-454 — decode benchmark baseline** (`benches/decode.rs`,
   criterion): decode throughput on the crate's own CBR streams
   (20 ms mono/stereo, 2.5 ms mono) plus an alternating

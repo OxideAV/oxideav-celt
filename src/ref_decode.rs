@@ -26,7 +26,7 @@ use crate::band_quant::{celt_lcg_rand, quant_all_bands, renormalise_vector, Quan
 use crate::bit_allocation::decode_alloc_trim;
 use crate::coarse_energy::{decode_coarse_energy, CoarseEnergyState};
 use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
-use crate::mdct::{build_low_overlap_window_f32, imdct_naive_f32};
+use crate::mdct::{build_low_overlap_window_f32, imdct_cached_f32};
 use crate::range_decoder::RangeDecoder;
 use crate::spread::Spread;
 use crate::tf_change::tf_adjustment;
@@ -771,7 +771,7 @@ impl CeltRefDecoder {
             if !is_transient {
                 let p = (frame - overlap) / 2;
                 let mut u = vec![0f32; 2 * frame];
-                if !imdct_naive_f32(&freq, &mut u) {
+                if !imdct_cached_f32(&freq, &mut u) {
                     return Err(Error::InvalidParameter);
                 }
                 for (j, o) in xbuf.iter_mut().enumerate() {
@@ -790,7 +790,7 @@ impl CeltRefDecoder {
                     for (j, s) in block_spec.iter_mut().enumerate() {
                         *s = freq[b + j * blocks];
                     }
-                    if !imdct_naive_f32(&block_spec, &mut u) {
+                    if !imdct_cached_f32(&block_spec, &mut u) {
                         return Err(Error::InvalidParameter);
                     }
                     for j in 0..(short_size + overlap) {
@@ -1011,7 +1011,7 @@ impl CeltRefDecoder {
                 // reference noise path does not roll the history).
                 let p = (frame - overlap) / 2;
                 let mut u = vec![0f32; 2 * frame];
-                if !imdct_naive_f32(&freq, &mut u) {
+                if !imdct_cached_f32(&freq, &mut u) {
                     return Err(Error::InvalidParameter);
                 }
                 let mut xbuf = vec![0f32; frame + overlap];

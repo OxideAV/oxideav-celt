@@ -152,6 +152,77 @@ pub fn imdct_naive_f32(spectrum: &[f32], out: &mut [f32]) -> bool {
     true
 }
 
+/// Process-wide cosine-basis cache for [`imdct_cached_f32`]: one
+/// table per **standard-mode** transform size (the bounded
+/// [`IMDCT_CACHED_SIZES`] set), built lazily on first use and shared
+/// by every decoder. Entry `[t * n + k]` holds exactly the value
+/// `cos((pi/N)(t + 1/2 + N/2)(k + 1/2))` that [`imdct_naive_f32`]
+/// evaluates inline, so the cached transform is **bit-identical**:
+/// same `f64` factors, same accumulation order
+/// (`tests/imdct_basis.rs` pins it).
+static IMDCT_BASES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<[f64]>>>,
+> = std::sync::OnceLock::new();
+
+/// Transform sizes the basis cache may hold — the standard 48 kHz
+/// mode's long sizes (`120 << lm`) which double as its short-block
+/// size (120). The allowlist keeps the cache bounded (custom-mode
+/// geometries fall back to the direct loop): fully populated it
+/// costs `(120*240 + 240*480 + 480*960 + 960*1920) * 8` bytes
+/// (~19.6 MB), and a single-LM stream builds only its own table
+/// (~14.7 MB at LM 3, 230 KB for 2.5 ms frames / short blocks).
+const IMDCT_CACHED_SIZES: [usize; 4] = [120, 240, 480, 960];
+
+/// Fetch (building on first use) the shared basis for size `n`;
+/// `None` for a size outside the allowlist.
+fn imdct_basis(n: usize) -> Option<std::sync::Arc<[f64]>> {
+    if !IMDCT_CACHED_SIZES.contains(&n) {
+        return None;
+    }
+    let map = IMDCT_BASES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut map = map.lock().ok()?;
+    Some(
+        map.entry(n)
+            .or_insert_with(|| {
+                let nf = n as f64;
+                let mut tab = Vec::with_capacity(2 * n * n);
+                for t in 0..2 * n {
+                    let phase_n = t as f64 + 0.5 + nf / 2.0;
+                    for k in 0..n {
+                        tab.push((std::f64::consts::PI / nf * phase_n * (k as f64 + 0.5)).cos());
+                    }
+                }
+                tab.into()
+            })
+            .clone(),
+    )
+}
+
+/// [`imdct_naive_f32`] with the cosine basis cached for the
+/// standard-mode sizes — **bit-identical** by construction (the
+/// cached factors are the very values the direct form computes, and
+/// the `f64` accumulation order is unchanged); any other geometry
+/// falls back to the direct form. This is the r454 decode hot-spot
+/// fix: the trig evaluation dominated the whole decoder
+/// (`benches/decode.rs`), and every frame re-derived the same basis.
+pub fn imdct_cached_f32(spectrum: &[f32], out: &mut [f32]) -> bool {
+    let n = spectrum.len();
+    if n == 0 || out.len() != 2 * n {
+        return false;
+    }
+    let Some(basis) = imdct_basis(n) else {
+        return imdct_naive_f32(spectrum, out);
+    };
+    for (slot, row) in out.iter_mut().zip(basis.chunks_exact(n)) {
+        let mut acc = 0.0f64;
+        for (&x, &c) in spectrum.iter().zip(row) {
+            acc += x as f64 * c;
+        }
+        *slot = (0.5 * acc) as f32;
+    }
+    true
+}
+
 /// Forward MDCT companion to [`imdct_naive_f32`], direct form.
 ///
 /// `time` holds a `2*N`-sample (windowed) block; `out` must hold
