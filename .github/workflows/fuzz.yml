@@ -1,0 +1,21 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harnesses under fuzz/. Splits the
+# 30-minute total budget across the auto-discovered targets (see
+# fuzz/Cargo.toml for the target inventory: the raw-frame decode
+# path across the band windows, packet-loss-concealment sequences,
+# the contract-valid encode→decode round trip, Appendix-A
+# custom-mode construction, and the full-rate ↔ reduced-rate decode
+# differential).
+
+on:
+  schedule:
+    - cron: "41 6 * * *"   # daily 06:41 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

@@ -1,0 +1,86 @@
+[package]
+name = "oxideav-celt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Coverage-guided libfuzzer harnesses for the clean-room CELT layer.
+# The in-tree test suite pins reference-lockstep behaviour on staged
+# and generated streams; these targets add coverage-guided exploration
+# of the hostile-input surface and the encoder's contract envelope:
+#
+# - `decode_frame` — raw CELT frame → PCM on a stateful
+#   `CeltRefDecoder` across the standard band windows (fullband, the
+#   §3.1 NB/WB/SWB bandwidths, the Hybrid `start = 17` layer), fed
+#   multiple consecutive frames so cross-frame state (coarse-energy
+#   prediction, overlap, post-filter history) is exercised.
+# - `plc_sequence` — loss/decode interleavings through `decode_lost`
+#   (the §4.3 packet-loss concealment): the pitch-locked LPC walk for
+#   short runs, the comfort-noise fallback for long runs and Hybrid
+#   streams, downsampled output included.
+# - `encode_roundtrip` — structure-aware, contract-valid encoder
+#   configs (LM × channels × band window × reduced input rate ×
+#   CBR/VBR/constrained-VBR) over arbitrary PCM: every emitted frame
+#   MUST be exactly the requested size (CBR) and MUST decode cleanly
+#   through the crate's own decoder — `expect` fires only on a real
+#   encoder (or decoder) defect.
+# - `custom_mode` — Appendix-A custom-mode construction over
+#   arbitrary `(rate, frame_size)` pairs: illegal geometry must be
+#   rejected without panicking, and every accepted mode must carry a
+#   one-frame encode→decode round trip.
+# - `downsample_differential` — the same frame bytes through the
+#   48 kHz decoder and the reduced-rate decoder: Ok/Err verdicts in
+#   lockstep (the two paths parse identical symbols) and output
+#   lengths related by exactly the resampling factor, PLC included.
+#
+# A crash in any target is a structural bug in the codec, never an
+# acceptable "malformed input" outcome: every byte sequence must
+# produce Ok(..) or Err(..) without panicking, overflowing, or
+# indexing out of bounds.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-celt]
+path = ".."
+
+# Prevent the cargo-fuzz crate from being pulled into the umbrella
+# workspace; libfuzzer-sys needs nightly + has its own deps that
+# don't belong in the umbrella resolve graph.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_frame"
+path = "fuzz_targets/decode_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "plc_sequence"
+path = "fuzz_targets/plc_sequence.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "custom_mode"
+path = "fuzz_targets/custom_mode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "downsample_differential"
+path = "fuzz_targets/downsample_differential.rs"
+test = false
+doc = false
