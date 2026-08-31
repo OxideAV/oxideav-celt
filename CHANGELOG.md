@@ -29,6 +29,12 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-454 — decode benchmark baseline** (`benches/decode.rs`,
+  criterion): decode throughput on the crate's own CBR streams
+  (20 ms mono/stereo, 2.5 ms mono) plus an alternating
+  decode/conceal walk — the A/B baseline for future decoder speed
+  work.
+
 * **Round-454 — cargo-fuzz harness** (`fuzz/`, daily `Fuzz`
   workflow): five coverage-guided targets — raw-frame decode across
   the band windows (fullband / NB / WB / SWB / Hybrid), packet-loss

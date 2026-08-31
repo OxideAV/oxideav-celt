@@ -15,3 +15,17 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Round 454 (depth-mode benchmarks): Criterion drives the `decode`
+# bench harness — a decode-throughput baseline (CBR streams the
+# crate's own encoder emits + the concealment walk) for future
+# decoder speed work to A/B against. Pinned to the same 0.5 line the
+# other OxideAV crates with benches use.
+criterion = "0.5"
+
+# Criterion needs `harness = false` so its own main runs. Run with:
+#     cargo bench --bench decode
+[[bench]]
+name = "decode"
+harness = false
