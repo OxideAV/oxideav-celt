@@ -322,6 +322,15 @@ pub fn resampling_factor(rate: u32) -> Option<usize> {
     }
 }
 
+/// RFC 8251 (Opus update) sec 8 "Cap on Band Energy": on extreme
+/// bitstreams the log-domain band energy can exceed what a
+/// single-precision float represents once converted to the linear
+/// scale, later producing NaNs; the update caps the log-domain value
+/// at 32.0 (base-2 log steps) before the exp2 conversion. This is the
+/// float-path counterpart of `denormalization::MAX_LOG_ENERGY_Q8`
+/// (fuzz regression, r454: `tests/hostile_streams.rs`).
+const MAX_BAND_LOG_ENERGY: f32 = 32.0;
+
 impl CeltRefDecoder {
     /// Build a decoder for frame-size shift `lm` (`0..=3`) and 1 or 2
     /// channels.
@@ -697,14 +706,15 @@ impl CeltRefDecoder {
                 );
             }
 
-            // log2Amp: the absolute amplitude scale (eMeans restored).
+            // log2Amp: the absolute amplitude scale (eMeans restored),
+            // under the RFC 8251 sec 8 cap on band energy.
             for (be, ce) in band_e
                 .iter_mut()
                 .zip(self.coarse.energy.iter())
                 .take(channels)
             {
                 for i in start..end {
-                    be[i] = (ce[i] + E_MEANS[i]).exp2();
+                    be[i] = (ce[i] + E_MEANS[i]).min(MAX_BAND_LOG_ENERGY).exp2();
                 }
             }
         } else {
@@ -946,7 +956,7 @@ impl CeltRefDecoder {
                     .take(channels)
                 {
                     for i in start..end.min(nb) {
-                        be[i] = (bg[i] + E_MEANS[i]).exp2();
+                        be[i] = (bg[i] + E_MEANS[i]).min(MAX_BAND_LOG_ENERGY).exp2();
                     }
                 }
             } else {
@@ -960,7 +970,7 @@ impl CeltRefDecoder {
                 {
                     for i in start..end.min(nb) {
                         ce[i] -= decay;
-                        be[i] = (ce[i] + E_MEANS[i]).exp2();
+                        be[i] = (ce[i] + E_MEANS[i]).min(MAX_BAND_LOG_ENERGY).exp2();
                     }
                 }
             }

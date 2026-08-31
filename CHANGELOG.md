@@ -6,6 +6,16 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Fixed
 
+* **Round-454 — RFC 8251 sec 8 "Cap on Band Energy" on the float
+  decode path (fuzz finding)**: `ref_decode` applied no cap on the
+  log-domain band energy, so a hostile coarse-energy walk overflowed
+  the linear conversion to inf and the synthesis emitted NaN (0 x
+  inf), poisoning the decoder state for every later frame (the Q8
+  path in `denormalization` already carried the cap). All three
+  exp2 sites — frame decode and both concealment arms — now clamp
+  the log-domain value at 32.0 base-2 steps; the minimized fuzz
+  artifact is pinned in `tests/hostile_streams.rs`.
+
 * **Round-442 — §5.3.1 pitch search**: the sub-period demotion now
   walks every legal divisor (2..=16, was 2..=4) so a raw correlation
   argmax many octaves up demotes to the fundamental, and the reported
@@ -18,6 +28,15 @@ All notable changes to `oxideav-celt` are recorded here.
   freedom; the 48 kHz oracle battery re-measures green.
 
 ### Added
+
+* **Round-454 — cargo-fuzz harness** (`fuzz/`, daily `Fuzz`
+  workflow): five coverage-guided targets — raw-frame decode across
+  the band windows (fullband / NB / WB / SWB / Hybrid), packet-loss
+  concealment sequences, a contract-valid encode -> decode round
+  trip (CBR/VBR/constrained-VBR x band window x reduced-rate I/O),
+  Appendix-A custom-mode construction over arbitrary geometry, and
+  a full-rate <-> reduced-rate decode differential (verdict
+  lockstep + factor-exact lengths).
 
 * **Round-451 — end-band configurations (the §3.1 CELT-mode
   bandwidths)**: both drivers now take an end band
