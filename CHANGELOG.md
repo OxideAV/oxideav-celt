@@ -4,6 +4,34 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/OxideAV/oxideav-celt/compare/v0.1.11...v0.1.12) - 2026-08-31
+
+### Other
+
+- rewrite the status prose — current-state README + crate docs, Fuzzing section
+- cache the standard-mode IMDCT cosine basis — bit-identical, ~5.8x throughput
+- criterion decode-throughput baseline (depth-mode tail)
+- RFC 8251 sec 8 cap on band energy — hostile streams stay NaN-free (fuzz finding)
+- stand up the cargo-fuzz harness — five coverage-guided targets + daily workflow
+- r451 status — reduced-rate I/O, CELT-mode bandwidths, loss concealment
+- end-band configurations: the RFC 6716 CELT-mode bandwidths on both sides
+- empty packets conceal through decode_lost
+- packet-loss concealment — the reference celt_decode_lost walk
+- clippy 1.98: needless_late_init + manual_slice_fill sweep
+- reduced-rate oracle A/B — decode lockstep 108 dB, encode parity within 0.1 dB
+- resample option — standard-mode reduced-rate PCM I/O through both factories
+- RFC 6716 reduced input rates (24/16/12/8 kHz into the standard mode)
+- RFC 6716 downsampled output rates (24/16/12/8 kHz from the standard mode)
+- re-measured self round-trip SNR range after the pitch fix
+- README/CHANGELOG — pitch fix + cvbr byte-parity in the r442 record
+- pitch search — demote high-order multiples; amplitude-aware comb gain
+- README + CHANGELOG — r442 custom modes: the last 'lacks' closes
+- non-48 kHz sample rates through the codec factories
+- custom-mode black-box oracle A/B — symbol-exact interop at 8-96 kHz
+- custom-mode encode + decode — non-48 kHz operating points end to end
+- thread the mode through the exact allocation + band walk; MAX_BANDS state
+- custom-mode construction — full mode geometry from (rate, frame size)
+
 ### Fixed
 
 * **Round-454 — RFC 8251 sec 8 "Cap on Band Energy" on the float
