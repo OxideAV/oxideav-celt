@@ -370,6 +370,34 @@ fn detect_transient(chans: &[Vec<f32>], frame: usize, overlap: usize, lm: u32) -
     false
 }
 
+/// One candidate for the measured-cost election: the boost vector to
+/// request and the deltas applied to the analysed trim / intensity /
+/// dual-stereo decisions.
+#[derive(Clone, Copy)]
+struct TailCandidate<'a> {
+    want_boost: &'a [i32],
+    trim_delta: i32,
+    intensity_delta: i32,
+    flip_dual: bool,
+}
+
+/// The coder state the measured-cost election snapshots: everything
+/// the post-spread tail of a frame (boosts, trim, VBR, allocation,
+/// fine energy, the band walk, finalize) mutates.
+#[derive(Clone)]
+struct TailState {
+    enc: RangeEncoder,
+    x: Vec<f32>,
+    y: Vec<f32>,
+    energy: [[f32; MAX_BANDS]; 2],
+    vbr_reservoir: i32,
+    vbr_drift: i32,
+    vbr_offset: i32,
+    vbr_count: i32,
+    prev_coded_bands: i32,
+    frame_bytes: usize,
+}
+
 /// Streaming state of the reference-compatible encoder: the
 /// §4.3.2.1 quantized-energy prediction (kept in lockstep with the
 /// decoder by construction), the pre-emphasis tap, the analysis
@@ -428,6 +456,11 @@ pub struct CeltRefEncoder {
     vbr_drift: i32,
     vbr_offset: i32,
     vbr_count: i32,
+    /// Measured-cost election effort (`set_search_effort`): 0 codes
+    /// the analysed decisions directly, 1 adds the no-boost
+    /// candidate, 2 adds trim ±1 and (stereo) the dual-stereo flip
+    /// and intensity ±2.
+    search_effort: u8,
     /// First coded band (`0` for pure CELT; `17` for the Hybrid-mode
     /// CELT layer).
     start: usize,
@@ -596,6 +629,7 @@ impl CeltRefEncoder {
             vbr_drift: 0,
             vbr_offset: 0,
             vbr_count: 0,
+            search_effort: 2,
             start,
             end,
             upsample,
@@ -618,6 +652,17 @@ impl CeltRefEncoder {
 
     /// Forward MDCT of one channel's analysis block (`frame + overlap`
     /// pre-emphasized samples) at the decoder's emission alignment.
+    /// Measured-cost election effort for the post-spread decisions
+    /// (encoder freedom; the wire is unaffected): `0` codes the
+    /// analysed boost / trim / stereo decisions directly (one band
+    /// walk per frame), `1` also tries the no-boost vector, `2`
+    /// (default) adds trim ±1 and, on stereo, the dual-stereo flip
+    /// and intensity ±2 — every candidate is a full band walk on a
+    /// coder snapshot and the least-error resynthesis is coded.
+    pub fn set_search_effort(&mut self, effort: u8) {
+        self.search_effort = effort.min(2);
+    }
+
     fn forward_freq(&self, block: &[f32], is_transient: bool) -> Result<Vec<f32>, Error> {
         let frame = self.frame_size();
         let overlap = self.mode.overlap;
@@ -1157,206 +1202,308 @@ impl CeltRefEncoder {
                     }
                 }
             }
-            let boosts = encode_band_boosts(
-                &mut enc,
-                start as u32,
-                end as u32,
-                channels as u32,
-                &bins,
-                &caps[start..end],
-                frame_8th,
-                &want_boost,
-            )?;
-            let mut offsets = [0i32; MAX_BANDS];
-            offsets[start..end].copy_from_slice(&boosts.boost);
-
-            // ── Allocation trim (§5.3.4.2 at the listing's exact
-            // operating point; the un-gated default 5 mirrors the
-            // decoder's fallback so the allocation walks stay in
-            // lockstep when the budget closes the gate) ──
-            let trim_gated =
-                enc.tell_frac() as i64 + 48 <= frame_8th as i64 - boosts.total_boost as i64;
-            let alloc_trim = if trim_gated {
-                alloc_trim_analysis(
-                    &self.mode.e_bands,
-                    &x,
-                    (channels == 2).then_some(&y[..]),
-                    &targets,
-                    end,
-                    lm,
-                )
-            } else {
-                5
+            // ── Measured-cost election over the rest of the frame
+            // (encoder freedom): the boost vector the §5.3.4.1
+            // contrast rule asks for and the no-boost vector are each
+            // carried through trim / VBR / allocation / fine energy /
+            // the band walk on a snapshot of the coder state, and the
+            // candidate whose resynthesis is closest to the analyzed
+            // spectrum (MDCT-domain squared error, rate-normalized by
+            // the Gaussian `2^(2R/N)` slope so a VBR candidate that
+            // spends more bytes must earn them) is kept. ──
+            let base = TailState {
+                enc: enc.clone(),
+                x: x.clone(),
+                y: y.clone(),
+                energy: self.coarse.energy,
+                vbr_reservoir: self.vbr_reservoir,
+                vbr_drift: self.vbr_drift,
+                vbr_offset: self.vbr_offset,
+                vbr_count: self.vbr_count,
+                prev_coded_bands: self.prev_coded_bands,
+                frame_bytes,
             };
-            encode_alloc_trim(&mut enc, trim_gated, alloc_trim)?;
+            let run_tail = |st: &mut TailState, cand: &TailCandidate| -> Result<(), Error> {
+                let want_boost: &[i32] = cand.want_boost;
+                let boosts = encode_band_boosts(
+                    &mut st.enc,
+                    start as u32,
+                    end as u32,
+                    channels as u32,
+                    &bins,
+                    &caps[start..end],
+                    frame_8th,
+                    want_boost,
+                )?;
+                let mut offsets = [0i32; MAX_BANDS];
+                offsets[start..end].copy_from_slice(&boosts.boost);
 
-            // ── Variable bitrate (§A.1 target/drift controller):
-            // the base target follows the tf response (short blocks
-            // boosted 7/4, long multi-block frames trimmed), the
-            // already-spent bits are folded in, the frame may never
-            // shrink below what is written (+2 bytes of decoder
-            // margin), and the drift integrator steers the long-term
-            // mean onto the target. The shrunk size takes effect for
-            // the allocation and everything after it — the earlier
-            // gates all fired at tell values the margin covers. ──
-            if vbr_rate > 0 {
-                let lm_diff = 3 - lm as i32;
-                let span = (end - start) as i32;
-                let mut target = vbr_rate + (self.vbr_offset >> lm_diff)
-                    - ((40 * channels as i32 + 20) << BITRES);
-                if is_transient || tf_sum < -2 * span {
-                    target = 7 * target / 4;
-                } else if tf_sum < -span {
-                    target = 3 * target / 2;
-                } else if m > 1 {
-                    target -= (target + 14) / 28;
-                }
-                let tell_frac = enc.tell_frac() as i32;
-                target += tell_frac;
-                let min_allowed = ((tell_frac + boosts.total_boost + (1 << (BITRES + 3)) - 1)
-                    >> (BITRES + 3))
-                    + 2;
-                let mut nb_available = (target + (1 << (BITRES + 2))) >> (BITRES + 3);
-                nb_available = nb_available.max(min_allowed).min(frame_bytes as i32);
-                let delta = target - vbr_rate;
-                let target_8th = nb_available << (BITRES + 3);
-                let alpha = if self.vbr_count < 970 {
-                    self.vbr_count += 1;
-                    1.0f32 / (self.vbr_count + 20) as f32
+                // ── Allocation trim (§5.3.4.2 at the listing's exact
+                // operating point; the un-gated default 5 mirrors the
+                // decoder's fallback so the allocation walks stay in
+                // lockstep when the budget closes the gate) ──
+                let trim_gated =
+                    st.enc.tell_frac() as i64 + 48 <= frame_8th as i64 - boosts.total_boost as i64;
+                let alloc_trim = if trim_gated {
+                    let analysed = alloc_trim_analysis(
+                        &self.mode.e_bands,
+                        &st.x,
+                        (channels == 2).then_some(&st.y[..]),
+                        &targets,
+                        end,
+                        lm,
+                    );
+                    (i32::from(analysed) + cand.trim_delta).clamp(0, 10) as u8
                 } else {
-                    0.001
+                    5
                 };
-                if constrained {
-                    self.vbr_reservoir += target_8th - vbr_rate;
-                }
-                self.vbr_drift += (alpha
-                    * ((delta * (1 << lm_diff)) as f32
-                        - self.vbr_offset as f32
-                        - self.vbr_drift as f32)) as i32;
-                self.vbr_offset = -self.vbr_drift;
-                if constrained && self.vbr_reservoir < 0 {
-                    // Under the floor: raise the rate.
-                    let adjust = (-self.vbr_reservoir) / (8 << BITRES);
-                    nb_available += adjust;
-                    self.vbr_reservoir = 0;
-                }
-                frame_bytes = frame_bytes.min(nb_available.max(2) as usize);
-            }
+                encode_alloc_trim(&mut st.enc, trim_gated, alloc_trim)?;
 
-            // ── Anti-collapse reservation + the exact allocation ──
-            let mut bits = (frame_bytes as i32 * 8) * 8 - enc.tell_frac() as i32 - 1;
-            let anti_collapse_rsv =
-                if is_transient && lm >= 2 && bits >= ((lm as i32 + 2) << BITRES) {
-                    1 << BITRES
-                } else {
-                    0
-                };
-            bits -= anti_collapse_rsv;
-            let alloc = compute_allocation_exact(
-                &self.mode,
-                start,
-                end,
-                &offsets,
-                &caps,
-                alloc_trim as i32,
-                bits,
-                channels as i32,
-                lm,
-                AllocIo::Encode {
-                    enc: &mut enc,
-                    // §5.3.5: the Table-66 bitrate threshold picks the
-                    // first intensity-coded band (`end` = disabled);
-                    // the walk clamps to the post-skip window.
-                    // (clamped into the coded window, the reference's
-                    // `min(end, max(start, intensity))`)
-                    intensity: intensity_start_band((effective_bytes * 8) as u32, lm)
-                        .unwrap_or(end)
-                        .max(start) as i32,
-                    // §A.1 L1 entropy model dual-vs-mid/side verdict
-                    // on the unit-norm spectra; 2.5 ms frames always
-                    // couple (the listing's rule).
-                    dual_stereo: channels == 2
-                        && lm != 0
-                        && stereo_analysis(&self.mode.e_bands, &x, &y, lm),
-                    prev_coded_bands: self.prev_coded_bands,
-                },
-            )?;
-            self.prev_coded_bands = alloc.coded_bands as i32;
-
-            // ── Fine energy (band-major, channel-minor) ──
-            #[allow(clippy::needless_range_loop)] // decode-mirror shape
-            for i in start..end {
-                let fq = alloc.fine_bits[i];
-                if fq <= 0 {
-                    continue;
+                // ── Variable bitrate (§A.1 target/drift controller):
+                // the base target follows the tf response (short blocks
+                // boosted 7/4, long multi-block frames trimmed), the
+                // already-spent bits are folded in, the frame may never
+                // shrink below what is written (+2 bytes of decoder
+                // margin), and the drift integrator steers the long-term
+                // mean onto the target. The shrunk size takes effect for
+                // the allocation and everything after it — the earlier
+                // gates all fired at tell values the margin covers. ──
+                if vbr_rate > 0 {
+                    let lm_diff = 3 - lm as i32;
+                    let span = (end - start) as i32;
+                    let mut target = vbr_rate + (st.vbr_offset >> lm_diff)
+                        - ((40 * channels as i32 + 20) << BITRES);
+                    if is_transient || tf_sum < -2 * span {
+                        target = 7 * target / 4;
+                    } else if tf_sum < -span {
+                        target = 3 * target / 2;
+                    } else if m > 1 {
+                        target -= (target + 14) / 28;
+                    }
+                    let tell_frac = st.enc.tell_frac() as i32;
+                    target += tell_frac;
+                    let min_allowed = ((tell_frac + boosts.total_boost + (1 << (BITRES + 3)) - 1)
+                        >> (BITRES + 3))
+                        + 2;
+                    let mut nb_available = (target + (1 << (BITRES + 2))) >> (BITRES + 3);
+                    nb_available = nb_available.max(min_allowed).min(st.frame_bytes as i32);
+                    let delta = target - vbr_rate;
+                    let target_8th = nb_available << (BITRES + 3);
+                    let alpha = if st.vbr_count < 970 {
+                        st.vbr_count += 1;
+                        1.0f32 / (st.vbr_count + 20) as f32
+                    } else {
+                        0.001
+                    };
+                    if constrained {
+                        st.vbr_reservoir += target_8th - vbr_rate;
+                    }
+                    st.vbr_drift += (alpha
+                        * ((delta * (1 << lm_diff)) as f32
+                            - st.vbr_offset as f32
+                            - st.vbr_drift as f32)) as i32;
+                    st.vbr_offset = -st.vbr_drift;
+                    if constrained && st.vbr_reservoir < 0 {
+                        // Under the floor: raise the rate.
+                        let adjust = (-st.vbr_reservoir) / (8 << BITRES);
+                        nb_available += adjust;
+                        st.vbr_reservoir = 0;
+                    }
+                    st.frame_bytes = st.frame_bytes.min(nb_available.max(2) as usize);
                 }
+
+                // ── Anti-collapse reservation + the exact allocation ──
+                let mut bits = (st.frame_bytes as i32 * 8) * 8 - st.enc.tell_frac() as i32 - 1;
+                let anti_collapse_rsv =
+                    if is_transient && lm >= 2 && bits >= ((lm as i32 + 2) << BITRES) {
+                        1 << BITRES
+                    } else {
+                        0
+                    };
+                bits -= anti_collapse_rsv;
+                let alloc = compute_allocation_exact(
+                    &self.mode,
+                    start,
+                    end,
+                    &offsets,
+                    &caps,
+                    alloc_trim as i32,
+                    bits,
+                    channels as i32,
+                    lm,
+                    AllocIo::Encode {
+                        enc: &mut st.enc,
+                        // §5.3.5: the Table-66 bitrate threshold picks the
+                        // first intensity-coded band (`end` = disabled);
+                        // the walk clamps to the post-skip window.
+                        // (clamped into the coded window, the reference's
+                        // `min(end, max(start, intensity))`)
+                        intensity: (intensity_start_band((effective_bytes * 8) as u32, lm)
+                            .unwrap_or(end) as i32
+                            + cand.intensity_delta)
+                            .clamp(start as i32, end as i32),
+                        // §A.1 L1 entropy model dual-vs-mid/side verdict
+                        // on the unit-norm spectra; 2.5 ms frames always
+                        // couple (the listing's rule).
+                        dual_stereo: channels == 2
+                            && lm != 0
+                            && (stereo_analysis(&self.mode.e_bands, &st.x, &st.y, lm)
+                                != cand.flip_dual),
+                        prev_coded_bands: st.prev_coded_bands,
+                    },
+                )?;
+                st.prev_coded_bands = alloc.coded_bands as i32;
+
+                // ── Fine energy (band-major, channel-minor) ──
                 #[allow(clippy::needless_range_loop)] // decode-mirror shape
-                for c in 0..channels {
-                    let err = targets[c][i] - self.coarse.energy[c][i];
-                    let q2 = (((err + 0.5) * (1 << fq) as f32).floor() as i32)
-                        .clamp(0, (1 << fq) - 1) as u32;
-                    enc.enc_bits(q2, fq as u32)?;
-                    let offset =
-                        (q2 as f32 + 0.5) * (1 << (14 - fq)) as f32 * (1.0 / 16384.0) - 0.5;
-                    self.coarse.energy[c][i] += offset;
-                }
-            }
-
-            // ── The §4.3.4 band loop (encode + resynthesis) ──
-            let mut seed = self.rng;
-            let _walk = quant_all_bands(
-                &self.mode,
-                QuantIo::Encode(&mut enc),
-                start,
-                end,
-                &mut x,
-                (channels == 2).then_some(&mut y[..]),
-                &alloc.shape_bits,
-                is_transient,
-                spread,
-                alloc.dual_stereo,
-                alloc.intensity,
-                &tf_res,
-                (frame_bytes as i32) * (8 << BITRES) - anti_collapse_rsv,
-                alloc.balance,
-                lm,
-                alloc.coded_bands,
-                &mut seed,
-                Some(&amps),
-                true,
-            )?;
-
-            // ── Anti-collapse bit (the §A.1 rule: request the
-            // §4.3.5 injection for the first two transient frames
-            // of a run — a long transient run keeps its thinner
-            // short-block energy instead of pumping noise). ──
-            if anti_collapse_rsv > 0 {
-                enc.enc_bits(u32::from(self.consec_transient < 2), 1)?;
-            }
-
-            // ── Final fine-energy bits (§4.3.2.2 finalize) ──
-            let mut bits_left = (frame_bytes * 8) as i32 - enc.tell() as i32;
-            for prio in [false, true] {
-                let mut i = start;
-                while i < end && bits_left >= channels as i32 {
-                    if alloc.fine_bits[i] >= MAX_FINE_BITS || alloc.fine_priority[i] != prio {
-                        i += 1;
+                for i in start..end {
+                    let fq = alloc.fine_bits[i];
+                    if fq <= 0 {
                         continue;
                     }
                     #[allow(clippy::needless_range_loop)] // decode-mirror shape
                     for c in 0..channels {
-                        let err = targets[c][i] - self.coarse.energy[c][i];
-                        let q2 = u32::from(err >= 0.0);
-                        enc.enc_bits(q2, 1)?;
-                        let offset = (q2 as f32 - 0.5)
-                            * (1 << (14 - alloc.fine_bits[i] - 1)) as f32
-                            * (1.0 / 16384.0);
-                        self.coarse.energy[c][i] += offset;
-                        bits_left -= 1;
+                        let err = targets[c][i] - st.energy[c][i];
+                        let q2 = (((err + 0.5) * (1 << fq) as f32).floor() as i32)
+                            .clamp(0, (1 << fq) - 1) as u32;
+                        st.enc.enc_bits(q2, fq as u32)?;
+                        let offset =
+                            (q2 as f32 + 0.5) * (1 << (14 - fq)) as f32 * (1.0 / 16384.0) - 0.5;
+                        st.energy[c][i] += offset;
                     }
-                    i += 1;
+                }
+
+                // ── The §4.3.4 band loop (encode + resynthesis) ──
+                let mut seed = self.rng;
+                let _walk = quant_all_bands(
+                    &self.mode,
+                    QuantIo::Encode(&mut st.enc),
+                    start,
+                    end,
+                    &mut st.x,
+                    (channels == 2).then_some(&mut st.y[..]),
+                    &alloc.shape_bits,
+                    is_transient,
+                    spread,
+                    alloc.dual_stereo,
+                    alloc.intensity,
+                    &tf_res,
+                    (st.frame_bytes as i32) * (8 << BITRES) - anti_collapse_rsv,
+                    alloc.balance,
+                    lm,
+                    alloc.coded_bands,
+                    &mut seed,
+                    Some(&amps),
+                    true,
+                )?;
+
+                // ── Anti-collapse bit (the §A.1 rule: request the
+                // §4.3.5 injection for the first two transient frames
+                // of a run — a long transient run keeps its thinner
+                // short-block energy instead of pumping noise). ──
+                if anti_collapse_rsv > 0 {
+                    st.enc.enc_bits(u32::from(self.consec_transient < 2), 1)?;
+                }
+
+                // ── Final fine-energy bits (§4.3.2.2 finalize) ──
+                let mut bits_left = (st.frame_bytes * 8) as i32 - st.enc.tell() as i32;
+                for prio in [false, true] {
+                    let mut i = start;
+                    while i < end && bits_left >= channels as i32 {
+                        if alloc.fine_bits[i] >= MAX_FINE_BITS || alloc.fine_priority[i] != prio {
+                            i += 1;
+                            continue;
+                        }
+                        #[allow(clippy::needless_range_loop)] // decode-mirror shape
+                        for c in 0..channels {
+                            let err = targets[c][i] - st.energy[c][i];
+                            let q2 = u32::from(err >= 0.0);
+                            st.enc.enc_bits(q2, 1)?;
+                            let offset = (q2 as f32 - 0.5)
+                                * (1 << (14 - alloc.fine_bits[i] - 1)) as f32
+                                * (1.0 / 16384.0);
+                            st.energy[c][i] += offset;
+                            bits_left -= 1;
+                        }
+                        i += 1;
+                    }
+                }
+                Ok(())
+            };
+            let distortion = |st: &TailState| -> f64 {
+                let mut err = 0f64;
+                for c in 0..channels {
+                    let (orig, q) = if c == 0 {
+                        (&freqs[0], &st.x)
+                    } else {
+                        (&freqs[1], &st.y)
+                    };
+                    #[allow(clippy::needless_range_loop)] // band index drives three tables
+                    for i in start..end {
+                        let amp = (st.energy[c][i] + E_MEANS[i]).exp2() as f64;
+                        for j in m * eb(i)..m * eb(i + 1) {
+                            let d = f64::from(orig[j]) - amp * f64::from(q[j]);
+                            err += d * d;
+                        }
+                    }
+                }
+                let rate = (st.frame_bytes * 8) as f64;
+                err * (2.0 * rate / (channels * n_coded) as f64).exp2()
+            };
+            let no_boost = vec![0i32; end - start];
+            let analysed = TailCandidate {
+                want_boost: &want_boost,
+                trim_delta: 0,
+                intensity_delta: 0,
+                flip_dual: false,
+            };
+            let mut candidates: Vec<TailCandidate> = vec![analysed];
+            if self.search_effort >= 1 && want_boost.iter().any(|&b| b != 0) {
+                candidates.push(TailCandidate {
+                    want_boost: &no_boost,
+                    ..analysed
+                });
+            }
+            if self.search_effort >= 2 {
+                for trim_delta in [-1, 1] {
+                    candidates.push(TailCandidate {
+                        trim_delta,
+                        ..analysed
+                    });
+                }
+                if channels == 2 {
+                    if lm != 0 {
+                        candidates.push(TailCandidate {
+                            flip_dual: true,
+                            ..analysed
+                        });
+                    }
+                    for intensity_delta in [-2, 2] {
+                        candidates.push(TailCandidate {
+                            intensity_delta,
+                            ..analysed
+                        });
+                    }
                 }
             }
+            let mut best: Option<(f64, TailState)> = None;
+            for cand in &candidates {
+                let mut st = base.clone();
+                run_tail(&mut st, cand)?;
+                let score = distortion(&st);
+                if best.as_ref().map_or(true, |(s, _)| score < *s) {
+                    best = Some((score, st));
+                }
+            }
+            let (_, best) = best.expect("at least one candidate");
+            enc = best.enc;
+            self.coarse.energy = best.energy;
+            self.vbr_reservoir = best.vbr_reservoir;
+            self.vbr_drift = best.vbr_drift;
+            self.vbr_offset = best.vbr_offset;
+            self.vbr_count = best.vbr_count;
+            self.prev_coded_bands = best.prev_coded_bands;
+            frame_bytes = best.frame_bytes;
         } else {
             // Silence: floor the prediction state like the decoder.
             for c in 0..2 {
@@ -1744,6 +1891,65 @@ mod tests {
             assert!(
                 tone_sizes.iter().any(|&s| s != tone_sizes[0]),
                 "constrained={constrained}: sizes never vary"
+            );
+        }
+    }
+
+    /// The measured-cost election is encoder freedom on a fixed wire:
+    /// every effort level's stream decodes cleanly, the elected
+    /// stream is never worse than the analysed-decision stream on
+    /// mixed tonal + stereo material, and effort 0 reproduces the
+    /// single-walk encode.
+    #[test]
+    fn election_effort_levels_decode_and_do_not_regress() {
+        for &(lm, channels, bytes) in &[(1u32, 1usize, 15usize), (3, 2, 160), (2, 2, 60)] {
+            let frame = 120usize << lm;
+            let frames = 12;
+            // Two-tone plus a panned partial: boosts, trim and the
+            // stereo decisions all have something to elect on.
+            let n = frame * frames;
+            let mut pcm = Vec::with_capacity(n * channels);
+            for t in 0..n {
+                let tf = t as f32 / 48000.0;
+                let pan = 0.5 + 0.4 * (2.0 * std::f32::consts::PI * 1.3 * tf).sin();
+                for c in 0..channels {
+                    let g = if channels == 1 {
+                        1.0
+                    } else if c == 0 {
+                        1.0 - pan
+                    } else {
+                        pan
+                    };
+                    let v = 0.3 * (2.0 * std::f32::consts::PI * 440.0 * tf).sin()
+                        + 0.15 * g * (2.0 * std::f32::consts::PI * 1364.0 * tf).sin()
+                        + 0.05 * (2.0 * std::f32::consts::PI * 3100.0 * tf).sin();
+                    pcm.push(v);
+                }
+            }
+            let mut snr = [0f64; 3];
+            for effort in 0..3u8 {
+                let mut enc = CeltRefEncoder::new(lm, channels).unwrap();
+                enc.set_search_effort(effort);
+                let mut dec = CeltRefDecoder::new(lm, channels).unwrap();
+                let mut out = Vec::new();
+                for f in 0..frames {
+                    let chunk = &pcm[f * frame * channels..(f + 1) * frame * channels];
+                    let bytes_out = enc.encode_frame(chunk, bytes).unwrap();
+                    assert_eq!(bytes_out.len(), bytes);
+                    out.extend(dec.decode_frame(&bytes_out).unwrap());
+                }
+                let delay = OVERLAP * channels;
+                let (mut ss, mut ee) = (0f64, 0f64);
+                for (i, &o) in out.iter().enumerate().skip(delay + 2 * frame * channels) {
+                    let s = f64::from(pcm[i - delay]);
+                    ss += s * s;
+                    ee += (s - f64::from(o)).powi(2);
+                }
+                snr[effort as usize] = 10.0 * (ss / ee.max(1e-30)).log10();
+            }
+            assert!(
+                snr[2] >= snr[0] - 0.05 && snr[1] >= snr[0] - 0.05,
+                "lm={lm} C={channels}: election regressed ({snr:?})"
             );
         }
     }

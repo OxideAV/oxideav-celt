@@ -6,6 +6,29 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-458 — measured-cost election of the post-spread decisions**
+  (`CeltRefEncoder::set_search_effort`, default 2): the §5.3.4.1
+  boost vector, the alloc-trim analysis (±1), and on stereo the
+  §5.3.5 dual-stereo verdict (flipped) and the Table-66 intensity
+  band (±2) are no longer coded as analysed — each candidate is
+  carried through boosts / trim / VBR / the exact allocation / fine
+  energy / the band walk on a snapshot of the coder state, and the
+  candidate whose resynthesis is closest to the analysed spectrum
+  (MDCT-domain squared error, rate-normalized by the Gaussian
+  `2^(2R/N)` slope so a VBR candidate that spends more bytes must
+  earn them) is the one written. Encoder freedom on the unchanged
+  wire; effort 0 reproduces the single-walk encode. Measured on the
+  equal-rate oracle matrix (mono/stereo x LM 0-3 x 6-128 kb/s x
+  three materials): the 5 ms low-rate deficit the dynalloc-at-every-
+  rate rule left (5 ms mono tonal 24 kb/s 14.5 vs the listing's
+  20.4 dB; 5 ms stereo 24-32 kb/s -1.7..-2.6 dB) closes to within
+  0.6 dB, every other point is at or ahead of the listing, and the
+  mean lead over the listing rises from +0.9/+1.0/+1.2 dB (LM 2/3/1,
+  boost election only) to +1.7/+1.5/+1.5 dB with the trim/stereo
+  candidates.
+
+### Added
+
 * **Round-458 — §5.3.1 prefilter: the §A.1 pitch estimator, elected
   against the in-crate search by measured residual**: the listing's
   encoder-side pitch pipeline lands (`plc::remove_doubling`
