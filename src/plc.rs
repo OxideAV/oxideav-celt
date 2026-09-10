@@ -243,6 +243,124 @@ pub(crate) fn pitch_search(x_lp: &[f32], y: &[f32], len: usize, max_pitch: usize
     (2 * best[0] as i32 - offset) as usize
 }
 
+/// The second-candidate multiplier table of the sub-harmonic check
+/// (`second_check`, RFC 6716 Appendix A `pitch.c`).
+const SECOND_CHECK: [usize; 16] = [0, 0, 3, 2, 3, 2, 5, 2, 3, 2, 3, 2, 5, 2, 3, 2];
+
+/// Pitch-doubling removal and gain estimate (`remove_doubling`, float
+/// build): starting from the coarse lag `t0` (full-rate samples) on
+/// the 2:1-downsampled buffer `x` (`max_period/2` history samples
+/// ahead of the `n/2`-sample frame), it tests every sub-multiple
+/// `T0/k` (`k = 2..=15`) together with a second lag that a true
+/// period at `T0/k` must also correlate at, accepts the shorter
+/// period when its normalized correlation beats
+/// `0.3 + 0.4 * g0 - continuity` (the continuity credit favouring
+/// the previous frame's period and gain), refines the winner by
+/// one full-rate sample from the three-point correlation shape, and
+/// returns the prediction gain `min(xy / yy, g)` clamped to the
+/// `[min_period, ..)` lag. `t0` is updated in place to the full-rate
+/// period.
+pub(crate) fn remove_doubling(
+    x: &[f32],
+    max_period: usize,
+    min_period: usize,
+    n: usize,
+    t0: &mut usize,
+    prev_period: usize,
+    prev_gain: f32,
+) -> f32 {
+    let min_period0 = min_period;
+    let max_period = max_period / 2;
+    let min_period = min_period / 2;
+    let prev_period = prev_period / 2;
+    let n = n / 2;
+    // The frame starts `max_period` samples into the buffer; lags
+    // up to `max_period - 1` read the history below it.
+    let at = |i: usize, t: usize| x[max_period + i - t];
+    let mut t = (*t0 / 2).min(max_period - 1);
+    let t0_half = t;
+    let (mut xx, mut xy, mut yy) = (0f32, 0f32, 0f32);
+    for i in 0..n {
+        let xi = at(i, 0);
+        let yi = at(i, t0_half);
+        xy += xi * yi;
+        xx += xi * xi;
+        yy += yi * yi;
+    }
+    let mut best_xy = xy;
+    let mut best_yy = yy;
+    let g0 = xy / (1.0 + xx * yy).sqrt();
+    let mut g = g0;
+    // Look for any pitch at T/k.
+    #[allow(clippy::needless_range_loop)] // `k` is the sub-multiple, not just an index
+    for k in 2..=15usize {
+        let t1 = (2 * t0_half + k) / (2 * k);
+        if t1 < min_period {
+            break;
+        }
+        // Look for another strong correlation at T1b.
+        let t1b = if k == 2 {
+            if t1 + t0_half > max_period {
+                t0_half
+            } else {
+                t0_half + t1
+            }
+        } else {
+            (2 * SECOND_CHECK[k] * t0_half + k) / (2 * k)
+        };
+        let (mut xy1, mut yy1) = (0f32, 0f32);
+        for i in 0..n {
+            let a = at(i, t1);
+            let b = at(i, t1b);
+            xy1 += at(i, 0) * a;
+            yy1 += a * a;
+            xy1 += at(i, 0) * b;
+            yy1 += b * b;
+        }
+        let g1 = xy1 / (1.0 + 2.0 * xx * yy1).sqrt();
+        let diff = (t1 as i64 - prev_period as i64).unsigned_abs() as usize;
+        let cont = if diff <= 1 {
+            prev_gain
+        } else if diff <= 2 && 5 * k * k < t0_half {
+            0.5 * prev_gain
+        } else {
+            0.0
+        };
+        if g1 > 0.3 + 0.4 * g0 - cont {
+            best_xy = xy1;
+            best_yy = yy1;
+            t = t1;
+            g = g1;
+        }
+    }
+    let mut pg = if best_yy <= best_xy {
+        1.0
+    } else {
+        best_xy / (best_yy + 1.0)
+    };
+    let mut xcorr = [0f32; 3];
+    for (k, c) in xcorr.iter_mut().enumerate() {
+        let t1 = t + k - 1;
+        let mut s = 0f32;
+        for i in 0..n {
+            s += at(i, 0) * at(i, t1);
+        }
+        *c = s;
+    }
+    let offset: i64 = if xcorr[2] - xcorr[0] > 0.7 * (xcorr[1] - xcorr[0]) {
+        1
+    } else if xcorr[0] - xcorr[2] > 0.7 * (xcorr[1] - xcorr[2]) {
+        -1
+    } else {
+        0
+    };
+    if pg > g {
+        pg = g;
+    }
+    *t0 = ((2 * t as i64 + offset).max(min_period0 as i64)) as usize;
+    pg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

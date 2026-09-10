@@ -4,6 +4,40 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-458 — §5.3.1 prefilter: the §A.1 pitch estimator, elected
+  against the in-crate search by measured residual**: the listing's
+  encoder-side pitch pipeline lands (`plc::remove_doubling`
+  transcribed from the in-RFC listing next to the r451
+  `pitch_downsample` / `pitch_search`; channel-summed 2:1
+  downsampled LPC-whitened comb source, coarse cross-correlation
+  search, the sub-harmonic check with the previous frame's
+  continuity credit) and runs alongside this crate's documented
+  full-rate normalized-autocorrelation search. Both candidates pass
+  the §A.1 threshold / continuity snap / 3-bit grid
+  (`gate_prefilter_gain`), and the one whose quantized comb leaves
+  the least residual energy in the frame is coded. Measured on the
+  new equal-rate oracle matrix: the listing's estimator alone
+  closes a 0.6–0.8 dB deficit on partially correlated stereo (the
+  in-crate search jittered the period 435/436/437 and under-shot
+  the gain by one grid step, costing a crossfade every frame) but
+  gives up 2.6 dB on sparse tonal mono; the election keeps both
+  (20 ms stereo pair 16.06 -> 16.88 dB at 64 kb/s vs the listing's
+  16.89; 20 ms tonal mono stays +2.6 dB ahead). Prefilter
+  period/gain/tapset symbols now match the listing frame-for-frame
+  on the stereo pair.
+* **Round-458 — equal-rate quality matrix vs the listing encoder**
+  (`tests/rate_matrix_oracle.rs`, runtime-gated on
+  `OXIDEAV_CELT_LISTING_ORACLE`): mono/stereo x 2.5/5/10/20 ms x
+  6–128 kb/s CBR on three materials (steady tones, a harmonic
+  "music-like" signal with vibrato, noise floor and hits, and a
+  partially correlated panning stereo pair), both encoders' streams
+  decoded through the listing decoder; `CELT_MATRIX_FULL=1` /
+  `CELT_MATRIX_LM=n` / `CELT_MATRIX_MATERIAL=name` scope the sweep.
+  The gate fails when this encoder trails the listing by more than
+  0.5 dB at any point.
+
 ## [0.1.12](https://github.com/OxideAV/oxideav-celt/compare/v0.1.11...v0.1.12) - 2026-08-31
 
 ### Other

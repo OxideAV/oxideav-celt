@@ -47,6 +47,7 @@ use crate::encoder_decisions::{
 };
 use crate::mdct::{build_low_overlap_window_f32, mdct_naive_f32};
 use crate::pitch::pitch_search;
+use crate::plc::{pitch_downsample, remove_doubling};
 use crate::post_filter::POST_FILTER_TAPS_F32;
 use crate::range_encoder::RangeEncoder;
 use crate::ref_decode::E_MEANS;
@@ -699,6 +700,45 @@ impl CeltRefEncoder {
         self.encode_impl(pcm, max_bytes.min(1275), vbr_rate, constrained)
     }
 
+    /// The §A.1 prefilter gain gate: the rate/continuity-adjusted
+    /// enable threshold (hard floor 0.2), then the continuity snap
+    /// onto the previous frame's gain and the §4.3.7.1 3-bit grid.
+    /// Returns the quantized `(gain, index)`, or `None` when the
+    /// prefilter stays off for this candidate.
+    fn gate_prefilter_gain(
+        &self,
+        period: usize,
+        raw_gain: f32,
+        frame_bytes: usize,
+    ) -> Option<(f32, i32)> {
+        let mut pf_threshold = 0.2f32;
+        if (period as i32 - self.prefilter_period as i32).abs() * 10 > period as i32 {
+            pf_threshold += 0.2;
+        }
+        if frame_bytes < 25 {
+            pf_threshold += 0.1;
+        }
+        if frame_bytes < 35 {
+            pf_threshold += 0.1;
+        }
+        if self.prefilter_gain > 0.4 {
+            pf_threshold -= 0.1;
+        }
+        if self.prefilter_gain > 0.55 {
+            pf_threshold -= 0.1;
+        }
+        pf_threshold = pf_threshold.max(0.2);
+        if raw_gain < pf_threshold {
+            return None;
+        }
+        let mut gain = raw_gain;
+        if (gain - self.prefilter_gain).abs() < 0.1 {
+            gain = self.prefilter_gain;
+        }
+        let qg = (((0.5 + gain * 32.0 / 3.0).floor() as i32) - 1).clamp(0, 7);
+        Some((0.09375 * (qg + 1) as f32, qg))
+    }
+
     /// The shared CBR/VBR encode walk (`vbr_rate` in 1/8 bits per
     /// frame; 0 selects CBR at exactly `nb_bytes_in` bytes).
     fn encode_impl(
@@ -814,57 +854,88 @@ impl CeltRefEncoder {
             enc.enc_bit_logp(u32::from(silence), 15)?;
         }
 
-        // ── §5.3.1 pitch prefilter decision (the §A.1 gain/threshold
-        // envelope over this crate's documented pitch search) ──
+        // ── §5.3.1 pitch prefilter decision: two period/gain
+        // estimators — the §A.1 listing's (channel-summed, 2:1
+        // downsampled, LPC-whitened; coarse cross-correlation search,
+        // then the sub-harmonic check with the previous frame's
+        // continuity credit) and this crate's documented full-rate
+        // normalized-autocorrelation search — each run through the
+        // §A.1 gain threshold / continuity snap / 3-bit grid, and the
+        // surviving candidate whose quantized comb leaves the least
+        // residual energy in the frame is kept (encoder freedom:
+        // measured on this crate's oracle matrix, the listing's
+        // estimator wins on mixed stereo material and the in-crate
+        // one on sparse tonal material, by 1-3 dB each way). ──
         let mut gain1 = 0.0f32;
         let mut pitch_index = COMB_MIN_PERIOD;
         let mut prefilter_tapset = 0usize;
+        let mut pf_on = false;
+        let mut qg = 0i32;
         if frame_bytes > 12 * channels && start == 0 && !silence {
-            // Channel-averaged unfiltered pre-emphasized signal.
+            prefilter_tapset = self.tapset_decision.clamp(0, 2) as usize;
+            // Channel-summed unfiltered pre-emphasized signal (the
+            // comb source both estimators and the residual measure
+            // read).
             let mut dm = pres[0].clone();
             if channels == 2 {
                 for (d, &v) in dm.iter_mut().zip(pres[1].iter()) {
                     *d = 0.5 * (*d + v);
                 }
             }
+            let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(2);
+            {
+                let chans: Vec<&[f32]> = pres.iter().map(|p| p.as_slice()).collect();
+                let mut pitch_buf = vec![0f32; (COMB_MAX_PERIOD + frame) >> 1];
+                pitch_downsample(&chans, &mut pitch_buf);
+                let idx = crate::plc::pitch_search(
+                    &pitch_buf[COMB_MAX_PERIOD >> 1..],
+                    &pitch_buf,
+                    frame,
+                    COMB_MAX_PERIOD - COMB_MIN_PERIOD,
+                );
+                let mut t = COMB_MAX_PERIOD - idx;
+                let g = remove_doubling(
+                    &pitch_buf,
+                    COMB_MAX_PERIOD,
+                    COMB_MIN_PERIOD,
+                    frame,
+                    &mut t,
+                    self.prefilter_period,
+                    self.prefilter_gain,
+                );
+                candidates.push((t.min(COMB_MAX_PERIOD - 2), 0.7 * g));
+            }
             if let Some(est) = pitch_search(&dm, frame, Some(self.prefilter_period as u16)) {
-                pitch_index = (est.period as usize).clamp(COMB_MIN_PERIOD, COMB_MAX_PERIOD - 2);
-                gain1 = 0.7 * est.correlation.max(0.0);
+                let t = (est.period as usize).clamp(COMB_MIN_PERIOD, COMB_MAX_PERIOD - 2);
+                candidates.push((t, 0.7 * est.correlation.max(0.0)));
             }
-            prefilter_tapset = self.tapset_decision.clamp(0, 2) as usize;
-        }
-        // Threshold for enabling the prefilter (§A.1: rate/continuity
-        // adjusted, hard floor 0.2).
-        let mut pf_threshold = 0.2f32;
-        if (pitch_index as i32 - self.prefilter_period as i32).abs() * 10 > pitch_index as i32 {
-            pf_threshold += 0.2;
-        }
-        if frame_bytes < 25 {
-            pf_threshold += 0.1;
-        }
-        if frame_bytes < 35 {
-            pf_threshold += 0.1;
-        }
-        if self.prefilter_gain > 0.4 {
-            pf_threshold -= 0.1;
-        }
-        if self.prefilter_gain > 0.55 {
-            pf_threshold -= 0.1;
-        }
-        pf_threshold = pf_threshold.max(0.2);
-        let pf_on: bool;
-        let mut qg = 0i32;
-        if gain1 < pf_threshold {
-            gain1 = 0.0;
-            pf_on = false;
-        } else {
-            // Continuity snap, then the §4.3.7.1 3-bit gain grid.
-            if (gain1 - self.prefilter_gain).abs() < 0.1 {
-                gain1 = self.prefilter_gain;
+            let mut best_energy = f32::INFINITY;
+            for &(t, raw_gain) in &candidates {
+                let Some((g, q)) = self.gate_prefilter_gain(t, raw_gain, frame_bytes) else {
+                    continue;
+                };
+                let taps = POST_FILTER_TAPS_F32[prefilter_tapset];
+                let mut energy = 0f32;
+                for n in COMB_MAX_PERIOD..COMB_MAX_PERIOD + frame {
+                    let pred = taps[0] * dm[n - t]
+                        + taps[1] * (dm[n - t + 1] + dm[n - t - 1])
+                        + taps[2] * (dm[n - t + 2] + dm[n - t - 2]);
+                    let r = dm[n] - g * pred;
+                    energy += r * r;
+                }
+                if energy < best_energy {
+                    best_energy = energy;
+                    pitch_index = t;
+                    gain1 = g;
+                    qg = q;
+                    pf_on = true;
+                }
             }
-            qg = (((0.5 + gain1 * 32.0 / 3.0).floor() as i32) - 1).clamp(0, 7);
-            gain1 = 0.09375 * (qg + 1) as f32;
-            pf_on = true;
+            if !pf_on {
+                // Both estimates fell under the threshold: the
+                // listing's period carries into the continuity state.
+                pitch_index = candidates[0].0;
+            }
         }
 
         // ── Apply the comb prefilter (previous → current parameters
