@@ -4,6 +4,27 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Changed
+
+* **Round-458 — decoder corrupt-frame semantics match the listing;
+  `Error::CorruptFrame`**: the reference-exact decode walk no longer
+  bails out mid-frame with `Error::NotImplemented` when the range
+  decoder latches its sticky error — `pvq::decode_pulses` keeps
+  decoding with the clamped `V(N, K) - 1` index exactly as the
+  listing's `ec_dec_uint` does, the frame's energies / overlap /
+  post-filter state advance as in the reference, and the over-read
+  is reported at the end of the frame (RFC 6716 §4.1.5, the
+  listing's `ec_tell > 8 * len` check) as the new
+  `Error::CorruptFrame`, so the next frame or `decode_lost`
+  continues from a consistent state. `Error::NotImplemented` is now
+  reachable only from the earlier in-crate-wire building blocks
+  (`frame_synthesis` / `residual` / `frame_encode` / `pcm_encode`),
+  never from `CeltRefDecoder` / `CeltRefEncoder`; a saturating
+  `V(N, K)` on the decode path (only a corrupt allocation can
+  produce one) is `CorruptFrame`, and geometry failures inside the
+  band walk are `InvalidParameter`. The `Error` docs are rewritten
+  to the current state (they still described the pre-r414 crate).
+
 ### Added
 
 * **Round-458 — measured-cost election of the post-spread decisions**

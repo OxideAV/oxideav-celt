@@ -274,21 +274,17 @@ pub fn decode_index_to_pulses(index: u32, n: u32, k: u32) -> Option<Vec<i32>> {
 /// Reads a uniform integer in `[0, V(N, K))` via [`RangeDecoder::dec_uint`]
 /// (§4.1.5) and reconstructs the signed integer vector. Returns
 /// `None` when `V(N, K)` saturates at `u32::MAX` (§4.3.4.4 split must
-/// run first), when `N == 0` and `K > 0`, when the range decoder
-/// reports a sticky error, or when the decoded index falls outside
-/// `[0, V(N, K))`.
+/// run first) or when `N == 0` and `K > 0`. A range decoder that
+/// has run past its budget keeps decoding with clamped symbols
+/// (`dec_uint` returns `V(N, K) - 1` and latches the sticky error),
+/// exactly as RFC 6716 §4.1.5 and the listing's decoder do — the
+/// frame driver reports the over-read at the end of the frame.
 pub fn decode_pulses(dec: &mut RangeDecoder<'_>, n: u32, k: u32) -> Option<Vec<i32>> {
     let v_nk = v_count(n, k);
     if v_nk == 0 || v_nk == V_COUNT_SATURATION {
         return None;
     }
-    let index = match dec.dec_uint(v_nk) {
-        Ok(i) => i,
-        Err(_) => return None,
-    };
-    if dec.has_error() {
-        return None;
-    }
+    let index = dec.dec_uint(v_nk).ok()?;
     decode_index_to_pulses(index, n, k)
 }
 

@@ -920,6 +920,14 @@ impl CeltRefDecoder {
 
         self.rng = dec.range_state();
         self.loss_count = 0;
+        // RFC 6716 §4.1.5 / the listing's end-of-frame check: a frame
+        // whose symbols ran past its byte budget is corrupt. Every
+        // state update above has already happened (clamped symbols
+        // decoded the frame like the reference), so the next frame or
+        // a `decode_lost` continues from a consistent state.
+        if dec.tell() > 8 * bytes.len() as u32 {
+            return Err(Error::CorruptFrame);
+        }
         Ok(pcm)
     }
 
@@ -1282,7 +1290,7 @@ mod tests {
                         assert!(
                             matches!(
                                 e,
-                                crate::Error::NotImplemented | crate::Error::InvalidParameter
+                                crate::Error::CorruptFrame | crate::Error::InvalidParameter
                             ),
                             "unexpected error kind"
                         );

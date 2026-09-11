@@ -24,12 +24,18 @@ fn hostile_energy_walk_stays_nan_free() {
     let mut dec = CeltRefDecoder::new(0, 1).expect("legal config");
     let want = dec.output_frame_size();
     for part in BODY.chunks(11) {
-        if let Ok(pcm) = dec.decode_frame(part) {
-            assert_eq!(pcm.len(), want);
-            assert!(
-                pcm.iter().all(|v| !v.is_nan()),
-                "hostile frame decoded to NaN"
-            );
+        match dec.decode_frame(part) {
+            Ok(pcm) => {
+                assert_eq!(pcm.len(), want);
+                assert!(
+                    pcm.iter().all(|v| !v.is_nan()),
+                    "hostile frame decoded to NaN"
+                );
+            }
+            // A hostile frame is either decoded (clamped symbols, like
+            // the reference) or reported as an over-read — never
+            // rejected as "unimplemented".
+            Err(e) => assert_eq!(e, oxideav_celt::Error::CorruptFrame),
         }
     }
     // The state must stay usable: concealment right after the hostile

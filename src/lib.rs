@@ -347,22 +347,38 @@ pub use tf_change::{
     TABLE_63_TRANSIENT_SEL1, TF_CHANGE_VALUES,
 };
 
-/// Crate-local error type. The encoder, frame-level decoder, and
-/// higher-level codec entry points are not yet wired up; calling them
-/// returns [`Error::NotImplemented`]. The range decoder primitives in
-/// [`range_decoder`] do not use this type for their hot paths — they
-/// latch a sticky error flag instead, mirroring the behaviour
-/// recommended by RFC 6716 §4.1.5 for corrupt frames.
+/// Crate-local error type.
+///
+/// The reference-exact drivers ([`ref_decode::CeltRefDecoder`] /
+/// [`ref_encode::CeltRefEncoder`]) return [`Error::InvalidParameter`]
+/// for caller-side contract violations and [`Error::CorruptFrame`]
+/// for a frame the range decoder ran past (RFC 6716 §4.1.5: the
+/// frame decodes with clamped symbols and the decoder state advances
+/// exactly as the listing's does, then the over-read is reported).
+/// [`Error::NotImplemented`] is only reachable from the earlier
+/// §4.3-prose building blocks (`frame_synthesis`, `residual`,
+/// `frame_encode`, `pcm_encode`), whose in-crate wire stops at the
+/// §4.3.4.4 split and joint-stereo paths the reference-exact layer
+/// implements. The range decoder primitives in [`range_decoder`] do
+/// not use this type for their hot paths — they latch a sticky error
+/// flag instead, mirroring RFC 6716 §4.1.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// A higher-level CELT entry point that has not been implemented
-    /// yet (everything beyond the range decoder, today).
+    /// A path the earlier in-crate-wire building blocks do not carry
+    /// (the §4.3.4.4 split / joint-stereo layouts); the
+    /// reference-exact drivers never return this.
     NotImplemented,
     /// A caller-supplied parameter was out of its documented range
     /// (e.g. `lm > 3`, a band window beyond [`NUM_BANDS`], or a
     /// channel count outside `1..=2`). The decoder state is never
     /// touched when this is returned.
     InvalidParameter,
+    /// The frame's symbols ran past its byte budget (RFC 6716
+    /// §4.1.5). The decoder state has advanced exactly as it would
+    /// in the reference (clamped symbols, the frame's energies and
+    /// overlap carried), so the next frame or a `decode_lost` call
+    /// continues cleanly; the over-read frame's PCM is withheld.
+    CorruptFrame,
 }
 
 impl core::fmt::Display for Error {
@@ -375,6 +391,10 @@ impl core::fmt::Display for Error {
             Error::InvalidParameter => write!(
                 f,
                 "oxideav-celt: a caller-supplied parameter is out of range"
+            ),
+            Error::CorruptFrame => write!(
+                f,
+                "oxideav-celt: corrupt frame (symbols ran past the byte budget)"
             ),
         }
     }

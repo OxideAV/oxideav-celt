@@ -481,7 +481,7 @@ fn alg_pvq(
     match io {
         QuantIo::Encode(enc) => {
             exp_rotation(x, 1, b, k, spread);
-            let iy = pvq_search(x, n, k as u32).ok_or(Error::NotImplemented)?;
+            let iy = pvq_search(x, n, k as u32).ok_or(Error::InvalidParameter)?;
             encode_pulses(enc, &iy, n, k as u32)?;
             if ctx.resynth {
                 let ryy: f32 = iy.iter().map(|&v| (v * v) as f32).sum();
@@ -491,7 +491,10 @@ fn alg_pvq(
             Ok(extract_collapse_mask(&iy, b))
         }
         QuantIo::Decode(dec) => {
-            let iy = decode_pulses(dec, n, k as u32).ok_or(Error::NotImplemented)?;
+            // The exact allocation caps `K` so `V(N, K)` never saturates on a
+            // stream this decoder's walk produced the budget for; a
+            // saturating `K` can only come from a corrupt frame.
+            let iy = decode_pulses(dec, n, k as u32).ok_or(Error::CorruptFrame)?;
             let ryy: f32 = iy.iter().map(|&v| (v * v) as f32).sum();
             normalise_residual(&iy, x, ryy, gain);
             exp_rotation(x, -1, b, k, spread);
@@ -1003,12 +1006,12 @@ fn quant_band(
         let q0 = ctx
             .mode
             .bits2pulses(band, lm, b.min(16383))
-            .ok_or(Error::NotImplemented)?;
+            .ok_or(Error::InvalidParameter)?;
         let mut q = q0;
         let mut curr_bits = ctx
             .mode
             .pulses2bits(band, lm, q)
-            .ok_or(Error::NotImplemented)?;
+            .ok_or(Error::InvalidParameter)?;
         *remaining_bits -= curr_bits;
         // Never bust the budget.
         while *remaining_bits < 0 && q > 0 {
@@ -1017,7 +1020,7 @@ fn quant_band(
             curr_bits = ctx
                 .mode
                 .pulses2bits(band, lm, q)
-                .ok_or(Error::NotImplemented)?;
+                .ok_or(Error::InvalidParameter)?;
             *remaining_bits -= curr_bits;
         }
 
