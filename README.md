@@ -34,16 +34,41 @@ built from that listing.
   Viterbi TF analysis, two-pass coarse-energy RD, alloc-trim /
   spreading / dual-stereo analyses, Table-66 intensity threshold,
   transient detection, the anti-collapse request rule, and the
-  complete §5.3.1 pitch-prefilter chain (the crate's documented
-  pitch search; encoder freedom with parity measured). **Measured
-  (re-verified r454 against a freshly built listing oracle):**
-  cross-decoder lockstep 99.4–133.1 dB float SNR on every LM x
-  channels combo, and decoded quality **above** the §A.1 listing
-  encoder at every measured CBR point — 10 ms mono 30.7 / 36.7 /
-  43.5 dB vs 21.4 / 33.8 / 42.0 at 40/80/160 B per frame, 20 ms
-  mono 24.3 / 29.2 / 34.9 vs 14.4 / 27.5 / 31.9, 10 ms stereo
-  15.9 / 23.8 / 29.9 vs 12.7 / 23.5 / 29.7 — with high-rate
-  coverage to 384 kb/s (above the listing at every point).
+  complete §5.3.1 pitch-prefilter chain — the §A.1 listing's pitch
+  estimator (2:1 downsampled LPC-whitened comb source, coarse
+  cross-correlation search, sub-harmonic check with continuity
+  credit) run alongside the crate's own full-rate autocorrelation
+  search, both gated by the §A.1 threshold/grid and the one whose
+  quantized comb leaves the least frame residual coded. On top of
+  the analysed decisions sits a **measured-cost election**
+  (`set_search_effort`, default 2): the §5.3.4.1 boost vector vs no
+  boosts, alloc-trim ±1, and on stereo the dual-stereo flip and
+  intensity ±2 are each carried through boosts / trim / VBR / the
+  exact allocation / fine energy / the band walk on a coder
+  snapshot, and the resynthesis closest to the analysed spectrum
+  (rate-normalized) is written — encoder freedom on the unchanged
+  wire. **Measured (r458, freshly built listing oracle):**
+  cross-decoder lockstep 99.4–133.0 dB float SNR on every LM x
+  channels combo; decoded quality **above** the §A.1 listing
+  encoder at every point of the r417 CBR sweep — 5 ms mono
+  36.2 / 45.0 / 52.8 dB vs 27.8 / 39.1 / 49.5 at 40/80/160 B per
+  frame, 10 ms mono 31.4 / 37.2 / 45.7 vs 21.4 / 33.8 / 42.0, 20 ms
+  mono 26.1 / 29.9 / 36.1 vs 14.4 / 27.5 / 31.9, 10 ms stereo
+  16.3 / 25.2 / 31.3 vs 12.7 / 23.5 / 29.7 — with high-rate
+  coverage to 384 kb/s (above the listing at every point); and on
+  the r458 **equal-rate matrix** (`tests/rate_matrix_oracle.rs`:
+  mono/stereo x 2.5/5/10/20 ms x 6–128 kb/s x steady tones /
+  harmonic "music" with hits / a panning stereo pair, both
+  encoders decoded through the listing decoder) the mean lead over
+  the listing is +1.5 / +1.7 / +1.5 dB at 5 / 10 / 20 ms (2.5 ms
+  at parity below 48 kb/s where neither codes shape, +0.4 to +8.8 dB
+  above), the worst point −0.6 dB (5 ms mono tones at 24 kb/s), the
+  stereo pair within ±0.1 dB of the listing at 20 ms and ahead at
+  5/10 ms. Before r458 the same matrix had the 5 ms low-rate points
+  at −1.1 to −5.9 dB and the 20 ms stereo pair at −0.6 to −2.1 dB
+  (the in-crate pitch search jittered the period and under-shot the
+  gain there; dynalloc boosts at 15-byte frames cost more than they
+  bought).
 * **Rate control**: CBR at any 2..=1275-byte budget (exact-size
   frames, decode-finite at every LM x channels); the §A.1 VBR
   controller (`encode_frame_vbr`) with transient boosts, drift
@@ -85,9 +110,16 @@ mono CBR (~20x realtime at 48 kHz), ~499 K/s on 20 ms stereo,
 decode/conceal walk (arm64, release; ~5.8x over the direct-form
 r451 decoder).
 
-**Boundaries and freedoms** (all documented in place): the §5.3.1
-pitch search and a handful of §5.3 decision maps are in-crate
-encoder freedom (RFC 6716 grants them; parity is measured above);
+**Boundaries and freedoms** (all documented in place): the second
+§5.3.1 pitch candidate, the residual-energy prefilter election and
+the measured-cost election of boosts / trim / stereo decisions are
+in-crate encoder freedom (RFC 6716 grants them; parity is measured
+above; effort 0 codes the analysed decisions directly); the
+reference-exact decoder reports a frame whose symbols run past its
+budget as `Error::CorruptFrame` after advancing its state exactly as
+the listing does (RFC 6716 §4.1.5; clamped symbols, end-of-frame
+check), and `Error::NotImplemented` is reachable only from the
+pre-r414 building blocks;
 custom-mode geometries whose half-short-size is not 5-smooth are
 constructed and coded by this crate but rejected by the oracle
 binary's transform planner, so they are covered by the
@@ -106,7 +138,11 @@ decode round trip** (CBR/VBR/constrained-VBR x band window x
 reduced-rate I/O — `expect` fires only on a real defect), Appendix-A
 **custom-mode construction** over arbitrary geometry, and a
 **full-rate <-> reduced-rate decode differential** (verdict lockstep
-+ factor-exact output lengths, concealment included). The corpora
++ factor-exact output lengths, concealment included); the encode
+target also drives the measured-cost election effort (0..=2) from
+the input. r458 re-ran `decode_frame` and `encode_roundtrip`
+bounded in the foreground after the election and corrupt-frame
+changes (200 s / 240 s, clean). The corpora
 seed from the staged fixture streams; the daily `Fuzz` workflow
 splits a 30-minute budget across the targets, and each target ran
 bounded (>= 20 min, rss-limited) at standup. First campaign finding,
@@ -710,8 +746,10 @@ Per-band shape-allocation assembly at a quality column (RFC 6716
   budget admits the `(0,0)` cell (otherwise it returns that floor cell,
   whose total is the minimum achievable). Input validation propagates
   from `combine_band_allocation`. The §2.7 hard-minimum **skip**
-  decision and the fine-energy/shape split remain deferred (same
-  docs-gap boundary).
+  decision and the fine-energy/shape split are not carried by this
+  building block; the reference-exact `alloc_exact` (the in-RFC
+  listing's `interp_bits2pulses`, driving both `ref_decode` and
+  `ref_encode`) carries them.
 
 Pyramid Vector Quantizer (RFC 6716 §4.3.4.2 decode + §5.3.8.1 encode):
 
@@ -854,12 +892,12 @@ page 118):
 * `plan_band_split(n, k, lm) -> BandSplitNode` descends the
   recursion from the given `(N, K, LM)` halving the band on each
   step until `band_needs_split` is `false`, the depth reaches
-  `LM + 1`, or `N` drops to `<= 1`. The quantized split-gain
-  parameter the §4.3.4.4 prose mentions to redistribute the L2
-  norm across the two halves is a docs gap (the RFC narrative
-  defers it to the reference implementation); the geometry tree
-  emitted here is wired up to a gain-aware leaf walker without
-  re-shaping when the gain decode lands.
+  `LM + 1`, or `N` drops to `<= 1`. The quantized split gain
+  (`itheta` — its `qn` derivation, PDF and precision) is not part of
+  this geometry-only block; the reference-exact `band_quant`
+  (`quant_all_bands` / `compute_qn`, transcribed from the in-RFC
+  listing) codes it on both the decode and encode sides, oracle
+  symbol-exact.
 * `MAX_LM = 3` pins the canonical CELT frame-size range
   (`LM ∈ {0, 1, 2, 3}` ↔ 2.5/5/10/20 ms frame durations).
 
@@ -943,9 +981,10 @@ Single-band shape-decode orchestrator (RFC 6716 §4.3.4 → §4.3.6):
   divisible by `nb_blocks`, or a TF request exceeding the available
   Hadamard levels).
 * The §4.3.4.4 split-gain band-split path and the stereo joint-coding
-  path remain out of scope for the same docs-gap reason (the precise
-  split-gain precision/PDF is deferred to the reference). Callers gate
-  on `band_needs_split(n, k)` before invoking this orchestrator.
+  path are not carried by this single-band block (it serves the
+  pre-r414 in-crate wire); both live in the reference-exact
+  `band_quant` walk. Callers of this block gate on
+  `band_needs_split(n, k)` before invoking it.
 
 Multi-band residual decode loop (RFC 6716 §4.3.4 → §4.3.6):
 
@@ -968,12 +1007,13 @@ Multi-band residual decode loop (RFC 6716 §4.3.4 → §4.3.6):
   §4.3.4 territory and does not depend on the RFC-deferred §4.3.3
   reallocation pass — the same boundary `bits_to_pulses_band_loop`
   already draws.
-* A saturated codebook (the §4.3.4.4 split gap), an indivisible block
-  count, or an over-large TF request surfaces as
-  `Error::NotImplemented` rather than a silent mis-decode;
+* A saturated codebook (a band this in-crate wire would have to
+  split), an indivisible block count, or an over-large TF request
+  surfaces as `Error::NotImplemented` rather than a silent mis-decode;
   length-mismatched per-band slices or an out-of-range window/`lm` are
   `Error::InvalidParameter`. This is the mono / per-channel, non-split
-  loop; stereo joint coding stays out of scope (§4.3.4.4 docs gap),
+  loop of the pre-r414 wire; the §4.3.4.4 split and stereo joint
+  coding are implemented in the reference-exact `band_quant` walk,
   and the §4.3.5 anti-collapse pass that follows it is applied by the
   frame drivers (r406).
 
@@ -1002,9 +1042,10 @@ Frame-prefix decode driver (RFC 6716 §4.3, Table 56):
   there: fine energy, the §4.3.4 residual loop, the §4.3.5
   anti-collapse bit + injection, and the §4.3.2.2 finalize backfill
   (r406). The reference-exact §4.3.3 reallocation bisection with
-  concurrent skip decoding remains the documented docs gap; the
-  in-crate derivation (`derive_band_allocation`) carries that seam
-  with documented in-crate rules.
+  concurrent skip decoding lives in `alloc_exact`
+  (`compute_allocation_exact`, used by both reference-exact
+  drivers); this earlier driver keeps the in-crate derivation
+  (`derive_band_allocation`) its wire was defined on.
 * Out-of-range `lm` (`> 3`) or band window (`start > end` /
   `end > 21`) is rejected with `Error::InvalidParameter` before any
   decode. Callers check `RangeDecoder::has_error()` after the call for
@@ -1079,10 +1120,11 @@ Long-MDCT synthesis spine (RFC 6716 §4.3.6 → §4.3.7):
   the frame without advancing either tail), with `reset()` zeroing both.
   `StereoChannel { Left, Right }` names the two interleave slots
   (`offset()` = 0/1). The §4.3.6 denormalization and §4.3.7 inverse MDCT
-  are per-channel and fully specified; only the §4.3.4.4 `itheta` mid/
-  side band coupling that produces the two channel spectra from the
-  bitstream is the documented docs gap, so this spine takes the two
-  channel spectra as input (the same boundary the mono spine draws).
+  are per-channel and fully specified; the §4.3.4.4 `itheta` mid/side
+  band coupling that produces the two channel spectra from the
+  bitstream is done by the reference-exact `band_quant` walk, so
+  this spine simply takes the two channel spectra as input (the same
+  boundary the mono spine draws).
 
 End-to-end frame decode → PCM (RFC 6716 §4.3, Table 56 → §4.3.7):
 
@@ -1115,8 +1157,10 @@ End-to-end frame decode → PCM (RFC 6716 §4.3, Table 56 → §4.3.7):
   and `bits_to_pulses_band_loop` keep). When that pass lands, the only
   change here is to compute these two vectors from the `FramePrefix`.
 * A stereo frame is rejected with `Error::NotImplemented` by the mono
-  driver (use the stereo drivers); a saturated codebook surfaces the
-  §4.3.4.4 split gap the same way. A `silence`-flagged frame decodes
+  driver (use the stereo drivers); a saturated codebook (the split
+  this wire does not carry) surfaces the same way — the
+  reference-exact `CeltRefDecoder` handles both. A `silence`-flagged
+  frame decodes
   to all-zero PCM. Transient frames decode through the §4.3.1
   short-block path (r406), including the §4.3.5 anti-collapse bit +
   injection and the §4.3.2.2 finalize backfill.
