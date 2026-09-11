@@ -6,6 +6,25 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ### Added
 
+* **Round-458 — §A.1 transient analysis; prefilter period x gain
+  grid; half-strength boost candidate**: the in-crate energy-ratio
+  transient detector is replaced by the listing's
+  `transient_analysis` (high-pass, per-half-overlap-block peaks,
+  the consecutive-quiet-block tests) — on the custom-mode A/B the
+  in-crate detector never flagged the burst/silence edges the
+  listing flags; the prefilter election now scores every period
+  candidate (both estimators' plus the previous frame's) against
+  both estimators' gated gains and their grid neighbours; and the
+  measured-cost election gains a half-strength boost vector.
+  Custom-mode oracle A/B: decoded quality ahead of or equal to the
+  listing at **18 of 18** points (was 10 of 18 at r442, 14 of 18
+  after the r458 election alone; the three mono long-frame points
+  that trailed by 0.7-1.3 dB now lead by +0.4 to +2.1). Equal-rate
+  matrix: no point more than 0.4 dB behind the listing, mean lead
+  +1.0 / +1.3 / +1.5 / +1.6 dB at 2.5 / 5 / 10 / 20 ms.
+
+### Added
+
 * **Round-458 — registry `search_effort` encoder option** (0..=2,
   default 2): the measured-cost election effort through
   `make_encoder` / the registry (`CeltEncoderOptions::search_effort`),

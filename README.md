@@ -33,16 +33,19 @@ built from that listing.
   band machinery, plus the full §5.3 decision layer — lambda-priced
   Viterbi TF analysis, two-pass coarse-energy RD, alloc-trim /
   spreading / dual-stereo analyses, Table-66 intensity threshold,
-  transient detection, the anti-collapse request rule, and the
+  the §A.1 transient analysis, the anti-collapse request rule, and the
   complete §5.3.1 pitch-prefilter chain — the §A.1 listing's pitch
   estimator (2:1 downsampled LPC-whitened comb source, coarse
   cross-correlation search, sub-harmonic check with continuity
   credit) run alongside the crate's own full-rate autocorrelation
   search, both gated by the §A.1 threshold/grid and the one whose
-  quantized comb leaves the least frame residual coded. On top of
-  the analysed decisions sits a **measured-cost election**
+  quantized comb leaves the least frame residual coded (every
+  period candidate — both estimators' and the previous frame's —
+  scored against both gated gains and their grid neighbours). On
+  top of the analysed decisions sits a **measured-cost election**
   (`set_search_effort`, default 2): the §5.3.4.1 boost vector vs no
-  boosts, alloc-trim ±1, and on stereo the dual-stereo flip and
+  boosts vs half-strength boosts, alloc-trim ±1, and on stereo the
+  dual-stereo flip and
   intensity ±2 are each carried through boosts / trim / VBR / the
   exact allocation / fine energy / the band walk on a coder
   snapshot, and the resynthesis closest to the analysed spectrum
@@ -60,11 +63,10 @@ built from that listing.
   mono/stereo x 2.5/5/10/20 ms x 6–128 kb/s x steady tones /
   harmonic "music" with hits / a panning stereo pair, both
   encoders decoded through the listing decoder) the mean lead over
-  the listing is +1.5 / +1.7 / +1.5 dB at 5 / 10 / 20 ms (2.5 ms
-  at parity below 48 kb/s where neither codes shape, +0.4 to +8.8 dB
-  above), the worst point −0.6 dB (5 ms mono tones at 24 kb/s), the
-  stereo pair within ±0.1 dB of the listing at 20 ms and ahead at
-  5/10 ms. Before r458 the same matrix had the 5 ms low-rate points
+  the listing is +1.0 / +1.3 / +1.5 / +1.6 dB at 2.5 / 5 / 10 /
+  20 ms (2.5 ms at parity below 48 kb/s where neither codes shape),
+  no point more than 0.4 dB behind, the stereo pair within ±0.3 dB
+  of the listing at 20 ms and ahead at 5/10 ms. Before r458 the same matrix had the 5 ms low-rate points
   at −1.1 to −5.9 dB and the 20 ms stereo pair at −0.6 to −2.1 dB
   (the in-crate pitch search jittered the period and under-shot the
   gain there; dynalloc boosts at 15-byte frames cost more than they
@@ -88,8 +90,9 @@ built from that listing.
   every input rate); Appendix-A **custom modes** for any legal
   geometry (8–96 kHz, 40–1024 even samples): mode construction
   reproduces every staged 48 kHz table bit-exactly, nine-point
-  oracle A/B symbol-exact both directions with quality within
-  ±1.5 dB (ahead at ten of eighteen), 44.1 kHz constrained-VBR
+  oracle A/B symbol-exact both directions with decoded quality
+  ahead of or equal to the listing at eighteen of eighteen points
+  (+0.0 to +4.5 dB; r458), 44.1 kHz constrained-VBR
   totals byte-equal; and **packet-loss concealment**
   (`decode_lost`: the reference pitch-locked LPC extrapolation for
   the first five losses, comfort noise toward the background floor
@@ -112,8 +115,9 @@ decode/conceal walk (arm64, release; ~5.8x over the direct-form
 r451 decoder).
 
 **Boundaries and freedoms** (all documented in place): the second
-§5.3.1 pitch candidate, the residual-energy prefilter election and
-the measured-cost election of boosts / trim / stereo decisions are
+§5.3.1 pitch candidate, the residual-energy prefilter election
+(period x gain grid) and the measured-cost election of boosts /
+trim / stereo decisions are
 in-crate encoder freedom (RFC 6716 grants them; parity is measured
 above; effort 0 codes the analysed decisions directly); the
 reference-exact decoder reports a frame whose symbols run past its

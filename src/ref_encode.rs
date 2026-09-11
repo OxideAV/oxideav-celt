@@ -344,30 +344,73 @@ fn tf_analysis(
     (tf_res, tf_sum)
 }
 
-/// Transient detector (encoder freedom, RFC 6716 §5.3.2 leaves the
-/// decision to the encoder): the pre-emphasized frame is cut into its
-/// `2^LM` short blocks and a frame is declared transient when a later
-/// block carries at least `TRANSIENT_RATIO` times the energy of every
-/// block before it (a hard onset that a single long MDCT would smear).
-fn detect_transient(chans: &[Vec<f32>], frame: usize, overlap: usize, lm: u32) -> bool {
-    if lm == 0 {
+/// The §A.1 transient analysis (`transient_analysis`, float build)
+/// over the prefiltered `[overlap history | frame]` blocks (channels
+/// summed): the `(1 - 2z^-1 + z^-2) / (1 - z^-1 + 0.5z^-2)` high-pass,
+/// the first 12 samples zeroed (unpropagated filter memory), the
+/// per-`overlap/2`-block peak magnitudes, and the two "consecutive
+/// quiet blocks" tests — three earlier blocks under 15 % / 40 % of a
+/// peak (counting twice under the lower threshold) or seven later
+/// blocks under 15 % of it flag the frame.
+fn transient_analysis(chans: &[Vec<f32>], len: usize, overlap: usize) -> bool {
+    let block = overlap / 2;
+    if block == 0 || len < block {
         return false;
     }
-    let blocks = 1usize << lm;
-    let sb = frame / blocks;
-    const TRANSIENT_RATIO: f32 = 40.0;
-    for ch in chans {
-        let cur = &ch[overlap..overlap + frame];
-        let mut max_prev = 1e-9f32;
-        for b in 0..blocks {
-            let e: f32 = cur[b * sb..(b + 1) * sb].iter().map(|v| v * v).sum();
-            if b > 0 && e > TRANSIENT_RATIO * max_prev {
-                return true;
+    let n = len / block;
+    let mut tmp: Vec<f32> = (0..len)
+        .map(|i| chans.iter().map(|c| c[i]).sum::<f32>())
+        .collect();
+    let (mut mem0, mut mem1) = (0f32, 0f32);
+    for v in tmp.iter_mut() {
+        let x = *v;
+        let y = mem0 + x;
+        mem0 = mem1 + y - 2.0 * x;
+        mem1 = x - 0.5 * y;
+        *v = y;
+    }
+    for v in tmp.iter_mut().take(12) {
+        *v = 0.0;
+    }
+    let bins: Vec<f32> = (0..n)
+        .map(|i| {
+            tmp[i * block..(i + 1) * block]
+                .iter()
+                .fold(0f32, |m, v| m.max(v.abs()))
+        })
+        .collect();
+    let mut is_transient = false;
+    for i in 0..n {
+        let t1 = 0.15 * bins[i];
+        let t2 = 0.4 * bins[i];
+        let t3 = 0.15 * bins[i];
+        let mut conseq = 0;
+        for &b in &bins[..i] {
+            if b < t1 {
+                conseq += 1;
             }
-            max_prev = max_prev.max(e);
+            if b < t2 {
+                conseq += 1;
+            } else {
+                conseq = 0;
+            }
+        }
+        if conseq >= 3 {
+            is_transient = true;
+        }
+        conseq = 0;
+        for &b in &bins[i + 1..] {
+            if b < t3 {
+                conseq += 1;
+            } else {
+                conseq = 0;
+            }
+        }
+        if conseq >= 7 {
+            is_transient = true;
         }
     }
-    false
+    is_transient
 }
 
 /// One candidate for the measured-cost election: the boost vector to
@@ -954,12 +997,21 @@ impl CeltRefEncoder {
                 let t = (est.period as usize).clamp(COMB_MIN_PERIOD, COMB_MAX_PERIOD - 2);
                 candidates.push((t, 0.7 * est.correlation.max(0.0)));
             }
-            let mut best_energy = f32::INFINITY;
-            for &(t, raw_gain) in &candidates {
-                let Some((g, q)) = self.gate_prefilter_gain(t, raw_gain, frame_bytes) else {
-                    continue;
-                };
-                let taps = POST_FILTER_TAPS_F32[prefilter_tapset];
+            // Period candidates: both estimators' periods plus the
+            // previous frame's (continuity avoids a crossfade); gain
+            // candidates: both estimators' raw gains, each gated and
+            // quantized, then the quantized grid neighbours.
+            let mut periods: Vec<usize> = candidates.iter().map(|c| c.0).collect();
+            if self.prefilter_gain > 0.0 {
+                periods.push(
+                    self.prefilter_period
+                        .clamp(COMB_MIN_PERIOD, COMB_MAX_PERIOD - 2),
+                );
+            }
+            periods.dedup();
+            let raw_gains: Vec<f32> = candidates.iter().map(|c| c.1).collect();
+            let taps = POST_FILTER_TAPS_F32[prefilter_tapset];
+            let residual = |t: usize, g: f32| -> f32 {
                 let mut energy = 0f32;
                 for n in COMB_MAX_PERIOD..COMB_MAX_PERIOD + frame {
                     let pred = taps[0] * dm[n - t]
@@ -968,12 +1020,31 @@ impl CeltRefEncoder {
                     let r = dm[n] - g * pred;
                     energy += r * r;
                 }
-                if energy < best_energy {
-                    best_energy = energy;
-                    pitch_index = t;
-                    gain1 = g;
-                    qg = q;
-                    pf_on = true;
+                energy
+            };
+            let mut best_energy = f32::INFINITY;
+            for &t in &periods {
+                let mut grid: Vec<i32> = Vec::with_capacity(6);
+                for &raw_gain in &raw_gains {
+                    if let Some((_, q)) = self.gate_prefilter_gain(t, raw_gain, frame_bytes) {
+                        for d in [-1, 0, 1] {
+                            let qd = q + d;
+                            if (0..=7).contains(&qd) && !grid.contains(&qd) {
+                                grid.push(qd);
+                            }
+                        }
+                    }
+                }
+                for &q in &grid {
+                    let g = 0.09375 * (q + 1) as f32;
+                    let energy = residual(t, g);
+                    if energy < best_energy {
+                        best_energy = energy;
+                        pitch_index = t;
+                        gain1 = g;
+                        qg = q;
+                        pf_on = true;
+                    }
                 }
             }
             if !pf_on {
@@ -1015,7 +1086,7 @@ impl CeltRefEncoder {
         self.prefilter_gain = gain1;
         self.prefilter_tapset = prefilter_tapset;
 
-        let want_transient = detect_transient(&blocks, frame, overlap, lm);
+        let want_transient = lm > 0 && transient_analysis(&blocks, frame + overlap, overlap);
 
         let mut is_transient = false;
         if !silence {
@@ -1451,6 +1522,20 @@ impl CeltRefEncoder {
                 err * (2.0 * rate / (channels * n_coded) as f64).exp2()
             };
             let no_boost = vec![0i32; end - start];
+            // Half-strength boosts: every requested band down to one
+            // quantum.
+            let half_boost: Vec<i32> = want_boost
+                .iter()
+                .zip(start..end)
+                .map(|(&b, j)| {
+                    if b > 0 {
+                        let width = channels as i32 * (m * (eb(j + 1) - eb(j))) as i32;
+                        (8 * width).min(width.max(48))
+                    } else {
+                        0
+                    }
+                })
+                .collect();
             let analysed = TailCandidate {
                 want_boost: &want_boost,
                 trim_delta: 0,
@@ -1465,6 +1550,12 @@ impl CeltRefEncoder {
                 });
             }
             if self.search_effort >= 2 {
+                if half_boost != want_boost && half_boost.iter().any(|&b| b != 0) {
+                    candidates.push(TailCandidate {
+                        want_boost: &half_boost,
+                        ..analysed
+                    });
+                }
                 for trim_delta in [-1, 1] {
                     candidates.push(TailCandidate {
                         trim_delta,
@@ -2017,7 +2108,7 @@ mod tests {
             // Cheap probe: decode and rely on internal consistency.
             let out = dec.decode_frame(&bytes).expect("decode");
             assert!(out.iter().all(|v| v.is_finite()));
-            any_transient |= detect_transient(
+            any_transient |= transient_analysis(
                 &[{
                     let mut b = vec![0f32; OVERLAP];
                     b.extend(
@@ -2027,9 +2118,8 @@ mod tests {
                     );
                     b
                 }],
-                frame,
+                frame + OVERLAP,
                 OVERLAP,
-                3,
             );
         }
         assert!(any_transient, "test signal never tripped the detector");
