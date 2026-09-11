@@ -37,10 +37,12 @@ fuzz_target!(|data: &[u8]| {
         ENDS[usize::from(b1) % ENDS.len()]
     };
     let vbr_mode = (b1 >> 4) & 3; // 0/1 = CBR, 2 = VBR, 3 = constrained VBR
+    let effort = (b1 >> 6) & 3; // measured-cost election effort (3 clamps to 2)
     let v = u16::from_le_bytes([b2, b3]);
 
     let mut enc =
         CeltRefEncoder::new_with_config(lm, channels, start, end, rate).expect("legal config");
+    enc.set_search_effort(effort);
     let mut dec =
         CeltRefDecoder::new_with_config(lm, channels, start, end, rate).expect("legal config");
     let spf = enc.input_frame_size() * channels;
