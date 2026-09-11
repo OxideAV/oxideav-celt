@@ -4,6 +4,14 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+* **Round-458 — registry `search_effort` encoder option** (0..=2,
+  default 2): the measured-cost election effort through
+  `make_encoder` / the registry (`CeltEncoderOptions::search_effort`),
+  validated at construction; registry test pins that every level
+  encodes and decodes and that effort 0 and 2 actually diverge.
+
 ### Changed
 
 * **Round-458 — decoder corrupt-frame semantics match the listing;

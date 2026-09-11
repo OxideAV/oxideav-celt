@@ -149,6 +149,11 @@ pub struct CeltEncoderOptions {
     /// Reduced-rate PCM input on the standard 48 kHz mode (see
     /// [`CeltCodecOptions::resample`]).
     pub resample: bool,
+    /// Measured-cost election effort (0..=2, default 2): the number
+    /// of decision candidates the encoder resynthesizes per frame
+    /// before writing the best one (see
+    /// [`CeltRefEncoder::set_search_effort`]).
+    pub search_effort: u32,
 }
 
 impl Default for CeltEncoderOptions {
@@ -157,6 +162,7 @@ impl Default for CeltEncoderOptions {
             frame_size: 960,
             vbr: false,
             vbr_constrained: false,
+            search_effort: 2,
             start_band: 0,
             end_band: 21,
             resample: false,
@@ -208,6 +214,14 @@ impl CodecOptionsStruct for CeltEncoderOptions {
                    upsampled input); sample_rate is the PCM rate (8/12/16/24/48 \
                    kHz), frame_size counts samples at it",
         },
+        OptionField {
+            name: "search_effort",
+            kind: OptionKind::U32,
+            default: OptionValue::U32(2),
+            help: "measured-cost election effort (0..=2): 0 codes the analysed \
+                   decisions in one band walk, 1 also tries no boosts, 2 adds \
+                   trim +-1 and the stereo dual/intensity candidates",
+        },
     ];
 
     fn apply(&mut self, key: &str, value: &OptionValue) -> CoreResult<()> {
@@ -218,6 +232,7 @@ impl CodecOptionsStruct for CeltEncoderOptions {
             "start_band" => self.start_band = value.as_u32()?,
             "end_band" => self.end_band = value.as_u32()?,
             "resample" => self.resample = value.as_bool()?,
+            "search_effort" => self.search_effort = value.as_u32()?,
             _ => unreachable!("guarded by SCHEMA"),
         }
         Ok(())
@@ -634,7 +649,17 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core
 
     Ok(Box::new(CeltEncoder {
         id: CodecId::new(CODEC_ID),
-        inner: build_ref_encoder(&cfg, start, end)?,
+        inner: {
+            if enc_opts.search_effort > 2 {
+                return Err(CoreError::invalid(format!(
+                    "celt: search_effort must be 0..=2 (got {})",
+                    enc_opts.search_effort
+                )));
+            }
+            let mut inner = build_ref_encoder(&cfg, start, end)?;
+            inner.set_search_effort(enc_opts.search_effort as u8);
+            inner
+        },
         output_params,
         sample_rate,
         channels,
@@ -765,6 +790,50 @@ mod tests {
     /// short-term rate, so the constrained stream's total bytes never
     /// exceed the unconstrained run's on the same input, and it still
     /// decodes through the registry decoder.
+    /// The `search_effort` encoder option: every level encodes and
+    /// decodes through the registry, 3 is rejected, and level 0
+    /// differs from the default (the election actually runs).
+    #[test]
+    fn registry_search_effort_option() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut streams = Vec::new();
+        for effort in ["0", "1", "2"] {
+            let mut p = params(2, 480, Some(64_000));
+            p.options.insert("search_effort", effort);
+            let mut enc = ctx.codecs.first_encoder(&p).expect("encoder");
+            let mut dec = ctx
+                .codecs
+                .first_decoder(&params(2, 480, None))
+                .expect("decoder");
+            for f in 0..12usize {
+                enc.send_frame(&tone_frame(480, 2, f * 480)).expect("send");
+            }
+            enc.flush().expect("flush");
+            let mut bytes = Vec::new();
+            loop {
+                match enc.receive_packet() {
+                    Ok(pk) => {
+                        bytes.extend_from_slice(&pk.data);
+                        dec.send_packet(&pk).expect("decode");
+                        dec.receive_frame().expect("frame");
+                    }
+                    Err(CoreError::Eof) => break,
+                    Err(e) => panic!("unexpected encoder error: {e:?}"),
+                }
+            }
+            assert!(!bytes.is_empty());
+            streams.push(bytes);
+        }
+        assert_ne!(
+            streams[0], streams[2],
+            "effort 0 and 2 elected the same on every frame"
+        );
+        let mut p = params(2, 480, Some(64_000));
+        p.options.insert("search_effort", "3");
+        assert!(ctx.codecs.first_encoder(&p).is_err());
+    }
+
     #[test]
     fn registry_vbr_constrained_option() {
         let mut ctx = RuntimeContext::new();

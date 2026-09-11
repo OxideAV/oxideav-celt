@@ -99,7 +99,8 @@ built from that listing.
   / `make_encoder` factories (the workspace dual-API convention) —
   one raw CELT frame per packet, interleaved-f32 frames, options
   `frame_size`, `start_band`, `end_band`, `resample`, `vbr`,
-  `vbr_constrained`; empty packets conceal through `decode_lost`.
+  `vbr_constrained`, `search_effort`; empty packets conceal through
+  `decode_lost`.
 
 **Performance (r454).** `benches/decode.rs` holds the decode
 baseline: with the standard-mode IMDCT cosine basis cached
