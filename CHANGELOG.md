@@ -4,6 +4,196 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.13...v0.2.0) - 2026-09-12
+
+### Other
+
+- release v0.1.13 ([#16](https://github.com/OxideAV/oxideav-celt/pull/16))
+- §A.1 transient analysis; prefilter period x gain grid; half-strength boost candidate
+- search_effort encoder option (measured-cost election effort 0..=2)
+- r458 status — prefilter election, measured-cost election, equal-rate matrix, corrupt-frame semantics; the §4.3.4.4 split / joint-stereo / §4.3.3 boundaries now point at the reference-exact layer
+- encode_roundtrip drives the measured-cost election effort (0..=2) from the input
+- corrupt-frame semantics match the listing — Error::CorruptFrame, no NotImplemented on the exact decode path
+- measured-cost election of boosts / trim / dual-stereo / intensity on a coder snapshot
+- §A.1 pitch estimator elected against the in-crate search by residual energy; equal-rate oracle matrix
+- release v0.1.12 ([#15](https://github.com/OxideAV/oxideav-celt/pull/15))
+- rewrite the status prose — current-state README + crate docs, Fuzzing section
+- cache the standard-mode IMDCT cosine basis — bit-identical, ~5.8x throughput
+- criterion decode-throughput baseline (depth-mode tail)
+- RFC 8251 sec 8 cap on band energy — hostile streams stay NaN-free (fuzz finding)
+- stand up the cargo-fuzz harness — five coverage-guided targets + daily workflow
+- r451 status — reduced-rate I/O, CELT-mode bandwidths, loss concealment
+- end-band configurations: the RFC 6716 CELT-mode bandwidths on both sides
+- empty packets conceal through decode_lost
+- packet-loss concealment — the reference celt_decode_lost walk
+- clippy 1.98: needless_late_init + manual_slice_fill sweep
+- reduced-rate oracle A/B — decode lockstep 108 dB, encode parity within 0.1 dB
+- resample option — standard-mode reduced-rate PCM I/O through both factories
+- RFC 6716 reduced input rates (24/16/12/8 kHz into the standard mode)
+- RFC 6716 downsampled output rates (24/16/12/8 kHz from the standard mode)
+- re-measured self round-trip SNR range after the pitch fix
+- README/CHANGELOG — pitch fix + cvbr byte-parity in the r442 record
+- pitch search — demote high-order multiples; amplitude-aware comb gain
+- README + CHANGELOG — r442 custom modes: the last 'lacks' closes
+- non-48 kHz sample rates through the codec factories
+- custom-mode black-box oracle A/B — symbol-exact interop at 8-96 kHz
+- custom-mode encode + decode — non-48 kHz operating points end to end
+- thread the mode through the exact allocation + band walk; MAX_BANDS state
+- custom-mode construction — full mode geometry from (rate, frame size)
+- release v0.1.11 ([#14](https://github.com/OxideAV/oxideav-celt/pull/14))
+- README + CHANGELOG — r434 VBR oracle validation, hybrid layer, high-rate
+- multi-rate VBR oracle A/B — 32/96/128 kb/s, both modes
+- registry vbr_constrained + start_band options
+- high-rate coverage — 192/384 kb/s sweep, oracle A/B beats reference
+- Hybrid-mode CELT layer — start=17 encode + decode, oracle-exact
+- $A.1-exact silence detection + VBR oracle A/B regression
+- decode the staged VBR/CVBR oracle sets in the raw-frame regression
+- r419 README/CHANGELOG — encoder beats the listing at every measured rate
+- $A.1 VBR controller — encode_frame_vbr + registry 'vbr' option
+- $A.1 stereo_analysis dual/MS verdict + consec-transient anti-collapse
+- signal the §5.3.1 pitch prefilter — the reference encoder's tonal RD lever
+- clippy fixes for the coarse-RD commit (iterator loops, dead tell)
+- two-pass badness-driven coarse-energy RD ($A.1 quant_coarse_energy)
+- listing-exact alloc-trim analysis + stereo-averaged dynalloc contrast
+- lambda-priced Viterbi TF analysis on long and transient frames
+- request §4.3.5 anti-collapse on transient frames
+- raw-frame fixture regression — reference-exact decode gated on the staged listing-encoded sets
+- r417 README/lib.rs/decision-docs — encoder arc + registry status
+- per-band §4.3.4.5 TF encode machinery + transient TF decision + budget-gate sweep
+- §5.3.5 stereo decisions — Table-66 intensity threshold + L1 mid/side-vs-dual verdict
+- oxideav-core registry wiring — Decoder + Encoder registration with dual-API factories
+- reference-compatible encoder arc — exact Table-56 encode walk + §A.1-listing cross-decode validation
+- mark internal §4.3 chain + ref-decode plumbing #[doc(hidden)]
+- r414 README/CHANGELOG/status — reference-exact decode milestone
+- deduplicate the black-box stream plumbing into tests/common
+- black-box reference-decode sweep — 133-137 dB float SNR at every frame size, mono and stereo
+- reference-exact end-to-end frame decoder — real reference streams decode at the comparison floor
+- reference-exact §4.3.4 band-quantization loop (splits, itheta, folding, collapse masks)
+- reference-exact §4.3.3 allocation walk from the normative Appendix A listing
+- r408 README/status — reallocation walk + interop energy convention
+- wire-interop absolute energy convention + black-box reference harness
+- wire the §4.3.3 reallocation walk into every frame driver
+- §4.3.3 reallocation walk per the staged behavioral spec
+- §4.3.3 static allocation takes base-width N — fix the 2^LM inflation
+- decode_stereo_frame doc — coarse-only prediction on the input-boundary variant
+- §4.3.2.1 fine-energy feedback into the inter-frame prediction + RFC 8251 §8 energy cap
+- r406 docs — README/CHANGELOG/lib.rs for the transient + anti-collapse + finalize round
+- §4.3.2.2 final fine-energy backfill wired through the codec loops
+- transient frame encode — the PCM codec loop closes over short-block frames
+- transient frame decode + §4.3.5 anti-collapse wired through every decode driver
+- §4.3.5 anti-collapse injection primitive
+- §4.3.4.5 inverse TF transform for the encode direction
+- transient frame spines — synthesize_frame / analyze_frame over one shared overlap state
+- §4.3.1/§4.3.7 transient short-block WOLA primitives
+- README — r393 §5.3.1 pitch pre-filter section + stale post-filter-rejection claims updated
+- §5.3.1 pitch pre-filter wired into the mono PCM loop + §4.3.7.1 history fixes
+- §5.3.1 pitch pre-filter inverse + pitch search
+- r393 docs — README/CHANGELOG for the corrected-cache allocation round + tightened fidelity assertions
+- in-crate fine/shape split — derived fine-energy bits in the auto codec loops
+- §4.3.3 hard-minimum skip floor in the pulse derivation
+- bit-exact cache pricing in the pulse derivation + rigorous budget fit
+- corrected LM-major pulse-cache mapping (docs #184) + combinatoric validation
+- add CI / crates.io / docs.rs / MIT-license badges
+- stereo-loop depth coverage — narrow band window + mixed sound/silence stream
+- README + crate docs — document the r389 stereo codec loop subsystem
+- §5.3.5 stereo decisions — mid/side-vs-dual L1 rule + Table 66 intensity thresholds
+- §5.3.4.2 allocation-trim decision, wired through the auto encoders
+- stereo PCM codec loop (StereoCeltEncodeState + encode_stereo_celt_frame_pcm[_auto])
+- dual-stereo frame codec + §4.3.4.1 balance-conservation fix
+- dual-stereo residual walk + shared per-band pulse derivation
+- release v0.1.10 ([#13](https://github.com/OxideAV/oxideav-celt/pull/13))
+- §5.3.3 intra/inter coarse-mode decision (choose_intra_mode)
+- README — document the r385 PCM analysis front end + PCM codec loop subsystem
+- stereo PCM analysis front end (StereoPcmAnalysis)
+- silence-frame encode/decode through the self-contained loop
+- §5.3.4.1 encoder band-boost decision (encoder_decisions), wired through the auto encoders
+- end-to-end PCM codec-loop integration tests (tests/pcm_codec_loop.rs)
+- PCM-consuming frame encoder (CeltEncodeState + encode_celt_frame_pcm[_auto])
+- long-MDCT analysis spine (LongMdctAnalysis + extract_coded_spectrum)
+- streaming windowed forward-MDCT analysis (MdctAnalysis, mirror of MdctSynthesis)
+- §4.3.7.2 encoder-side pre-emphasis (Preemphasis, FIR inverse of Deemphasis)
+- README — document the r382 end-to-end mono frame encode subsystem
+- caller-input-free encode (encode_celt_frame_auto) — self-contained codec loop
+- full mono CELT frame encoder (encode_celt_frame) + end-to-end round-trip
+- Table-56 frame-prefix encode driver + §5.1 fixed-size frame assembly
+- §4.3.3 band-boost (dynalloc) encode (encode_band_boosts)
+- §4.3.2.2 fine-energy quantization from an f32 residual
+- energy encode->decode pipeline integration test
+- §4.3.6 band energy analysis (encode front-end)
+- coarse-energy encode in the Table-56 frame chain (integration test)
+- §4.3.2.1 coarse-energy encode (encode_coarse_energy)
+- §4.3.2.1 Laplace-symbol encode (ec_laplace_encode)
+- assembled control-symbol encode chain integration test
+- §4.3.3 band-allocation field encode — inverse of decode_band_allocation
+- §4.3.4.3 spread encode — inverse of decode_spread
+- §4.3.4.5 TF-parameter encode — inverse of decode_tf_parameters
+- §4.3 frame-prefix encode — inverse of decode_prefix
+- §4.3.4.2 PVQ shape encode into the range coder
+- §4.3.2.2 fine-energy encode — inverse of decode_fine_energy
+- §5.1 range encoder — exact inverse of the §4.1 range decoder
+- extend §4.3.7.1 post-filter transition to the stereo path
+- wire §4.3.7.1 post-filter transition into decode_celt_frame
+- §4.3.7.1 post-filter cross-frame gain-transition crossfade
+- caller-input-free mono decode — derive_band_pulses + decode_celt_frame_auto
+- paraphrase two residual reference-code mentions in doc comments
+- fix laplace_constants test for standalone CI (no docs/ include_str!)
+- stereo frame-decode integration test (tests/stereo_decode.rs)
+- stereo frame-decode driver (bitstream prefix + coarse energy -> interleaved PCM)
+- re-anchor §4.3.2.1 Laplace/coarse-energy provenance to clean-room narrative
+- PVQ encode→decode round-trip integration test
+- PVQ encoder codeword search (§5.3.8.1) + encode_unit_shape
+- PVQ codeword index encode — inverse of §4.3.4.2 decode loop
+- pin documented allocation→pulses→synthesis seam (r348)
+- README — document the stereo synthesis path + sharpen the gap list
+- stereo synthesis-chain integration test (energy → denorm → PCM)
+- stereo long-MDCT synthesis spine (§4.3.6→§4.3.7 per channel)
+- neutralise enumerated-denial prose in e_prob_model provenance doc-comment
+- end-to-end frame decode → PCM orchestrator (RFC 6716 §4.3 Table 56 → §4.3.7)
+- §4.3.6→§4.3.7 long-MDCT synthesis spine (place_residual_spectrum + LongMdctSynthesis)
+- §4.3.3 combined-candidate quality-column search (find_combined_alloc)
+- §4.3.3 per-band shape-allocation assembly at a quality column (alloc_combine)
+- §4.3.4 multi-band residual decode loop (residual)
+- §4.3.4.1 bit-exact pulse-cost cache (cache_index50/cache_bits50)
+- refresh to current status, drop per-round changelog cruft
+- release v0.1.9 ([#12](https://github.com/OxideAV/oxideav-celt/pull/12))
+- round-29 §4.3 MDCT band-layout module (RFC 6716 Table 55)
+- §4.3 frame-prefix decode driver (Table 56 integration spine)
+- celt r297: bump README status header to round-27
+- celt r297: §4.3.3 per-band interpolated allocation vector (window_static_alloc_per_band_1_8th)
+- §4.3.2 final per-band log-energy assembly + Q8 bridge
+- release v0.1.8 ([#11](https://github.com/OxideAV/oxideav-celt/pull/11))
+- round-25 §4.3.2.1 ec_laplace_decode + coarse-energy decode (RFC 6716 Appendix A)
+- round-24 §4.3.7 inverse MDCT + low-overlap window (RFC 6716)
+- round-23 §4.3.4 → §4.3.6 single-band shape-decode orchestrator (RFC 6716)
+- round-22 §4.3.6 band denormalization (RFC 6716)
+- round-21 §4.3.2.1 e_prob_model Laplace-parameter table (RFC 6716)
+- scrub pre-existing enumerated denial in hadamard.rs + CHANGELOG
+- round-20 §4.3.4.4 PVQ band-split gating + recursion geometry (RFC 6716)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round-19 §4.3.4.3 spreading rotation chain (RFC 6716)
+- round-18 §4.3.4.1 bits-to-pulses search + balance accumulator (RFC 6716)
+- round-17 §4.3.4.2 PVQ codebook + per-band shape decoder (RFC 6716)
+- round-16 §4.3.3 static-allocation search (RFC 6716)
+- round-15 §4.3.3 Table 57 static-allocation table (RFC 6716)
+- round-14 §4.3.3 §2.6 minimums + trim_offsets + Table 55 (RFC 6716)
+- round-13 §4.3.3 initial-reservations budget walk (RFC 6716)
+- round-12 §4.3.3 cache_caps50 + band-boost decode (RFC 6716)
+- round-11 §4.3.4.5 Hadamard transform primitives (RFC 6716)
+- release v0.1.7 ([#10](https://github.com/OxideAV/oxideav-celt/pull/10))
+- round-10 §4.3.3 stereo reservation: LOG2_FRAC_TABLE + intensity_rsv + reserve_stereo (RFC 6716)
+- round-9 §4.3.7.1 post-filter + §4.3.7.2 de-emphasis (RFC 6716)
+- release v0.1.6 ([#9](https://github.com/OxideAV/oxideav-celt/pull/9))
+- round-8 §4.3.4.3 spreading parameter + Table 56 / Table 59 (RFC 6716)
+- round-7 §4.3.2.2 fine-energy refinement + finalize step (RFC 6716)
+- scrub external-name disclaimer (clean-room hygiene)
+- round-6 §4.3.4.5 time-frequency change: per-band tf_change + gated tf_select + Tables 60–63 (RFC 6716)
+- round-5 §4.3.3 bit-allocation fields: alloc.trim / skip / intensity / dual (RFC 6716)
+- round-4 coarse-energy scaffold: 21-band layout + intra prediction filter + DOCS GAP (RFC 6716 §4.3.2.1)
+- round-3 frame header: silence/post-filter/transient/intra prefix + deferred anti-collapse (RFC 6716 §4.3, §4.3.5, §4.3.7.1)
+- round-2 entropy primitives: ec_decode_bin / ec_dec_icdf / ec_tell_frac (RFC 6716 §4.1.3.1, §4.1.3.3, §4.1.6.2)
+- round-1 bootstrap: bit-exact CELT/SILK range decoder (RFC 6716 §4.1)
+- orphan rebuild: clean-room scaffold post 2026-05-20 audit
+
 ## [0.1.13](https://github.com/OxideAV/oxideav-celt/compare/v0.1.12...v0.1.13) - 2026-09-11
 
 ### Other
