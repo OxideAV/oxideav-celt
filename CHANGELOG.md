@@ -4,6 +4,18 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/OxideAV/oxideav-celt/compare/v0.1.12...v0.1.13) - 2026-09-11
+
+### Other
+
+- §A.1 transient analysis; prefilter period x gain grid; half-strength boost candidate
+- search_effort encoder option (measured-cost election effort 0..=2)
+- r458 status — prefilter election, measured-cost election, equal-rate matrix, corrupt-frame semantics; the §4.3.4.4 split / joint-stereo / §4.3.3 boundaries now point at the reference-exact layer
+- encode_roundtrip drives the measured-cost election effort (0..=2) from the input
+- corrupt-frame semantics match the listing — Error::CorruptFrame, no NotImplemented on the exact decode path
+- measured-cost election of boosts / trim / dual-stereo / intensity on a coder snapshot
+- §A.1 pitch estimator elected against the in-crate search by residual energy; equal-rate oracle matrix
+
 ### Added
 
 * **Round-458 — §A.1 transient analysis; prefilter period x gain
