@@ -4,6 +4,12 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.14...v0.2.0) - 2026-10-23
+
+### Other
+
+- edition 2024, MSRV 1.95
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
