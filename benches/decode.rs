@@ -23,7 +23,7 @@
 //!     (alternating decode/conceal), the §4.3 concealment walk's
 //!     cost next to a clean decode.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use oxideav_celt::ref_decode::CeltRefDecoder;
 use oxideav_celt::ref_encode::CeltRefEncoder;
 

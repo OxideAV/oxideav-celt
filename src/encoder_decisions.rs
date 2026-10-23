@@ -84,11 +84,7 @@ use crate::coarse_energy::NUM_BANDS;
 /// units: `(2, 4)` for `LM >= 1`, `(3, 5)` for `LM < 1`.
 #[inline]
 pub fn boost_thresholds(lm: u32) -> (f32, f32) {
-    if lm >= 1 {
-        (2.0, 4.0)
-    } else {
-        (3.0, 5.0)
-    }
+    if lm >= 1 { (2.0, 4.0) } else { (3.0, 5.0) }
 }
 
 /// The §4.3.3 dynalloc boost quantum for a band of `n` MDCT bins, in
@@ -181,11 +177,7 @@ pub fn spectral_tilt_slope(window_log_energy: &[f32]) -> f32 {
         num += dx * (e - mean_y);
         den += dx * dx;
     }
-    if den > 0.0 {
-        num / den
-    } else {
-        0.0
-    }
+    if den > 0.0 { num / den } else { 0.0 }
 }
 
 /// The normalized inter-channel correlation over the first 8 coded
@@ -390,11 +382,7 @@ pub const MID_SIDE_DECISION_BANDS: usize = 13;
 /// mid-side).
 #[inline]
 pub fn mid_side_extra_dof(lm: u32) -> u32 {
-    if lm > 1 {
-        13
-    } else {
-        5
-    }
+    if lm > 1 { 13 } else { 5 }
 }
 
 /// The §5.3.5 mid/side-vs-dual stereo decision.
@@ -690,7 +678,7 @@ mod tests {
         assert_eq!(choose_alloc_trim(&flat, Some(1.0)), 1); // 5 - 4
         assert_eq!(choose_alloc_trim(&flat, Some(0.5)), 4); // 4*0.25 = 1
         assert_eq!(choose_alloc_trim(&flat, Some(0.2)), 5); // ~0.16 rounds to 0
-                                                            // Steep high tilt + full correlation: 5 - 2 - 4 = -1 → clamp 0.
+        // Steep high tilt + full correlation: 5 - 2 - 4 = -1 → clamp 0.
         let steep_high: Vec<f32> = (0..NUM_BANDS).map(|b| b as f32).collect();
         assert_eq!(choose_alloc_trim(&steep_high, Some(1.0)), 0);
         // Out-of-range correlation input saturates safely.
@@ -823,7 +811,7 @@ mod tests {
     /// a spread of states × targets × frame sizes.
     #[test]
     fn intra_mode_matches_manual_cost_comparison() {
-        use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS};
+        use crate::coarse_energy::{CoarseEnergyState, MAX_CHANNELS, encode_coarse_energy};
         use crate::range_encoder::RangeEncoder;
 
         let budget = 96u32 * 8;
@@ -879,7 +867,7 @@ mod tests {
     /// 3-bit flag) again.
     #[test]
     fn stationary_stream_prefers_inter() {
-        use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS};
+        use crate::coarse_energy::{CoarseEnergyState, MAX_CHANNELS, encode_coarse_energy};
         use crate::range_encoder::RangeEncoder;
 
         let budget = 96u32 * 8;

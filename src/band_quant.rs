@@ -24,13 +24,13 @@
 //! `bit-interleave-table.csv`, `bit-deinterleave-table.csv`,
 //! `exp2-table8.csv`).
 
-use crate::alloc_exact::{get_pulses, BITRES, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE};
+use crate::Error;
+use crate::alloc_exact::{BITRES, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE, get_pulses};
 use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
 use crate::pvq::{decode_pulses, encode_pulses, pvq_search};
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::spread::Spread;
-use crate::Error;
 
 /// The §4.3.5 linear congruential generator (Appendix A `bands.c`
 /// `celt_lcg_rand`).
@@ -621,18 +621,20 @@ fn quant_band(
     // If we need 1.5 more bits than the band can produce, split it.
     let mut split = stereo;
     let mut split_lm = lm;
-    if !stereo && lm != -1 && n > 2 {
-        if let Some(cache) = ctx.mode.cache_row(band, lm) {
-            let max_cost = cache[cache[0] as usize] as i32;
-            if b > max_cost + 12 {
-                n >>= 1;
-                split = true;
-                split_lm = lm - 1;
-                if b_blocks == 1 {
-                    fill = (fill & 1) | (fill << 1);
-                }
-                b_blocks = b_blocks.div_ceil(2);
+    if !stereo
+        && lm != -1
+        && n > 2
+        && let Some(cache) = ctx.mode.cache_row(band, lm)
+    {
+        let max_cost = cache[cache[0] as usize] as i32;
+        if b > max_cost + 12 {
+            n >>= 1;
+            split = true;
+            split_lm = lm - 1;
+            if b_blocks == 1 {
+                fill = (fill & 1) | (fill << 1);
             }
+            b_blocks = b_blocks.div_ceil(2);
         }
     }
 
@@ -1433,7 +1435,7 @@ mod tests {
     /// run the identical arithmetic, RFC 6716 §4.3.3 lines 6113–6118).
     #[test]
     fn band_walk_encode_decode_lockstep() {
-        use crate::alloc_exact::{compute_allocation_exact, AllocIo};
+        use crate::alloc_exact::{AllocIo, compute_allocation_exact};
         use crate::band_cap::compute_band_caps;
         use crate::band_minimums::BAND_BINS_LM;
         use crate::coarse_energy::NUM_BANDS;
@@ -1452,7 +1454,7 @@ mod tests {
             let stereo = channels == 2;
             // Deterministic pseudo-random input spectra.
             let mut rng = 0x1234_5678u32;
-            let mut gen = |len: usize| -> Vec<f32> {
+            let mut r#gen = |len: usize| -> Vec<f32> {
                 (0..len)
                     .map(|_| {
                         rng = celt_lcg_rand(rng);
@@ -1460,8 +1462,8 @@ mod tests {
                     })
                     .collect()
             };
-            let mut x_enc = gen(n_coded);
-            let mut y_enc_v = gen(n_coded);
+            let mut x_enc = r#gen(n_coded);
+            let mut y_enc_v = r#gen(n_coded);
 
             let bins: Vec<u32> = BAND_BINS_LM[lm as usize].to_vec();
             let mut caps16 = vec![0i16; NUM_BANDS];

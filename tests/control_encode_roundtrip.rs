@@ -14,10 +14,10 @@
 //! exercises the contiguous chain of fully-specified encoders.
 
 use oxideav_celt::{
-    decode_band_allocation, decode_fine_energy_band, decode_pulses, decode_spread,
-    decode_tf_parameters, encode_band_allocation, encode_fine_energy_band, encode_shape,
-    encode_spread, encode_tf_parameters, fine_correction_q14, BandAllocation, BandAllocationGates,
-    CeltFrameHeader, PostFilter, RangeDecoder, RangeEncoder, Spread, TfParameters,
+    BandAllocation, BandAllocationGates, CeltFrameHeader, PostFilter, RangeDecoder, RangeEncoder,
+    Spread, TfParameters, decode_band_allocation, decode_fine_energy_band, decode_pulses,
+    decode_spread, decode_tf_parameters, encode_band_allocation, encode_fine_energy_band,
+    encode_shape, encode_spread, encode_tf_parameters, fine_correction_q14,
 };
 
 #[test]

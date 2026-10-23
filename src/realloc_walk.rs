@@ -42,13 +42,13 @@
 //!
 //! No external library source was consulted.
 
+use crate::Error;
 use crate::band_minimums::SHORT_FRAME_BAND_BINS;
 use crate::coarse_energy::NUM_BANDS;
 use crate::fine_energy::{FinalizePriority, MAX_FINE_BITS};
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
 use crate::static_alloc::{NUM_Q, STATIC_ALLOC};
-use crate::Error;
 
 /// Cost of one coded skip bit in 1/8-bit units (`{1,1}/2` PDF — one
 /// whole bit, RFC 6716 Table 56 / §4.3.3).
@@ -457,7 +457,7 @@ pub fn realloc_walk(
 mod tests {
     use super::*;
     use crate::band_cap::compute_band_caps;
-    use crate::band_minimums::{compute_thresh, compute_trim_offsets, BAND_BINS_LM};
+    use crate::band_minimums::{BAND_BINS_LM, compute_thresh, compute_trim_offsets};
 
     /// Assemble a full 21-band mono/stereo input set at `lm`.
     struct Fixture {

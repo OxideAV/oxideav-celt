@@ -46,7 +46,7 @@
 //! page 117 of `docs/audio/opus/rfc6716-opus.txt`). No external
 //! implementation was consulted.
 
-use crate::spread::{pre_rotation_stride, rotation_gain_squared_ratio, Spread};
+use crate::spread::{Spread, pre_rotation_stride, rotation_gain_squared_ratio};
 
 /// Minimum per-block sample count that enables the §4.3.4.3 "extra
 /// rotation" by `(pi/2 - theta)`.
@@ -158,7 +158,7 @@ pub fn apply_nd_rotation_multi_block(samples: &mut [f32], nb_blocks: u32, theta:
         return false;
     }
     let nb = nb_blocks as usize;
-    if samples.len() % nb != 0 {
+    if !samples.len().is_multiple_of(nb) {
         return false;
     }
     if theta == 0.0 {
@@ -229,7 +229,7 @@ pub fn apply_pre_rotation(samples: &mut [f32], nb_blocks: u32, theta: f64) -> bo
         return false;
     }
     let nb = nb_blocks as usize;
-    if samples.len() % nb != 0 {
+    if !samples.len().is_multiple_of(nb) {
         return false;
     }
     let per_block_u32 = (samples.len() / nb) as u32;
@@ -321,7 +321,7 @@ pub fn apply_spread(spread: Spread, samples: &mut [f32], k: u32, nb_blocks: u32)
     if nb_blocks == 0 || samples.is_empty() {
         return false;
     }
-    if samples.len() % (nb_blocks as usize) != 0 {
+    if !samples.len().is_multiple_of(nb_blocks as usize) {
         return false;
     }
     if matches!(spread, Spread::None) {

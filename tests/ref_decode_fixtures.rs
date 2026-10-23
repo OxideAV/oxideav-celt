@@ -136,7 +136,9 @@ fn celt_raw_frame_fixture_reference_exactness() {
         let frames = std::fs::read(d.join("frames.bin")).expect("frames.bin");
         let expected: Vec<f32> = std::fs::read(d.join("expected.f32"))
             .expect("expected.f32")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let mut dec = CeltRefDecoder::new(lm, channels).expect("decoder");

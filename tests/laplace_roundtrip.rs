@@ -18,9 +18,9 @@
 //! `ec_enc_done`).
 
 use oxideav_celt::{
-    decode_coarse_energy, ec_laplace_decode, CoarseEnergyState, RangeDecoder, BETA_COEF_Q15,
-    E_PROB_MODEL, INTRA_BETA_Q15, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN, MAX_BANDS,
-    MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, PRED_INTER, PRED_INTRA, SMALL_ENERGY_ICDF,
+    BETA_COEF_Q15, CoarseEnergyState, E_PROB_MODEL, INTRA_BETA_Q15, LAPLACE_LOG_MINP, LAPLACE_MINP,
+    LAPLACE_NMIN, MAX_BANDS, MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15, PRED_INTER, PRED_INTRA,
+    RangeDecoder, SMALL_ENERGY_ICDF, decode_coarse_energy, ec_laplace_decode,
 };
 
 // ---- test-only range encoder (RFC 6716 Appendix A entenc.c) ----

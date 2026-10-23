@@ -55,9 +55,9 @@
 //! (`docs/audio/opus/rfc6716-opus.txt`). No external implementation
 //! was consulted.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// Number of `(LM, tf_change)` columns in each TF adjustment sub-table.
 ///

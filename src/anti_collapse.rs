@@ -69,11 +69,7 @@ pub const ENERGY_HISTORY_FLOOR_LOG2: f32 = -28.0;
 #[inline]
 fn next_sign(seed: &mut u32) -> f32 {
     *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-    if *seed & 0x8000_0000 != 0 {
-        -1.0
-    } else {
-        1.0
-    }
+    if *seed & 0x8000_0000 != 0 { -1.0 } else { 1.0 }
 }
 
 /// Apply the §4.3.5 anti-collapse injection to a decoded (denormalized)
@@ -141,7 +137,7 @@ pub fn apply_anti_collapse(
         offset += n;
 
         let sub = n / nb_blocks;
-        if sub == 0 || n % nb_blocks != 0 {
+        if sub == 0 || !n.is_multiple_of(nb_blocks) {
             return false;
         }
 

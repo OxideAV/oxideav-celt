@@ -28,9 +28,9 @@
 //! bit count, and every parameter expression is transcribed from
 //! RFC 6716 (`docs/audio/opus/rfc6716-opus.txt`).
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// Post-filter parameters carried in the CELT frame header
 /// (RFC 6716 §4.3.7.1).

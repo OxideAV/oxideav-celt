@@ -20,17 +20,17 @@
 //! the reference signal scale (`1/32768`, the float-API output
 //! convention).
 
-use crate::alloc_exact::{compute_allocation_exact, AllocIo, BITRES, MAX_FINE_BITS};
+use crate::Error;
+use crate::alloc_exact::{AllocIo, BITRES, MAX_FINE_BITS, compute_allocation_exact};
 use crate::band_cap::decode_band_boosts;
-use crate::band_quant::{celt_lcg_rand, quant_all_bands, renormalise_vector, QuantIo};
+use crate::band_quant::{QuantIo, celt_lcg_rand, quant_all_bands, renormalise_vector};
 use crate::bit_allocation::decode_alloc_trim;
-use crate::coarse_energy::{decode_coarse_energy, CoarseEnergyState};
+use crate::coarse_energy::{CoarseEnergyState, decode_coarse_energy};
 use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
 use crate::mdct::{build_low_overlap_window_f32, imdct_cached_f32};
 use crate::range_decoder::RangeDecoder;
 use crate::spread::Spread;
 use crate::tf_change::tf_adjustment;
-use crate::Error;
 
 /// Mean band energy in base-2 log-amplitude units (`eMeans`,
 /// Appendix A `quant_bands.c` float table, all 25 entries; the first
@@ -449,7 +449,7 @@ impl CeltRefDecoder {
             return Err(Error::InvalidParameter);
         }
         // The decimation grid must land on whole output frames.
-        if downsample == 0 || (mode.short_mdct_size << lm) % downsample != 0 {
+        if downsample == 0 || !(mode.short_mdct_size << lm).is_multiple_of(downsample) {
             return Err(Error::InvalidParameter);
         }
         let frame = mode.short_mdct_size << lm;

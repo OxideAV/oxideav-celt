@@ -66,10 +66,10 @@
 //! direct reading of the Table 55 coded-range top vs. the MDCT span. No
 //! external library source was consulted.
 
+use crate::Error;
 use crate::band_layout::{band_edge, coded_total_bins};
 use crate::coarse_energy::NUM_BANDS;
-use crate::mdct::{build_low_overlap_window_f32, MdctSynthesis, BASIC_WINDOW_HALF};
-use crate::Error;
+use crate::mdct::{BASIC_WINDOW_HALF, MdctSynthesis, build_low_overlap_window_f32};
 
 /// The fixed CELT MDCT overlap, in per-channel samples (RFC 6716
 /// §4.3.7: the window is derived from the basic 240-sample version, so

@@ -81,10 +81,10 @@
 //! outside the workspace's clean-room allow-list and were not
 //! consulted.
 
+use crate::Error;
 use crate::coarse_energy::NUM_BANDS;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// Upper bound on the number of fine bits the §4.3.3 bit allocator can
 /// assign to any single band.
@@ -410,11 +410,7 @@ pub struct FinalizeDepthResult {
 #[inline]
 pub fn finalize_correction_q14(f: u32, b_bits: u32) -> i32 {
     let magnitude = 4096i32 >> b_bits.min(MAX_FINE_BITS);
-    if f != 0 {
-        magnitude
-    } else {
-        -magnitude
-    }
+    if f != 0 { magnitude } else { -magnitude }
 }
 
 /// Decode the §4.3.2.2 finalize step with **depth-aware** corrections

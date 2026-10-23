@@ -505,7 +505,7 @@ impl RangeEncoder {
             return;
         }
         let b = c >> 8; // carry bit
-                        // Emit the previously-buffered byte plus the carry, if any.
+        // Emit the previously-buffered byte plus the carry, if any.
         if self.rem != REM_EMPTY {
             self.buf.push((self.rem as u32 + b) as u8);
         }
@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(enc.enc_uint(5, 5), Err(Error::InvalidParameter)); // t>=ft
         assert_eq!(enc.enc_bits(0, 33), Err(Error::InvalidParameter)); // bits>32
         assert_eq!(enc.enc_uint(1, 1), Err(Error::InvalidParameter)); // ft<=1,t!=0
-                                                                      // ft<=1 with t==0 is a no-op success.
+        // ft<=1 with t==0 is a no-op success.
         assert_eq!(enc.enc_uint(0, 1), Ok(()));
     }
 

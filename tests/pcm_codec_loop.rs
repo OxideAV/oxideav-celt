@@ -12,7 +12,7 @@ use oxideav_celt::deemphasis::{Deemphasis, Preemphasis};
 use oxideav_celt::derive_pulses::decode_celt_frame_auto;
 use oxideav_celt::frame_header::CeltFrameHeader;
 use oxideav_celt::frame_synthesis::CeltDecodeState;
-use oxideav_celt::pcm_encode::{encode_celt_frame_pcm_auto, CeltEncodeState};
+use oxideav_celt::pcm_encode::{CeltEncodeState, encode_celt_frame_pcm_auto};
 use oxideav_celt::synthesis::LongMdctSynthesis;
 
 fn plain_header(intra: bool) -> CeltFrameHeader {
@@ -273,11 +273,10 @@ fn quantized_loop_reanalysis_recovers_reconstruction() {
     // Tolerance scales with the spectrum magnitude (the analysis
     // round-trip is exact to ~2e-4 relative; see the analysis module
     // tests).
-    let max_abs =
-        reconstructed
-            .iter()
-            .flatten()
-            .fold(0.0f32, |m, &v| if v.abs() > m { v.abs() } else { m });
+    let max_abs = reconstructed
+        .iter()
+        .flatten()
+        .fold(0.0f32, |m, &v| if v.abs() > m { v.abs() } else { m });
     let tol = 5e-4 * max_abs.max(1e-3);
 
     // Re-analysis frame t sees decoded block t-1 (one frame of

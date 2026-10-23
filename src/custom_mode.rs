@@ -36,12 +36,12 @@
 //! semantics. The §4.3.4.2 codebook sizes come from this crate's own
 //! `V(N, K)` recursion ([`crate::pvq::v_count`]).
 
+use crate::Error;
 use crate::alloc_exact::{
-    get_pulses, BITRES, FINE_OFFSET, MAX_FINE_BITS, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE,
+    BITRES, FINE_OFFSET, MAX_FINE_BITS, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE, get_pulses,
 };
 use crate::mdct::celt_window_f32;
 use crate::pvq::v_count;
-use crate::Error;
 
 /// Upper bound on the band count any legal custom mode can produce
 /// (the Appendix A `eMeans` / prob-model tables are sized for it; an

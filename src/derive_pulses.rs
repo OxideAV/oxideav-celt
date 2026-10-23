@@ -84,18 +84,18 @@
 //! whose own provenance is recorded in that module. No external library
 //! source was consulted.
 
+use crate::Error;
 use crate::alloc_combine::find_combined_alloc;
+use crate::band_minimums::BAND_BINS_LM;
 use crate::band_minimums::compute_thresh;
 use crate::band_minimums::compute_trim_offsets;
-use crate::band_minimums::BAND_BINS_LM;
 use crate::bits_to_pulses::bits_to_pulses_band_loop_cached_thresh;
 use crate::coarse_energy::NUM_BANDS;
 use crate::fine_energy::MAX_FINE_BITS;
 use crate::frame_decode::FramePrefix;
 use crate::frame_synthesis::{CeltDecodeState, DecodedFrame};
-use crate::pvq::{v_count, V_COUNT_SATURATION};
-use crate::realloc_walk::{realloc_walk, WalkAllocation, WalkBands, WalkBudget, WalkIo};
-use crate::Error;
+use crate::pvq::{V_COUNT_SATURATION, v_count};
+use crate::realloc_walk::{WalkAllocation, WalkBands, WalkBudget, WalkIo, realloc_walk};
 
 /// Largest `K' <= K` such that the PVQ codebook size `V(N, K')` does not
 /// saturate (i.e. it fits in `u32`). `v_count` is monotone non-decreasing

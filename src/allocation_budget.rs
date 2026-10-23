@@ -50,7 +50,7 @@
 //! itself at `docs/audio/opus/rfc6716-opus.txt`. No external library
 //! source was consulted.
 
-use crate::bit_allocation::{intensity_rsv, BandAllocationGates};
+use crate::bit_allocation::{BandAllocationGates, intensity_rsv};
 
 /// One quantum of 1/8-bit budget for the binary reservations
 /// (`anti_collapse_rsv`, `skip_rsv`, `dual_stereo_rsv`).
@@ -399,7 +399,7 @@ mod tests {
         let r_eq = compute_initial_reservations(1, 55, false, 0, false, 21);
         assert_eq!(r_eq.total_initial, 8);
         assert_eq!(r_eq.skip_rsv, 0); // 8 is NOT > 8.
-                                      // 1*64 - 54 - 1 = 9 → skip fires.
+        // 1*64 - 54 - 1 = 9 → skip fires.
         let r_gt = compute_initial_reservations(1, 54, false, 0, false, 21);
         assert_eq!(r_gt.total_initial, 9);
         assert_eq!(r_gt.skip_rsv, 8);

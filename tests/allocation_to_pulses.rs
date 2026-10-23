@@ -50,8 +50,8 @@
 //! §4.3 narrative cited in the module docs. No external library source.
 
 use oxideav_celt::{
-    bits_to_pulses_band_loop_cached, decode_celt_frame, decode_frame_prefix, find_combined_alloc,
-    CeltDecodeState, CoarseEnergyState, BAND_BINS_LM, NUM_BANDS,
+    BAND_BINS_LM, CeltDecodeState, CoarseEnergyState, NUM_BANDS, bits_to_pulses_band_loop_cached,
+    decode_celt_frame, decode_frame_prefix, find_combined_alloc,
 };
 
 /// Build a deterministic, well-formed CELT range-coded payload of

@@ -144,7 +144,7 @@ pub fn apply_tf_resolution_change(band: &mut [f32], tf_adjustment: i8, nb_blocks
     if nb_blocks == 0 || band.is_empty() {
         return false;
     }
-    if band.len() % nb_blocks != 0 {
+    if !band.len().is_multiple_of(nb_blocks) {
         return false;
     }
     let sub_len = band.len() / nb_blocks;
@@ -239,7 +239,7 @@ pub fn apply_tf_resolution_change_inverse(
     if tf_adjustment == 0 {
         return true;
     }
-    if nb_blocks == 0 || band.is_empty() || band.len() % nb_blocks != 0 {
+    if nb_blocks == 0 || band.is_empty() || !band.len().is_multiple_of(nb_blocks) {
         return false;
     }
     let sub_len = band.len() / nb_blocks;

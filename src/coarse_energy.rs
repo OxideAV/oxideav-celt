@@ -92,12 +92,12 @@
 //! and SHA-1-verified; no source outside the staged docs was
 //! consulted.
 
+use crate::Error;
 use crate::custom_mode::MAX_BANDS;
 use crate::e_prob_model::{E_PROB_MODEL, NUM_LM_FRAME_SIZES, PRED_INTER, PRED_INTRA};
 use crate::laplace::{ec_laplace_decode, ec_laplace_encode};
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// Number of CELT bands per RFC 6716 Table 55 (band index 0..=20).
 ///
@@ -1126,7 +1126,9 @@ mod tests {
         let mut enc = RangeEncoder::new();
         let tell_before = enc.tell();
         assert_eq!(
-            encode_coarse_energy(&mut enc, &mut state, &target, true, 4, 0, NUM_BANDS, 1, 1024),
+            encode_coarse_energy(
+                &mut enc, &mut state, &target, true, 4, 0, NUM_BANDS, 1, 1024
+            ),
             Err(Error::InvalidParameter)
         );
         assert_eq!(
@@ -1134,7 +1136,9 @@ mod tests {
             Err(Error::InvalidParameter)
         );
         assert_eq!(
-            encode_coarse_energy(&mut enc, &mut state, &target, true, 0, 0, NUM_BANDS, 3, 1024),
+            encode_coarse_energy(
+                &mut enc, &mut state, &target, true, 0, 0, NUM_BANDS, 3, 1024
+            ),
             Err(Error::InvalidParameter)
         );
         assert_eq!(enc.tell(), tell_before);

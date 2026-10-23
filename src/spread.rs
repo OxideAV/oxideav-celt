@@ -57,9 +57,9 @@
 //! RFC text per §A.1 and SHA-1-verified; no source outside the staged
 //! docs was consulted.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// The four legal spread parameter values per RFC 6716 §4.3.4.3.
 ///

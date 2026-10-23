@@ -80,13 +80,13 @@
 //! existing RFC-grounded primitive whose own provenance is recorded in
 //! its module. No external library source was consulted.
 
+use crate::Error;
 use crate::band_decode::decode_band_shape;
 use crate::band_layout::{band_bin_range, band_bins, coded_total_bins};
 use crate::coarse_energy::NUM_BANDS;
 use crate::range_decoder::RangeDecoder;
 use crate::spread::Spread;
 use crate::tf_change::tf_adjustment;
-use crate::Error;
 
 /// The decoded residual spectrum for the coded-band window, plus the
 /// per-band pulse counts the loop consumed.
@@ -561,9 +561,11 @@ mod tests {
         // Band 0 occupies bin 0 only (N=1 at LM=3 ⇒ 8 bins). Its slot is
         // all zero because K=0 ⇒ zero pulse vector ⇒ zero shape.
         let (s, e) = band_bin_range(0, lm).unwrap();
-        assert!(res.samples[s as usize..e as usize]
-            .iter()
-            .all(|&x| x == 0.0));
+        assert!(
+            res.samples[s as usize..e as usize]
+                .iter()
+                .all(|&x| x == 0.0)
+        );
     }
 
     /// Length-mismatched per-band slices are rejected.

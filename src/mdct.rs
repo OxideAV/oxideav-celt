@@ -108,7 +108,7 @@ pub fn build_window_half_f32(overlap: usize) -> Vec<f32> {
 /// `overlap == 0`, `overlap > n`, or `n - overlap` odd (the zero
 /// padding must split evenly across both ends).
 pub fn build_low_overlap_window_f32(n: usize, overlap: usize) -> Option<Vec<f32>> {
-    if n == 0 || overlap == 0 || overlap > n || (n - overlap) % 2 != 0 {
+    if n == 0 || overlap == 0 || overlap > n || !(n - overlap).is_multiple_of(2) {
         return None;
     }
     let pad = (n - overlap) / 2;
@@ -356,11 +356,11 @@ impl MdctSynthesis {
 /// matches the long window's zero padding.
 #[inline]
 pub fn short_block_geometry(n: usize, nb_blocks: usize) -> Option<(usize, usize)> {
-    if nb_blocks == 0 || n == 0 || n % nb_blocks != 0 {
+    if nb_blocks == 0 || n == 0 || !n.is_multiple_of(nb_blocks) {
         return None;
     }
     let sb = n / nb_blocks;
-    if (n - sb) % 2 != 0 {
+    if !(n - sb).is_multiple_of(2) {
         return None;
     }
     Some((sb, (n - sb) / 2))

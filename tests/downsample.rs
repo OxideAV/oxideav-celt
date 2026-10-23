@@ -3,7 +3,7 @@
 //! rate — spectrum bounded to the output Nyquist, de-emphasis
 //! decimation), and the encoder-side upsampled-input counterpart.
 
-use oxideav_celt::ref_decode::{resampling_factor, CeltRefDecoder};
+use oxideav_celt::ref_decode::{CeltRefDecoder, resampling_factor};
 use oxideav_celt::ref_encode::CeltRefEncoder;
 
 const RATES: [u32; 4] = [24_000, 16_000, 12_000, 8_000];

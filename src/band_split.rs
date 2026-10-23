@@ -65,7 +65,7 @@
 //! `V(N, K)` saturation flag is reused from [`crate::pvq`]. No
 //! external library source was consulted.
 
-use crate::pvq::{v_count, V_COUNT_SATURATION};
+use crate::pvq::{V_COUNT_SATURATION, v_count};
 
 /// Maximum CELT frame-size index `LM` recognised by RFC 6716 §4.3:
 /// `LM ∈ {0, 1, 2, 3}` ↔ frame durations `{2.5, 5, 10, 20}` ms.

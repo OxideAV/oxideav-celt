@@ -56,18 +56,18 @@
 //! [`encode_celt_frame`](crate::frame_encode::encode_celt_frame)).
 //! No external library source was consulted.
 
+use crate::Error;
 use crate::analysis::{LongMdctAnalysis, StereoPcmAnalysis};
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::deemphasis::Preemphasis;
 use crate::frame_encode::{
-    encode_celt_frame, encode_celt_frame_auto, encode_stereo_celt_frame,
-    encode_stereo_celt_frame_auto, EncodedFrame, StereoEncodedFrame,
+    EncodedFrame, StereoEncodedFrame, encode_celt_frame, encode_celt_frame_auto,
+    encode_stereo_celt_frame, encode_stereo_celt_frame_auto,
 };
 use crate::frame_header::CeltFrameHeader;
-use crate::frame_synthesis::{push_post_filter_history, POST_FILTER_HISTORY_LEN};
-use crate::post_filter::{apply_pitch_prefilter_transition_f32, PostFilterParams};
-use crate::synthesis::{mdct_size, CELT_OVERLAP};
-use crate::Error;
+use crate::frame_synthesis::{POST_FILTER_HISTORY_LEN, push_post_filter_history};
+use crate::post_filter::{PostFilterParams, apply_pitch_prefilter_transition_f32};
+use crate::synthesis::{CELT_OVERLAP, mdct_size};
 
 /// Streaming CELT **encoder** state carried across frames — the
 /// encode-side mirror of

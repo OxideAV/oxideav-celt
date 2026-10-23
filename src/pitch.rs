@@ -36,7 +36,7 @@
 //! search algorithm and its thresholds are this crate's own design.
 //! No external library source was consulted.
 
-use crate::post_filter::{PostFilterParams, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN};
+use crate::post_filter::{POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN, PostFilterParams};
 
 /// Result of a [`pitch_search`]: the chosen period and its normalized
 /// autocorrelation (`0.0..=1.0` for a genuinely periodic signal).

@@ -85,9 +85,9 @@
 //! sole reference for both the codebook arithmetic and the per-
 //! position reconstruction loop.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// Sentinel for "codebook size exceeds 32 bits" — never reached for
 /// legal PVQ inputs because §4.3.4.4 splits large bands before they hit
@@ -130,7 +130,7 @@ pub fn v_count(n: u32, k: u32) -> u32 {
         for j in 1..=kk {
             let v_m_j = row[j]; // V(m, j) before update
             let v_mplus1_jminus1 = row[j - 1]; // already updated to V(m+1, j-1)
-                                               // V(m+1, j) = V(m, j) + V(m+1, j-1) + V(m, j-1)
+            // V(m+1, j) = V(m, j) + V(m+1, j-1) + V(m, j-1)
             let new_val = v_m_j
                 .saturating_add(v_mplus1_jminus1)
                 .saturating_add(prev_v_m);

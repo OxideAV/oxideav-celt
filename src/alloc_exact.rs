@@ -25,13 +25,13 @@
 //! `cache-{index,bits}50.csv` ([`crate::pulse_cache`]), and
 //! `log2-frac-table.csv` ([`crate::bit_allocation::LOG2_FRAC_TABLE`]).
 
+use crate::Error;
 use crate::bit_allocation::LOG2_FRAC_TABLE;
 use crate::coarse_energy::NUM_BANDS;
 use crate::custom_mode::{CeltCustomMode, MAX_BANDS, NB_ALLOC_VECTORS};
 use crate::pulse_cache::{CACHE_BITS50, CACHE_INDEX50};
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// 1/8-bit resolution shift (RFC 6716 Appendix A `rate.h` `BITRES`).
 pub const BITRES: u32 = 3;

@@ -20,9 +20,9 @@
 //! zero-extends past the real bytes, so the padding is transparent.
 
 use oxideav_celt::{
-    decode_coarse_energy, decode_spread, decode_tf_parameters, encode_coarse_energy, encode_spread,
-    encode_tf_parameters, CeltFrameHeader, CoarseEnergyState, RangeDecoder, RangeEncoder, Spread,
-    TfParameters, MAX_BANDS, MAX_CHANNELS, NUM_BANDS,
+    CeltFrameHeader, CoarseEnergyState, MAX_BANDS, MAX_CHANNELS, NUM_BANDS, RangeDecoder,
+    RangeEncoder, Spread, TfParameters, decode_coarse_energy, decode_spread, decode_tf_parameters,
+    encode_coarse_energy, encode_spread, encode_tf_parameters,
 };
 
 /// Frame budget in bytes; large enough that every coarse-energy band

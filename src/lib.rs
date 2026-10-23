@@ -149,202 +149,203 @@ pub mod tf_change;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub use alloc_combine::{
-    combine_band_allocation, find_combined_alloc, CombinedAllocSearch, CombinedAllocation,
+    CombinedAllocSearch, CombinedAllocation, combine_band_allocation, find_combined_alloc,
 };
 #[doc(hidden)]
 pub use allocation_budget::{
-    compute_initial_reservations, InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH,
+    InitialReservations, RSV_BIT_8TH, RSV_INITIAL_SLACK_8TH, compute_initial_reservations,
 };
 #[doc(hidden)]
-pub use analysis::{extract_coded_spectrum, LongMdctAnalysis, StereoPcmAnalysis};
+pub use analysis::{LongMdctAnalysis, StereoPcmAnalysis, extract_coded_spectrum};
 #[doc(hidden)]
-pub use anti_collapse::{apply_anti_collapse, ENERGY_HISTORY_FLOOR_LOG2};
+pub use anti_collapse::{ENERGY_HISTORY_FLOOR_LOG2, apply_anti_collapse};
 #[doc(hidden)]
 pub use band_analysis::{
-    analyze_band_f32, analyze_bands_f32, band_energy_f32, band_log_energy_f32, BandAnalysis,
-    SILENCE_LOG_ENERGY,
+    BandAnalysis, SILENCE_LOG_ENERGY, analyze_band_f32, analyze_bands_f32, band_energy_f32,
+    band_log_energy_f32,
 };
 #[doc(hidden)]
 pub use band_cap::{
-    compute_band_caps, decode_band_boosts, encode_band_boosts, BoostResult, CACHE_CAPS50,
+    BoostResult, CACHE_CAPS50, compute_band_caps, decode_band_boosts, encode_band_boosts,
 };
 #[doc(hidden)]
-pub use band_decode::{decode_band_shape, BandShape};
+pub use band_decode::{BandShape, decode_band_shape};
 #[doc(hidden)]
 pub use band_energy::{
+    E_MEANS_Q4, FINE_Q14_DENOM, Q14_TO_Q8_SHIFT, SPECTRUM_SCALE_LOG2_Q8,
     assemble_band_log_energy_f32, assemble_band_log_energy_q8, interop_wire_bias_f32,
-    interop_wire_bias_q8, log_energy_f32_to_q8, render_band_energy_q8, E_MEANS_Q4, FINE_Q14_DENOM,
-    Q14_TO_Q8_SHIFT, SPECTRUM_SCALE_LOG2_Q8,
+    interop_wire_bias_q8, log_energy_f32_to_q8, render_band_energy_q8,
 };
 #[doc(hidden)]
 pub use band_layout::{
-    band_bin_range, band_bins, band_edge, coded_total_bins, EBAND_EDGES_5MS, NUM_BAND_EDGES,
+    EBAND_EDGES_5MS, NUM_BAND_EDGES, band_bin_range, band_bins, band_edge, coded_total_bins,
 };
 #[doc(hidden)]
 pub use band_minimums::{
-    compute_thresh, compute_trim_offsets, BAND_BINS_LM, EIGHTH_BIT_QUANTUM, NUM_LM,
-    SHORT_FRAME_BAND_BINS,
+    BAND_BINS_LM, EIGHTH_BIT_QUANTUM, NUM_LM, SHORT_FRAME_BAND_BINS, compute_thresh,
+    compute_trim_offsets,
 };
 #[doc(hidden)]
 pub use band_split::{
-    band_needs_split, max_split_levels, plan_band_split, split_dimensions, BandSplitNode, MAX_LM,
+    BandSplitNode, MAX_LM, band_needs_split, max_split_levels, plan_band_split, split_dimensions,
 };
 #[doc(hidden)]
 pub use bit_allocation::{
-    decode_alloc_trim, decode_band_allocation, decode_dual_stereo, decode_intensity_band,
-    decode_skip_flag, encode_alloc_trim, encode_band_allocation, encode_dual_stereo,
-    encode_intensity_band, encode_skip_flag, intensity_rsv, reserve_stereo, BandAllocation,
-    BandAllocationGates, DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE,
+    BandAllocation, BandAllocationGates, DEFAULT_ALLOC_TRIM, LOG2_FRAC_TABLE, decode_alloc_trim,
+    decode_band_allocation, decode_dual_stereo, decode_intensity_band, decode_skip_flag,
+    encode_alloc_trim, encode_band_allocation, encode_dual_stereo, encode_intensity_band,
+    encode_skip_flag, intensity_rsv, reserve_stereo,
 };
 #[doc(hidden)]
 pub use bits_to_pulses::{
-    bits_to_pulses_band_loop, bits_to_pulses_band_loop_cached,
-    bits_to_pulses_band_loop_cached_thresh, bits_to_pulses_search, cost_log2_v_count_8th,
     BalanceAccumulator, BitsToPulses, DEFAULT_BALANCE_DIVISOR, EIGHTH_BITS_PER_BIT, K_SEARCH_CAP,
-    LAST_BALANCE_DIVISOR, SECOND_TO_LAST_BALANCE_DIVISOR,
+    LAST_BALANCE_DIVISOR, SECOND_TO_LAST_BALANCE_DIVISOR, bits_to_pulses_band_loop,
+    bits_to_pulses_band_loop_cached, bits_to_pulses_band_loop_cached_thresh, bits_to_pulses_search,
+    cost_log2_v_count_8th,
 };
 #[doc(hidden)]
 pub use coarse_energy::{
-    decode_coarse_energy, encode_coarse_energy, quant_coarse_energy_rd, CoarseEnergyState,
-    BETA_COEF_Q15, INTRA_ALPHA_Q15, INTRA_BETA_Q15, MAX_CHANNELS, NUM_BANDS, PRED_COEF_Q15,
-    SMALL_ENERGY_ICDF,
+    BETA_COEF_Q15, CoarseEnergyState, INTRA_ALPHA_Q15, INTRA_BETA_Q15, MAX_CHANNELS, NUM_BANDS,
+    PRED_COEF_Q15, SMALL_ENERGY_ICDF, decode_coarse_energy, encode_coarse_energy,
+    quant_coarse_energy_rd,
 };
 pub use custom_mode::{CeltCustomMode, MAX_BANDS};
 #[doc(hidden)]
 pub use deemphasis::{
-    deemphasize_in_place_f32, preemphasize_in_place_f32, Deemphasis, Preemphasis, ALPHA_P_F32,
-    ALPHA_P_Q15,
+    ALPHA_P_F32, ALPHA_P_Q15, Deemphasis, Preemphasis, deemphasize_in_place_f32,
+    preemphasize_in_place_f32,
 };
 #[doc(hidden)]
 pub use denormalization::{
-    denormalize_band_f32, denormalize_band_in_place_f32, denormalize_bands_f32,
-    denormalize_bands_in_place_f32, log_energy_q8_to_amplitude_f32, scale_band_f32,
-    scale_band_in_place_f32, MAX_LOG_ENERGY_Q8, Q8_DENOM, SQRT_Q8_DENOM,
+    MAX_LOG_ENERGY_Q8, Q8_DENOM, SQRT_Q8_DENOM, denormalize_band_f32,
+    denormalize_band_in_place_f32, denormalize_bands_f32, denormalize_bands_in_place_f32,
+    log_energy_q8_to_amplitude_f32, scale_band_f32, scale_band_in_place_f32,
 };
 #[doc(hidden)]
 pub use derive_pulses::{
-    decode_celt_frame_auto, derive_band_allocation, derive_band_allocation_dual,
+    DerivedAllocation, decode_celt_frame_auto, derive_band_allocation, derive_band_allocation_dual,
     derive_band_pulses, derive_band_pulses_dual, pulses_from_walk, run_prefix_walk,
-    DerivedAllocation,
 };
 #[doc(hidden)]
 pub use e_prob_model::{
-    prob_decay, ProbDecay, E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER,
-    PRED_INTRA,
+    E_PROB_MODEL, NUM_LM_FRAME_SIZES, NUM_PREDICTION_TYPES, PRED_INTER, PRED_INTRA, ProbDecay,
+    prob_decay,
 };
 #[doc(hidden)]
 pub use encoder_decisions::{
-    boost_quanta_8th, boost_thresholds, choose_alloc_trim, choose_band_boosts, choose_intra_mode,
-    choose_mid_side_stereo, intensity_start_band, low_band_stereo_correlation, mid_side_extra_dof,
-    spectral_tilt_slope, MID_SIDE_DECISION_BANDS, TRIM_TILT_GAIN,
+    MID_SIDE_DECISION_BANDS, TRIM_TILT_GAIN, boost_quanta_8th, boost_thresholds, choose_alloc_trim,
+    choose_band_boosts, choose_intra_mode, choose_mid_side_stereo, intensity_start_band,
+    low_band_stereo_correlation, mid_side_extra_dof, spectral_tilt_slope,
 };
 #[doc(hidden)]
 pub use fine_energy::{
+    FINE_Q14_ONE, FinalizeDepthResult, FinalizePriority, FinalizeResult, MAX_FINE_BITS,
     apply_finalize_scale_f32, decode_fine_energy, decode_fine_energy_band,
     encode_finalize_extra_bits_depth, encode_fine_energy, encode_fine_energy_band,
     finalize_correction_q14, finalize_extra_bits, finalize_extra_bits_depth,
     finalize_priorities_from_k, fine_correction_q14, fine_correction_qn, quantize_fine_energy_band,
-    quantize_fine_energy_f32, FinalizeDepthResult, FinalizePriority, FinalizeResult, FINE_Q14_ONE,
-    MAX_FINE_BITS,
+    quantize_fine_energy_f32,
 };
 #[doc(hidden)]
-pub use frame_decode::{decode_frame_prefix, FramePrefix};
+pub use frame_decode::{FramePrefix, decode_frame_prefix};
 #[doc(hidden)]
 pub use frame_encode::{
-    encode_celt_frame, encode_celt_frame_auto, encode_celt_frame_auto_boosted, encode_frame_prefix,
-    encode_stereo_celt_frame, encode_stereo_celt_frame_auto, EncodedFrame, FramePrefixSpec,
-    StereoEncodedFrame,
+    EncodedFrame, FramePrefixSpec, StereoEncodedFrame, encode_celt_frame, encode_celt_frame_auto,
+    encode_celt_frame_auto_boosted, encode_frame_prefix, encode_stereo_celt_frame,
+    encode_stereo_celt_frame_auto,
 };
 #[doc(hidden)]
 pub use frame_header::{
-    decode_anti_collapse_flag, encode_anti_collapse_flag, CeltFrameHeader, PostFilter,
+    CeltFrameHeader, PostFilter, decode_anti_collapse_flag, encode_anti_collapse_flag,
 };
 #[doc(hidden)]
 pub use frame_synthesis::{
-    decode_celt_frame, CeltDecodeState, DecodedFrame, PostFilterParams, StereoCeltDecodeState,
-    StereoDecodedFrame,
+    CeltDecodeState, DecodedFrame, PostFilterParams, StereoCeltDecodeState, StereoDecodedFrame,
+    decode_celt_frame,
 };
 #[doc(hidden)]
 pub use hadamard::{
-    apply_tf_resolution_change, apply_tf_resolution_change_inverse, walsh_hadamard_inplace,
-    walsh_hadamard_sequency_inplace, walsh_hadamard_sequency_inverse_inplace, HADAMARD_LEVEL_SCALE,
+    HADAMARD_LEVEL_SCALE, apply_tf_resolution_change, apply_tf_resolution_change_inverse,
+    walsh_hadamard_inplace, walsh_hadamard_sequency_inplace,
+    walsh_hadamard_sequency_inverse_inplace,
 };
 #[doc(hidden)]
 pub use laplace::{
-    ec_laplace_decode, ec_laplace_encode, LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN,
+    LAPLACE_LOG_MINP, LAPLACE_MINP, LAPLACE_NMIN, ec_laplace_decode, ec_laplace_encode,
 };
 #[doc(hidden)]
 pub use mdct::{
-    build_low_overlap_window_f32, build_window_half_f32, celt_window_f32, imdct_naive_f32,
-    mdct_naive_f32, short_block_geometry, MdctAnalysis, MdctSynthesis, BASIC_WINDOW_HALF,
-    BASIC_WINDOW_LEN,
+    BASIC_WINDOW_HALF, BASIC_WINDOW_LEN, MdctAnalysis, MdctSynthesis, build_low_overlap_window_f32,
+    build_window_half_f32, celt_window_f32, imdct_naive_f32, mdct_naive_f32, short_block_geometry,
 };
 #[doc(hidden)]
 pub use pcm_encode::{
-    encode_celt_frame_pcm, encode_celt_frame_pcm_auto, encode_stereo_celt_frame_pcm,
-    encode_stereo_celt_frame_pcm_auto, CeltEncodeState, StereoCeltEncodeState,
+    CeltEncodeState, StereoCeltEncodeState, encode_celt_frame_pcm, encode_celt_frame_pcm_auto,
+    encode_stereo_celt_frame_pcm, encode_stereo_celt_frame_pcm_auto,
 };
 #[doc(hidden)]
 pub use pitch::{
-    choose_post_filter_params, pitch_search, PitchEstimate, CONTINUITY_HALF_WIDTH,
-    CONTINUITY_RATIO, MIN_PITCH_CORRELATION, MULTIPLE_AVOIDANCE_RATIO,
+    CONTINUITY_HALF_WIDTH, CONTINUITY_RATIO, MIN_PITCH_CORRELATION, MULTIPLE_AVOIDANCE_RATIO,
+    PitchEstimate, choose_post_filter_params, pitch_search,
 };
 #[doc(hidden)]
 pub use post_filter::{
-    apply_pitch_prefilter_transition_f32, apply_post_filter_f32, filter_sample_f32, gain_f32,
-    gain_q15, tap_coefficients_f32, tap_coefficients_q15, NUM_TAPSETS, POST_FILTER_PERIOD_MAX,
-    POST_FILTER_PERIOD_MIN, POST_FILTER_TAPS_F32, POST_FILTER_TAPS_Q15, TAPS_PER_SET,
+    NUM_TAPSETS, POST_FILTER_PERIOD_MAX, POST_FILTER_PERIOD_MIN, POST_FILTER_TAPS_F32,
+    POST_FILTER_TAPS_Q15, TAPS_PER_SET, apply_pitch_prefilter_transition_f32,
+    apply_post_filter_f32, filter_sample_f32, gain_f32, gain_q15, tap_coefficients_f32,
+    tap_coefficients_q15,
 };
 #[doc(hidden)]
 pub use pulse_cache::{
+    CACHE_BITS50, CACHE_INDEX50, CachedPulses, EXTENDED_K_CAP, NUM_FRAME_LM, NUM_LM_ROWS,
     cache_cost_8th, cache_max_k, cache_offset, cache_offset_half_block, cache_stored_qbits,
-    cached_bits_to_pulses, cached_bits_to_pulses_extended, cost_exact_8th, CachedPulses,
-    CACHE_BITS50, CACHE_INDEX50, EXTENDED_K_CAP, NUM_FRAME_LM, NUM_LM_ROWS,
+    cached_bits_to_pulses, cached_bits_to_pulses_extended, cost_exact_8th,
 };
 #[doc(hidden)]
 pub use pvq::{
-    decode_index_to_pulses, decode_pulses, decode_unit_shape, encode_pulses,
+    V_COUNT_SATURATION, decode_index_to_pulses, decode_pulses, decode_unit_shape, encode_pulses,
     encode_pulses_to_index, encode_shape, encode_unit_shape, normalize_to_unit_l2, pvq_search,
-    v_count, V_COUNT_SATURATION,
+    v_count,
 };
 #[doc(hidden)]
 pub use range_decoder::RangeDecoder;
 #[doc(hidden)]
-pub use range_encoder::{RangeEncoder, REM_EMPTY};
+pub use range_encoder::{REM_EMPTY, RangeEncoder};
 #[doc(hidden)]
 pub use realloc_walk::{
-    realloc_walk, WalkAllocation, WalkBands, WalkBudget, WalkIo, FRAC_STEPS, SKIP_BIT_COST_8TH,
+    FRAC_STEPS, SKIP_BIT_COST_8TH, WalkAllocation, WalkBands, WalkBudget, WalkIo, realloc_walk,
 };
 #[doc(hidden)]
 pub use residual::{
-    decode_residual_bands, decode_stereo_residual_bands, ResidualSpectrum, StereoResidualSpectrum,
+    ResidualSpectrum, StereoResidualSpectrum, decode_residual_bands, decode_stereo_residual_bands,
 };
 #[doc(hidden)]
 pub use spread::{
-    decode_spread, encode_spread, pre_rotation_stride, rotation_gain_ratio,
-    rotation_gain_squared_ratio, Spread, DEFAULT_SPREAD,
+    DEFAULT_SPREAD, Spread, decode_spread, encode_spread, pre_rotation_stride, rotation_gain_ratio,
+    rotation_gain_squared_ratio,
 };
 #[doc(hidden)]
 pub use spread_rotation::{
-    apply_2d_rotation, apply_nd_rotation, apply_nd_rotation_multi_block, apply_pre_rotation,
-    apply_spread, rotation_angle_f64, EXTRA_ROTATION_MIN_BLOCK_SAMPLES,
+    EXTRA_ROTATION_MIN_BLOCK_SAMPLES, apply_2d_rotation, apply_nd_rotation,
+    apply_nd_rotation_multi_block, apply_pre_rotation, apply_spread, rotation_angle_f64,
 };
 #[doc(hidden)]
 pub use static_alloc::{
-    band_static_alloc_1_8th, find_static_alloc, interp_alloc_1_32nd, window_static_alloc_1_8th,
-    window_static_alloc_per_band_1_8th, StaticAllocSearch, INTERP_STEPS, NUM_Q, STATIC_ALLOC,
+    INTERP_STEPS, NUM_Q, STATIC_ALLOC, StaticAllocSearch, band_static_alloc_1_8th,
+    find_static_alloc, interp_alloc_1_32nd, window_static_alloc_1_8th,
+    window_static_alloc_per_band_1_8th,
 };
 #[doc(hidden)]
 pub use synthesis::{
-    mdct_size, place_residual_spectrum, LongMdctSynthesis, StereoChannel, StereoLongMdctSynthesis,
-    CELT_OVERLAP,
+    CELT_OVERLAP, LongMdctSynthesis, StereoChannel, StereoLongMdctSynthesis, mdct_size,
+    place_residual_spectrum,
 };
 #[doc(hidden)]
 pub use tf_change::{
-    decode_tf_changes, decode_tf_parameters, decode_tf_select, encode_tf_changes,
-    encode_tf_parameters, encode_tf_select, tf_adjustment, tf_select_matters, TfParameters,
     LM_VALUES, TABLE_60_NON_TRANSIENT_SEL0, TABLE_61_NON_TRANSIENT_SEL1, TABLE_62_TRANSIENT_SEL0,
-    TABLE_63_TRANSIENT_SEL1, TF_CHANGE_VALUES,
+    TABLE_63_TRANSIENT_SEL1, TF_CHANGE_VALUES, TfParameters, decode_tf_changes,
+    decode_tf_parameters, decode_tf_select, encode_tf_changes, encode_tf_parameters,
+    encode_tf_select, tf_adjustment, tf_select_matters,
 };
 
 /// Crate-local error type.
@@ -402,7 +403,7 @@ impl core::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-pub use codec::{make_decoder, make_encoder, CeltCodecOptions, CeltDecoder, CeltEncoder};
+pub use codec::{CeltCodecOptions, CeltDecoder, CeltEncoder, make_decoder, make_encoder};
 
 /// Install the `celt` codec (decoder + encoder) into the runtime
 /// context — see [`codec::register`].

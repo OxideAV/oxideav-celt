@@ -49,23 +49,23 @@
 //! provenance is recorded in that module. No external library source
 //! was consulted.
 
+use crate::Error;
 use crate::allocation_budget::compute_initial_reservations;
 use crate::band_analysis::analyze_band_f32;
 use crate::band_cap::{compute_band_caps, encode_band_boosts};
 use crate::band_energy::{assemble_band_log_energy_f32, assemble_band_log_energy_q8};
 use crate::band_layout::{band_bins, coded_total_bins};
 use crate::band_split::band_needs_split;
-use crate::bit_allocation::{encode_alloc_trim, BandAllocation};
-use crate::coarse_energy::{encode_coarse_energy, CoarseEnergyState, MAX_CHANNELS, NUM_BANDS};
+use crate::bit_allocation::{BandAllocation, encode_alloc_trim};
+use crate::coarse_energy::{CoarseEnergyState, MAX_CHANNELS, NUM_BANDS, encode_coarse_energy};
 use crate::denormalization::denormalize_band_in_place_f32;
 use crate::fine_energy::{encode_fine_energy_band, fine_correction_q14, quantize_fine_energy_f32};
 use crate::frame_decode::FramePrefix;
-use crate::frame_header::{encode_anti_collapse_flag, CeltFrameHeader};
+use crate::frame_header::{CeltFrameHeader, encode_anti_collapse_flag};
 use crate::pvq::{encode_pulses, normalize_to_unit_l2, pvq_search};
 use crate::range_encoder::RangeEncoder;
-use crate::spread::{encode_spread, Spread};
-use crate::tf_change::{encode_tf_parameters, tf_adjustment, tf_select_matters, TfParameters};
-use crate::Error;
+use crate::spread::{Spread, encode_spread};
+use crate::tf_change::{TfParameters, encode_tf_parameters, tf_adjustment, tf_select_matters};
 
 /// Per-band MDCT-bin layout for the coded band window (same helper the
 /// decode driver uses; RFC 6716 §4.3 Table 55).
@@ -473,10 +473,10 @@ fn encode_celt_frame_impl(
     let nb_blocks: usize = if header.transient { 1usize << lm } else { 1 };
     let tf_adj = tf_adjustment(header.transient, 0, lm as u8, false);
     let coded_bands = end - start;
-    if let Some(k) = band_k {
-        if k.len() != coded_bands {
-            return Err(Error::InvalidParameter);
-        }
+    if let Some(k) = band_k
+        && k.len() != coded_bands
+    {
+        return Err(Error::InvalidParameter);
     }
     let total_bins = coded_total_bins(start, end, lm).ok_or(Error::InvalidParameter)? as usize;
     if spectrum.len() != total_bins {
@@ -929,10 +929,10 @@ fn encode_stereo_celt_frame_impl(
     let nb_blocks: usize = if header.transient { 1usize << lm } else { 1 };
     let tf_adj = tf_adjustment(header.transient, 0, lm as u8, false);
     let coded_bands = end - start;
-    if let Some(k) = band_k {
-        if k.len() != coded_bands {
-            return Err(Error::InvalidParameter);
-        }
+    if let Some(k) = band_k
+        && k.len() != coded_bands
+    {
+        return Err(Error::InvalidParameter);
     }
     let total_bins = coded_total_bins(start, end, lm).ok_or(Error::InvalidParameter)? as usize;
     if left_spectrum.len() != total_bins || right_spectrum.len() != total_bins {
@@ -1471,29 +1471,33 @@ mod tests {
         let mut enc = RangeEncoder::new();
         let mut state = CoarseEnergyState::new();
         // lm out of range.
-        assert!(encode_frame_prefix(
-            &mut enc,
-            &mut state,
-            &base,
-            4,
-            FRAME_BYTES,
-            false,
-            0,
-            NUM_BANDS
-        )
-        .is_err());
+        assert!(
+            encode_frame_prefix(
+                &mut enc,
+                &mut state,
+                &base,
+                4,
+                FRAME_BYTES,
+                false,
+                0,
+                NUM_BANDS
+            )
+            .is_err()
+        );
         // band window out of range.
-        assert!(encode_frame_prefix(
-            &mut enc,
-            &mut state,
-            &base,
-            2,
-            FRAME_BYTES,
-            false,
-            0,
-            NUM_BANDS + 1
-        )
-        .is_err());
+        assert!(
+            encode_frame_prefix(
+                &mut enc,
+                &mut state,
+                &base,
+                2,
+                FRAME_BYTES,
+                false,
+                0,
+                NUM_BANDS + 1
+            )
+            .is_err()
+        );
         // tf length mismatch (window is 4 bands, tf has 21).
         assert!(
             encode_frame_prefix(&mut enc, &mut state, &base, 2, FRAME_BYTES, false, 17, 21)
@@ -1548,13 +1552,15 @@ mod tests {
             2 * crate::encoder_decisions::boost_quanta_8th(n),
             "the §5.3.4.1 double boost must land on the wire"
         );
-        assert!(frame
-            .prefix
-            .boosts
-            .boost
-            .iter()
-            .enumerate()
-            .all(|(b, &v)| b == peak_band || v == 0));
+        assert!(
+            frame
+                .prefix
+                .boosts
+                .boost
+                .iter()
+                .enumerate()
+                .all(|(b, &v)| b == peak_band || v == 0)
+        );
 
         // The boosted frame still decodes caller-input-free with the
         // identical prefix and coarse state.
@@ -2055,16 +2061,18 @@ mod tests {
 
         // Length mismatch is rejected.
         let mut fresh = CoarseEnergyState::new();
-        assert!(encode_celt_frame_auto_boosted(
-            &mut fresh,
-            &spectrum,
-            &header,
-            lm,
-            FRAME_BYTES,
-            0,
-            NUM_BANDS,
-            &target[..5],
-        )
-        .is_err());
+        assert!(
+            encode_celt_frame_auto_boosted(
+                &mut fresh,
+                &spectrum,
+                &header,
+                lm,
+                FRAME_BYTES,
+                0,
+                NUM_BANDS,
+                &target[..5],
+            )
+            .is_err()
+        );
     }
 }

@@ -51,11 +51,11 @@
 //! the §5.3 encoder-is-inverse prose. No external library source was
 //! consulted.
 
+use crate::Error;
 use crate::band_layout::{band_edge, coded_total_bins};
 use crate::coarse_energy::NUM_BANDS;
-use crate::mdct::{build_low_overlap_window_f32, MdctAnalysis};
-use crate::synthesis::{mdct_size, CELT_OVERLAP};
-use crate::Error;
+use crate::mdct::{MdctAnalysis, build_low_overlap_window_f32};
+use crate::synthesis::{CELT_OVERLAP, mdct_size};
 
 /// Slice the coded-band window out of a full per-channel MDCT
 /// spectrum — the exact inverse of
@@ -349,7 +349,7 @@ impl StereoPcmAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::synthesis::{place_residual_spectrum, LongMdctSynthesis};
+    use crate::synthesis::{LongMdctSynthesis, place_residual_spectrum};
 
     /// Deterministic pseudo-random signal in [-1, 1).
     fn test_signal(len: usize, mut seed: u32) -> Vec<f32> {
@@ -584,7 +584,7 @@ mod tests {
         let coded = coded_total_bins(0, NUM_BANDS, lm).unwrap() as usize;
 
         // Per-channel band-limited generators with distinct seeds.
-        let mut gen = [
+        let mut r#gen = [
             LongMdctSynthesis::new(lm).unwrap(),
             LongMdctSynthesis::new(lm).unwrap(),
         ];
@@ -594,7 +594,7 @@ mod tests {
             let mut chans: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
             for (ch, chan_buf) in chans.iter_mut().enumerate() {
                 let spec = test_signal(coded, 0x57E0 + 977 * ch as u32 + t as u32);
-                let mut pcm = gen[ch].synthesize(&spec, 0, NUM_BANDS).unwrap();
+                let mut pcm = r#gen[ch].synthesize(&spec, 0, NUM_BANDS).unwrap();
                 gen_deemph[ch].apply_in_place(&mut pcm);
                 *chan_buf = pcm;
             }

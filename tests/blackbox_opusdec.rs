@@ -18,7 +18,7 @@
 //! installed for the real measurement, or set
 //! `OXIDEAV_CELT_REQUIRE_OPUSDEC=1` to make the gate a failure.
 
-use oxideav_celt::{encode_celt_frame_pcm_auto, CeltEncodeState, CeltFrameHeader};
+use oxideav_celt::{CeltEncodeState, CeltFrameHeader, encode_celt_frame_pcm_auto};
 use std::io::Write as _;
 use std::process::Command;
 
@@ -135,7 +135,9 @@ fn parse_wav_s16_mono(bytes: &[u8]) -> Vec<f32> {
         if id == b"data" {
             let data = &bytes[pos + 8..(pos + 8 + sz).min(bytes.len())];
             return data
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
                 .collect();
         }

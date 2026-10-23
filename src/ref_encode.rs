@@ -36,11 +36,12 @@
 //! therefore carries `overlap` (120) samples of algorithmic delay,
 //! exactly like the reference.
 
-use crate::alloc_exact::{compute_allocation_exact, AllocIo, BITRES, MAX_FINE_BITS};
+use crate::Error;
+use crate::alloc_exact::{AllocIo, BITRES, MAX_FINE_BITS, compute_allocation_exact};
 use crate::band_cap::encode_band_boosts;
-use crate::band_quant::{haar1, quant_all_bands, BandAmps, QuantIo};
+use crate::band_quant::{BandAmps, QuantIo, haar1, quant_all_bands};
 use crate::bit_allocation::encode_alloc_trim;
-use crate::coarse_energy::{quant_coarse_energy_rd, CoarseEnergyState};
+use crate::coarse_energy::{CoarseEnergyState, quant_coarse_energy_rd};
 use crate::custom_mode::{CeltCustomMode, MAX_BANDS};
 use crate::encoder_decisions::{
     alloc_trim_analysis, boost_thresholds, intensity_start_band, stereo_analysis,
@@ -51,9 +52,8 @@ use crate::plc::{pitch_downsample, remove_doubling};
 use crate::post_filter::POST_FILTER_TAPS_F32;
 use crate::range_encoder::RangeEncoder;
 use crate::ref_decode::E_MEANS;
-use crate::spread::{encode_spread, spreading_decision, Spread};
+use crate::spread::{Spread, encode_spread, spreading_decision};
 use crate::tf_change::tf_adjustment;
-use crate::Error;
 
 /// The reference float-API signal scale (`CELT_SIG_SCALE`).
 const SIG_SCALE: f32 = 32768.0;
@@ -636,7 +636,7 @@ impl CeltRefEncoder {
             return Err(Error::InvalidParameter);
         }
         // The interpolation grid must land on whole input frames.
-        if upsample == 0 || (mode.short_mdct_size << lm) % upsample != 0 {
+        if upsample == 0 || !(mode.short_mdct_size << lm).is_multiple_of(upsample) {
             return Err(Error::InvalidParameter);
         }
         let frame = mode.short_mdct_size << lm;
@@ -1582,7 +1582,7 @@ impl CeltRefEncoder {
                 let mut st = base.clone();
                 run_tail(&mut st, cand)?;
                 let score = distortion(&st);
-                if best.as_ref().map_or(true, |(s, _)| score < *s) {
+                if best.as_ref().is_none_or(|(s, _)| score < *s) {
                     best = Some((score, st));
                 }
             }
@@ -1949,7 +1949,7 @@ mod tests {
         let frames_tone = 50usize;
         let frames_sil = 25usize;
         let mut pcm = tone(frame, 1, frames_tone, 0.3);
-        pcm.extend(std::iter::repeat(0.0f32).take(frames_sil * frame));
+        pcm.extend(std::iter::repeat_n(0.0f32, frames_sil * frame));
         for &constrained in &[false, true] {
             let mut enc = CeltRefEncoder::new(lm, 1).expect("encoder");
             let mut dec = CeltRefDecoder::new(lm, 1).expect("decoder");

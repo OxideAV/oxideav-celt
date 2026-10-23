@@ -45,9 +45,9 @@
 //! Q8→Q15/Q14 call-site shifts are RFC 6716 §4.3.2.1. No external
 //! library source was consulted.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// Base-2 log of the minimum probability floor of an energy delta
 /// (out of 32768). The §4.3.2.1 constant is 0

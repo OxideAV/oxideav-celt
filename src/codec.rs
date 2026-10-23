@@ -26,9 +26,9 @@
 use std::collections::VecDeque;
 
 use oxideav_core::{
-    parse_options, CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters,
-    Error as CoreError, Frame, OptionField, OptionKind, OptionValue, Packet, Result as CoreResult,
-    RuntimeContext, SampleFormat, TimeBase,
+    CodecCapabilities, CodecId, CodecInfo, CodecOptionsStruct, CodecParameters, Error as CoreError,
+    Frame, OptionField, OptionKind, OptionValue, Packet, Result as CoreResult, RuntimeContext,
+    SampleFormat, TimeBase, parse_options,
 };
 
 use crate::custom_mode::CeltCustomMode;
@@ -286,7 +286,7 @@ fn stream_config(
                 return Err(CoreError::invalid(format!(
                     "celt: resample frame_size must span 2.5/5/10/20 ms at \
                      {sample_rate} Hz (got {frame_size} samples)"
-                )))
+                )));
             }
         };
         return Ok(StreamConfig {
@@ -588,7 +588,9 @@ impl oxideav_core::Encoder for CeltEncoder {
         }
         self.buffer.extend(
             plane
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
         );
         self.encode_buffered()
@@ -917,7 +919,7 @@ mod tests {
                     let Frame::Audio(a) = dec.receive_frame().expect("frame") else {
                         panic!("audio")
                     };
-                    for c in a.data[0].chunks_exact(4) {
+                    for c in a.data[0].as_chunks::<4>().0 {
                         let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64;
                         energy += v * v;
                         n += 1;
@@ -981,7 +983,9 @@ mod tests {
                         assert_eq!(a.samples, 480);
                         pcm.extend(
                             a.data[0]
-                                .chunks_exact(4)
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
                                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
                         );
                     }
@@ -1074,7 +1078,9 @@ mod tests {
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
                 out.extend(
                     a.data[0]
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
                 );
             }

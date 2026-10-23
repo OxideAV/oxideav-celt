@@ -49,8 +49,8 @@
 //! [`StaticAllocSearch`]: crate::static_alloc::StaticAllocSearch
 
 use crate::band_cap::compute_band_caps;
-use crate::band_minimums::{compute_trim_offsets, SHORT_FRAME_BAND_BINS};
-use crate::static_alloc::{window_static_alloc_per_band_1_8th, INTERP_STEPS, NUM_Q};
+use crate::band_minimums::{SHORT_FRAME_BAND_BINS, compute_trim_offsets};
+use crate::static_alloc::{INTERP_STEPS, NUM_Q, window_static_alloc_per_band_1_8th};
 
 /// The per-band shape-allocation candidate assembled at a quality
 /// column, in 1/8-bit units.
@@ -385,7 +385,7 @@ pub fn find_combined_alloc(
 mod tests {
     use super::*;
     use crate::band_cap::compute_band_caps;
-    use crate::band_minimums::{compute_trim_offsets, BAND_BINS_LM};
+    use crate::band_minimums::{BAND_BINS_LM, compute_trim_offsets};
     use crate::static_alloc::window_static_alloc_per_band_1_8th;
 
     /// Pure-CELT mono LM=0 window of all 21 bands.

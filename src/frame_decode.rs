@@ -68,15 +68,15 @@
 //! is produced by an existing module whose own provenance is recorded
 //! in that module. No external library source was consulted.
 
-use crate::allocation_budget::{compute_initial_reservations, InitialReservations};
-use crate::band_cap::{compute_band_caps, decode_band_boosts, BoostResult};
-use crate::bit_allocation::{decode_alloc_trim, BandAllocation};
-use crate::coarse_energy::{decode_coarse_energy, CoarseEnergyState, NUM_BANDS};
+use crate::Error;
+use crate::allocation_budget::{InitialReservations, compute_initial_reservations};
+use crate::band_cap::{BoostResult, compute_band_caps, decode_band_boosts};
+use crate::bit_allocation::{BandAllocation, decode_alloc_trim};
+use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS, decode_coarse_energy};
 use crate::frame_header::CeltFrameHeader;
 use crate::range_decoder::RangeDecoder;
-use crate::spread::{decode_spread, Spread};
-use crate::tf_change::{decode_tf_parameters, TfParameters};
-use crate::Error;
+use crate::spread::{Spread, decode_spread};
+use crate::tf_change::{TfParameters, decode_tf_parameters};
 
 /// 1/8-bit units per whole coded bit (the §4.3.3 budget scale).
 const BITS_TO_8TH: u32 = 8;

@@ -211,7 +211,7 @@ mod tests {
     /// a capped value equals the amplitude at exactly 32.0).
     #[test]
     fn rfc8251_energy_cap_keeps_amplitude_finite() {
-        use super::{log_energy_q8_to_amplitude_f32, MAX_LOG_ENERGY_Q8};
+        use super::{MAX_LOG_ENERGY_Q8, log_energy_q8_to_amplitude_f32};
         let extreme = log_energy_q8_to_amplitude_f32(i32::MAX);
         assert!(extreme.is_finite());
         assert_eq!(extreme, log_energy_q8_to_amplitude_f32(MAX_LOG_ENERGY_Q8));

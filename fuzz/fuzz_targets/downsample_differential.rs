@@ -12,7 +12,7 @@
 //! included). Any divergence is a real decoder bug.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_celt::ref_decode::{resampling_factor, CeltRefDecoder};
+use oxideav_celt::ref_decode::{CeltRefDecoder, resampling_factor};
 
 /// Reduced output rates under test (the §4.2.9 ladder below 48 kHz).
 const RATES: [u32; 4] = [24_000, 16_000, 12_000, 8_000];

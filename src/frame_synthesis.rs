@@ -117,15 +117,15 @@
 //! delegates to an existing RFC-grounded module whose own provenance is
 //! recorded in that module. No external library source was consulted.
 
-use crate::anti_collapse::{apply_anti_collapse, ENERGY_HISTORY_FLOOR_LOG2};
+use crate::anti_collapse::{ENERGY_HISTORY_FLOOR_LOG2, apply_anti_collapse};
 use crate::band_energy::{assemble_band_log_energy_f32, assemble_band_log_energy_q8};
 use crate::coarse_energy::{CoarseEnergyState, NUM_BANDS};
 use crate::deemphasis::Deemphasis;
 use crate::fine_energy::decode_fine_energy;
-use crate::frame_decode::{decode_frame_prefix, FramePrefix};
+use crate::frame_decode::{FramePrefix, decode_frame_prefix};
 use crate::frame_header::decode_anti_collapse_flag;
 use crate::post_filter::{
-    apply_post_filter_transition_f32, PostFilterParams as PfTransitionParams,
+    PostFilterParams as PfTransitionParams, apply_post_filter_transition_f32,
 };
 use crate::range_decoder::RangeDecoder;
 use crate::residual::decode_residual_bands;
@@ -157,8 +157,8 @@ pub(crate) fn push_post_filter_history(history: &mut [f32], block: &[f32]) {
         history[k] = block[n - 1 - k];
     }
 }
-use crate::synthesis::{LongMdctSynthesis, StereoLongMdctSynthesis};
 use crate::Error;
+use crate::synthesis::{LongMdctSynthesis, StereoLongMdctSynthesis};
 
 /// Streaming CELT decoder state carried across frames (RFC 6716 §4.5.2).
 ///
@@ -381,10 +381,10 @@ pub(crate) fn decode_celt_frame_inner(
         return Err(Error::InvalidParameter);
     }
     let coded_bands = end - start;
-    if let Some((_, k)) = overrides {
-        if k.len() != coded_bands {
-            return Err(Error::InvalidParameter);
-        }
+    if let Some((_, k)) = overrides
+        && k.len() != coded_bands
+    {
+        return Err(Error::InvalidParameter);
     }
     let lm = state.lm;
 
@@ -949,10 +949,10 @@ impl StereoCeltDecodeState {
             return Err(Error::InvalidParameter);
         }
         let coded_bands = end - start;
-        if let Some((_, k)) = overrides {
-            if k.len() != coded_bands {
-                return Err(Error::InvalidParameter);
-            }
+        if let Some((_, k)) = overrides
+            && k.len() != coded_bands
+        {
+            return Err(Error::InvalidParameter);
         }
         let lm = self.lm;
 
@@ -1504,10 +1504,11 @@ mod tests {
                 .map(|i| i.wrapping_mul(37).wrapping_add(seed))
                 .collect();
             let mut probe = CeltDecodeState::new(lm).unwrap();
-            if let Ok(f) = decode_celt_frame(&mut probe, &buf, 0, 21, &zero_fine(), &[2u32; 21]) {
-                if !f.prefix.header.transient && f.prefix.header.post_filter.is_some() {
-                    return Some(buf);
-                }
+            if let Ok(f) = decode_celt_frame(&mut probe, &buf, 0, 21, &zero_fine(), &[2u32; 21])
+                && !f.prefix.header.transient
+                && f.prefix.header.post_filter.is_some()
+            {
+                return Some(buf);
             }
         }
         None

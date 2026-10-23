@@ -119,7 +119,9 @@ fn write_f32(path: &Path, data: &[f32]) {
 fn read_f32(path: &Path) -> Vec<f32> {
     std::fs::read(path)
         .expect("read f32")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }

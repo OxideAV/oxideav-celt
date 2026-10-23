@@ -36,9 +36,9 @@
 //! §4.3 (cited in the module docs). No external library source.
 
 use oxideav_celt::{
-    assemble_band_log_energy_q8, coded_total_bins, decode_frame_prefix, mdct_size,
-    CoarseEnergyState, Deemphasis, LongMdctSynthesis, RangeDecoder, StereoCeltDecodeState,
-    NUM_BANDS,
+    CoarseEnergyState, Deemphasis, LongMdctSynthesis, NUM_BANDS, RangeDecoder,
+    StereoCeltDecodeState, assemble_band_log_energy_q8, coded_total_bins, decode_frame_prefix,
+    mdct_size,
 };
 
 /// A deterministic stereo CELT payload. The exact bytes are arbitrary;
@@ -64,10 +64,9 @@ fn non_transient_payload(lm: u32) -> Vec<u8> {
         let mut dec = RangeDecoder::new(&buf);
         if let Ok(prefix) =
             decode_frame_prefix(&mut dec, &mut probe, lm, buf.len() as u32, true, 0, 21)
+            && !prefix.header.transient
         {
-            if !prefix.header.transient {
-                return buf;
-            }
+            return buf;
         }
     }
     panic!("no non-transient stereo payload found for lm={lm}");

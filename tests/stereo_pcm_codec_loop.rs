@@ -8,7 +8,7 @@ use oxideav_celt::coarse_energy::NUM_BANDS;
 use oxideav_celt::frame_header::CeltFrameHeader;
 use oxideav_celt::frame_synthesis::StereoCeltDecodeState;
 use oxideav_celt::pcm_encode::{
-    encode_stereo_celt_frame_pcm, encode_stereo_celt_frame_pcm_auto, StereoCeltEncodeState,
+    StereoCeltEncodeState, encode_stereo_celt_frame_pcm, encode_stereo_celt_frame_pcm_auto,
 };
 
 fn plain_header(intra: bool) -> CeltFrameHeader {
@@ -335,15 +335,10 @@ fn stereo_pcm_rejections_and_explicit_variant() {
     let good = plain_header(true);
 
     // Wrong PCM length.
-    assert!(encode_stereo_celt_frame_pcm_auto(
-        &mut state,
-        &pcm[..2 * n - 1],
-        &good,
-        frame_bytes,
-        0,
-        21
-    )
-    .is_err());
+    assert!(
+        encode_stereo_celt_frame_pcm_auto(&mut state, &pcm[..2 * n - 1], &good, frame_bytes, 0, 21)
+            .is_err()
+    );
     // A transient header encodes (r406 short-block support) — on a
     // scratch state so the rejection checks below start clean.
     let transient = CeltFrameHeader {

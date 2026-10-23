@@ -32,11 +32,11 @@
 //! `docs/audio/celt/tables/cache_caps50.csv` (metadata in
 //! `cache_caps50.meta`). No external library source was consulted.
 
+use crate::Error;
 use crate::coarse_energy::NUM_BANDS;
 use crate::custom_mode::MAX_BANDS;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// CELT cache.caps cache, 8 rows × 21 bands per RFC 6716 §4.3.3 +
 /// `docs/audio/celt/tables/cache_caps50.csv`.

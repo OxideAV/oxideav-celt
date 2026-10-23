@@ -16,10 +16,10 @@
 //! against `EncodedFrame::reconstructed_spectrum`.
 
 use oxideav_celt::{
-    band_bins, coded_total_bins, decode_celt_frame, decode_celt_frame_auto, decode_fine_energy,
-    decode_frame_prefix, decode_residual_bands, encode_celt_frame, encode_celt_frame_auto,
-    pulses_from_walk, run_prefix_walk, v_count, CeltDecodeState, CeltFrameHeader,
-    CoarseEnergyState, PostFilter, RangeDecoder, WalkIo, NUM_BANDS,
+    CeltDecodeState, CeltFrameHeader, CoarseEnergyState, NUM_BANDS, PostFilter, RangeDecoder,
+    WalkIo, band_bins, coded_total_bins, decode_celt_frame, decode_celt_frame_auto,
+    decode_fine_energy, decode_frame_prefix, decode_residual_bands, encode_celt_frame,
+    encode_celt_frame_auto, pulses_from_walk, run_prefix_walk, v_count,
 };
 
 const FRAME_BYTES: u32 = 160;
@@ -372,32 +372,36 @@ fn encoder_rejects_out_of_scope_frames() {
     .expect("transient mono encode");
 
     // Spectrum length mismatch.
-    assert!(encode_celt_frame(
-        &mut state,
-        &spectrum[1..],
-        &default_header(),
-        lm,
-        FRAME_BYTES,
-        start,
-        end,
-        &fine_bits,
-        &band_k
-    )
-    .is_err());
+    assert!(
+        encode_celt_frame(
+            &mut state,
+            &spectrum[1..],
+            &default_header(),
+            lm,
+            FRAME_BYTES,
+            start,
+            end,
+            &fine_bits,
+            &band_k
+        )
+        .is_err()
+    );
 
     // band_k length mismatch.
-    assert!(encode_celt_frame(
-        &mut state,
-        &spectrum,
-        &default_header(),
-        lm,
-        FRAME_BYTES,
-        start,
-        end,
-        &fine_bits,
-        &band_k[1..]
-    )
-    .is_err());
+    assert!(
+        encode_celt_frame(
+            &mut state,
+            &spectrum,
+            &default_header(),
+            lm,
+            FRAME_BYTES,
+            start,
+            end,
+            &fine_bits,
+            &band_k[1..]
+        )
+        .is_err()
+    );
 }
 
 /// The fully self-contained codec loop: `encode_celt_frame_auto` →

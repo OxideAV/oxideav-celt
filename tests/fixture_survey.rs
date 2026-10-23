@@ -8,7 +8,7 @@
 //! — the test passes with a note when the directory is absent.
 
 use oxideav_celt::{
-    decode_frame_prefix, run_prefix_walk, CoarseEnergyState, RangeDecoder, WalkIo, NUM_BANDS,
+    CoarseEnergyState, NUM_BANDS, RangeDecoder, WalkIo, decode_frame_prefix, run_prefix_walk,
 };
 use std::path::PathBuf;
 

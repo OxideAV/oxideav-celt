@@ -65,9 +65,9 @@
 //! (metadata in `log2_frac_table.meta`). No external library source
 //! was consulted.
 
+use crate::Error;
 use crate::range_decoder::RangeDecoder;
 use crate::range_encoder::RangeEncoder;
-use crate::Error;
 
 /// Default value of the allocation trim per RFC 6716 §4.3.3.
 ///
@@ -176,11 +176,7 @@ pub fn intensity_rsv(coded_bands: u32, stereo: bool, total_8th_bits: i32) -> u32
     // §4.3.3: "If intensity_rsv > total, set it to 0; otherwise
     // decrement total by it ...". We return the value that survives
     // the >total test, or 0 if it would exceed the budget.
-    if rsv > total_8th_bits {
-        0
-    } else {
-        rsv as u32
-    }
+    if rsv > total_8th_bits { 0 } else { rsv as u32 }
 }
 
 /// Compute the trio (intensity_rsv, total_after, dual_stereo_rsv) for

@@ -189,11 +189,7 @@ pub fn cache_offset(band: usize, lm: usize) -> Option<usize> {
     }
     let off = CACHE_INDEX50[(lm + 1) * NUM_BANDS + band];
     debug_assert!(off >= 0, "coded rows carry no sentinels");
-    if off < 0 {
-        None
-    } else {
-        Some(off as usize)
-    }
+    if off < 0 { None } else { Some(off as usize) }
 }
 
 /// Look up the byte offset of the cost run for a band on the
@@ -208,11 +204,7 @@ pub fn cache_offset_half_block(band: usize) -> Option<usize> {
         return None;
     }
     let off = CACHE_INDEX50[band];
-    if off < 0 {
-        None
-    } else {
-        Some(off as usize)
-    }
+    if off < 0 { None } else { Some(off as usize) }
 }
 
 /// The largest `K` the cached run for `(band, LM)` supports at a coded
@@ -311,7 +303,7 @@ pub const EXTENDED_K_CAP: u32 = 128;
 /// function, so allocation lockstep is bit-exact by construction even
 /// in a hypothetical misceil corner.
 pub fn cost_exact_8th(n: u32, k: u32) -> Option<u32> {
-    use crate::pvq::{v_count, V_COUNT_SATURATION};
+    use crate::pvq::{V_COUNT_SATURATION, v_count};
     if k == 0 {
         return Some(0);
     }
@@ -383,7 +375,7 @@ pub fn cached_bits_to_pulses_extended(
 mod tests {
     use super::*;
     use crate::band_minimums::BAND_BINS_LM;
-    use crate::pvq::{v_count, V_COUNT_SATURATION};
+    use crate::pvq::{V_COUNT_SATURATION, v_count};
 
     /// The band size `N` a `(band, LM)` tuple prices, per RFC 6716
     /// Table 55: the coded rows read `BAND_BINS_LM[lm][band]`; the
@@ -392,7 +384,7 @@ mod tests {
         let base = BAND_BINS_LM[0][band];
         if lm >= 0 {
             Some(base << lm)
-        } else if base % 2 == 0 {
+        } else if base.is_multiple_of(2) {
             Some(base / 2)
         } else {
             None
@@ -430,7 +422,7 @@ mod tests {
         let sentinels: Vec<usize> = CACHE_INDEX50
             .iter()
             .enumerate()
-            .filter(|(_, &v)| v < 0)
+            .filter(|&(_, &v)| v < 0)
             .map(|(i, _)| i)
             .collect();
         assert_eq!(sentinels, vec![0, 1, 2, 3, 4, 5, 6, 7]);

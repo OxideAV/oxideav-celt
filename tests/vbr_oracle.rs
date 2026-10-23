@@ -108,7 +108,7 @@ fn stats(sizes: &[usize], frame_size: usize) -> SetResult {
     let silence_frames: Vec<usize> = sizes
         .iter()
         .enumerate()
-        .filter(|(_, &s)| s <= 2)
+        .filter(|&(_, &s)| s <= 2)
         .map(|(i, _)| i)
         .collect();
     SetResult {
@@ -189,7 +189,9 @@ fn vbr_controller_tracks_the_reference_oracle() {
         let our_snr = snr_vs_delayed_input(&pcm, &input, channels);
         let expected: Vec<f32> = std::fs::read(d.join("expected.f32"))
             .expect("expected.f32")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         let oracle_snr = snr_vs_delayed_input(&expected, &input, channels);

@@ -101,7 +101,7 @@
 //! and `cache-index50.csv`. No external library source was consulted.
 
 use crate::pulse_cache::{cache_offset, cached_bits_to_pulses_extended};
-use crate::pvq::{v_count, V_COUNT_SATURATION};
+use crate::pvq::{V_COUNT_SATURATION, v_count};
 
 /// Number of 1/8 bits per whole bit. Pinned for arithmetic clarity
 /// since every quantity in this module is in 1/8-bit units.
@@ -469,10 +469,10 @@ pub fn bits_to_pulses_band_loop_cached_thresh(
     if band_n.len() != band_target_8th.len() {
         return None;
     }
-    if let Some(t) = thresh_8th {
-        if t.len() != band_n.len() {
-            return None;
-        }
+    if let Some(t) = thresh_8th
+        && t.len() != band_n.len()
+    {
+        return None;
     }
 
     let nbands = band_n.len();
@@ -494,15 +494,15 @@ pub fn bits_to_pulses_band_loop_cached_thresh(
         // §4.3.3 hard-minimum skip floor: below-threshold bands carry
         // no shape allocation at all (see the function docs); the raw
         // target is credited to the balance below, unspent.
-        if let Some(t) = thresh_8th {
-            if adjusted_target < t[i] {
-                balance.update(raw_target, 0);
-                out.push(BitsToPulses {
-                    k: 0,
-                    bits_used_8th: 0,
-                });
-                continue;
-            }
+        if let Some(t) = thresh_8th
+            && adjusted_target < t[i]
+        {
+            balance.update(raw_target, 0);
+            out.push(BitsToPulses {
+                k: 0,
+                bits_used_8th: 0,
+            });
+            continue;
         }
 
         let celt_band = band_start + i;
@@ -1066,14 +1066,16 @@ mod tests {
             bits_to_pulses_band_loop_cached_thresh(2, 0, &[4, 8, 16], &[60, 120, 200], None)
                 .unwrap();
         assert_eq!(plain.0, with_none.0);
-        assert!(bits_to_pulses_band_loop_cached_thresh(
-            2,
-            0,
-            &[4, 8, 16],
-            &[60, 120, 200],
-            Some(&[8, 8])
-        )
-        .is_none());
+        assert!(
+            bits_to_pulses_band_loop_cached_thresh(
+                2,
+                0,
+                &[4, 8, 16],
+                &[60, 120, 200],
+                Some(&[8, 8])
+            )
+            .is_none()
+        );
     }
 
     /// A zero thresh never skips: identical to the plain walk.

@@ -31,9 +31,9 @@
 //! §4.3 (cited in the module docs). No external library source.
 
 use oxideav_celt::{
-    assemble_band_log_energy_q8, denormalize_bands_in_place_f32, log_energy_q8_to_amplitude_f32,
-    mdct_size, CoarseEnergyState, Deemphasis, LongMdctSynthesis, StereoCeltDecodeState,
-    BAND_BINS_LM, NUM_BANDS,
+    BAND_BINS_LM, CoarseEnergyState, Deemphasis, LongMdctSynthesis, NUM_BANDS,
+    StereoCeltDecodeState, assemble_band_log_energy_q8, denormalize_bands_in_place_f32,
+    log_energy_q8_to_amplitude_f32, mdct_size,
 };
 
 /// Build a deterministic unit-norm-ish shape for one channel's full

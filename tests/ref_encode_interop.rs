@@ -66,7 +66,9 @@ fn write_frames(path: &Path, frames: &[Vec<u8>]) {
 fn read_f32(path: &Path) -> Vec<f32> {
     std::fs::read(path)
         .expect("read f32")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -214,16 +216,18 @@ fn rate_quality_sweep_vs_listing_encoder() {
             let ours_frames = tmp.join(format!("o_{lm}_{channels}_{bytes}.frames"));
             let ours_out = tmp.join(format!("o_{lm}_{channels}_{bytes}.f32"));
             write_frames(&ours_frames, &frames);
-            assert!(Command::new(dir.join("celt_ref_dec"))
-                .args([
-                    &channels.to_string(),
-                    &frame.to_string(),
-                    ours_frames.to_str().unwrap(),
-                    ours_out.to_str().unwrap(),
-                ])
-                .status()
-                .expect("oracle decoder runs")
-                .success());
+            assert!(
+                Command::new(dir.join("celt_ref_dec"))
+                    .args([
+                        &channels.to_string(),
+                        &frame.to_string(),
+                        ours_frames.to_str().unwrap(),
+                        ours_out.to_str().unwrap(),
+                    ])
+                    .status()
+                    .expect("oracle decoder runs")
+                    .success()
+            );
 
             // Reference encoder on the same material.
             let in_f32 = tmp.join(format!("in_{lm}_{channels}.f32"));
@@ -234,27 +238,31 @@ fn rate_quality_sweep_vs_listing_encoder() {
             std::fs::write(&in_f32, raw).unwrap();
             let ref_frames = tmp.join(format!("r_{lm}_{channels}_{bytes}.frames"));
             let ref_out = tmp.join(format!("r_{lm}_{channels}_{bytes}.f32"));
-            assert!(Command::new(dir.join("celt_ref_enc"))
-                .args([
-                    &channels.to_string(),
-                    &frame.to_string(),
-                    &budget.to_string(),
-                    in_f32.to_str().unwrap(),
-                    ref_frames.to_str().unwrap(),
-                ])
-                .status()
-                .expect("oracle encoder runs")
-                .success());
-            assert!(Command::new(dir.join("celt_ref_dec"))
-                .args([
-                    &channels.to_string(),
-                    &frame.to_string(),
-                    ref_frames.to_str().unwrap(),
-                    ref_out.to_str().unwrap(),
-                ])
-                .status()
-                .expect("oracle decoder runs")
-                .success());
+            assert!(
+                Command::new(dir.join("celt_ref_enc"))
+                    .args([
+                        &channels.to_string(),
+                        &frame.to_string(),
+                        &budget.to_string(),
+                        in_f32.to_str().unwrap(),
+                        ref_frames.to_str().unwrap(),
+                    ])
+                    .status()
+                    .expect("oracle encoder runs")
+                    .success()
+            );
+            assert!(
+                Command::new(dir.join("celt_ref_dec"))
+                    .args([
+                        &channels.to_string(),
+                        &frame.to_string(),
+                        ref_frames.to_str().unwrap(),
+                        ref_out.to_str().unwrap(),
+                    ])
+                    .status()
+                    .expect("oracle decoder runs")
+                    .success()
+            );
 
             let ours = read_f32(&ours_out);
             let theirs = read_f32(&ref_out);

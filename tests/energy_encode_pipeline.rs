@@ -23,9 +23,9 @@
 //! function) on top of the reconstructed coarse envelope.
 
 use oxideav_celt::{
+    BAND_BINS_LM, CoarseEnergyState, MAX_CHANNELS, NUM_BANDS, RangeDecoder, RangeEncoder,
     analyze_bands_f32, assemble_band_log_energy_q8, decode_coarse_energy, denormalize_bands_f32,
     encode_coarse_energy, fine_correction_q14, log_energy_f32_to_q8, quantize_fine_energy_band,
-    CoarseEnergyState, RangeDecoder, RangeEncoder, BAND_BINS_LM, MAX_CHANNELS, NUM_BANDS,
 };
 
 const FRAME_BYTES: usize = 192;

@@ -66,7 +66,9 @@ fn write_f32(path: &Path, data: &[f32]) {
 fn read_f32(path: &Path) -> Vec<f32> {
     std::fs::read(path)
         .expect("read f32")
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -279,13 +281,13 @@ fn hybrid_layer_oracle_vbr_ab() {
         let our_silence: Vec<usize> = sizes
             .iter()
             .enumerate()
-            .filter(|(_, &s)| s <= 2)
+            .filter(|&(_, &s)| s <= 2)
             .map(|(i, _)| i)
             .collect();
         let oracle_silence: Vec<usize> = oracle_sizes
             .iter()
             .enumerate()
-            .filter(|(_, &s)| s <= 2)
+            .filter(|&(_, &s)| s <= 2)
             .map(|(i, _)| i)
             .collect();
         let mean = |s: &[usize]| {
