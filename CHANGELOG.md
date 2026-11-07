@@ -4,6 +4,12 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.15...v0.2.0) - 2026-11-07
+
+### Other
+
+- API hygiene: non_exhaustive Error, option records and CeltCustomMode
+
 ### Added
 
 - `CeltCodecOptions::new` / `CeltEncoderOptions::new` plus a `with_<field>` builder for every option field.
