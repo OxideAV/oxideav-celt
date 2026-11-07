@@ -4,6 +4,15 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Added
+
+- `CeltCodecOptions::new` / `CeltEncoderOptions::new` plus a `with_<field>` builder for every option field.
+
+### Changed
+
+- `#[non_exhaustive]` on `Error` and on the `CeltCodecOptions`, `CeltEncoderOptions` and `CeltCustomMode` records. Build the options with `Default` / `new()` and the `with_*` builders; a mode comes from `CeltCustomMode::new` / `CeltCustomMode::standard`.
+- `#[doc(hidden)]` on the internal `custom_mode::log2_frac` helper.
+
 ## [0.1.15](https://github.com/OxideAV/oxideav-celt/compare/v0.1.14...v0.1.15) - 2026-10-23
 
 ### Other

@@ -364,6 +364,7 @@ pub use tf_change::{
 /// not use this type for their hot paths — they latch a sticky error
 /// flag instead, mirroring RFC 6716 §4.1.5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A path the earlier in-crate-wire building blocks do not carry
     /// (the §4.3.4.4 split / joint-stereo layouts); the

@@ -133,6 +133,7 @@ fn fits_in32(n: i32, k: i32) -> bool {
 
 /// `log2_frac` (Appendix A `cwrs.c`): a conservatively-large binary
 /// logarithm with `frac` fractional bits.
+#[doc(hidden)]
 pub fn log2_frac(val: u32, frac: u32) -> i32 {
     let mut val = val;
     let l = 32 - val.leading_zeros() as i32; // EC_ILOG
@@ -245,6 +246,7 @@ fn compute_ebands(fs: i32, frame_size: i32, res: i32) -> Vec<i16> {
 /// RFC 6716 Opus stream uses (the same construction — its output is
 /// pinned bit-exact against the staged 48 kHz tables).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CeltCustomMode {
     /// Sample rate in Hz (8000..=96000).
     pub fs: u32,

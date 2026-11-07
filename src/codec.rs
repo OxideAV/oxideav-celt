@@ -47,6 +47,7 @@ const DEFAULT_BIT_RATE: u64 = 96_000;
 
 /// Typed options shared by the decoder and encoder factories.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CeltCodecOptions {
     /// CELT frame size in samples: 120/240/480/960 at the standard
     /// 48 kHz modes, or any legal custom-mode size at other rates.
@@ -77,6 +78,37 @@ impl Default for CeltCodecOptions {
             end_band: 21,
             resample: false,
         }
+    }
+}
+
+impl CeltCodecOptions {
+    /// The defaults: 960-sample frames, bands 0..21, no resampling.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `frame_size`.
+    pub fn with_frame_size(mut self, frame_size: u32) -> Self {
+        self.frame_size = frame_size;
+        self
+    }
+
+    /// Set `start_band`.
+    pub fn with_start_band(mut self, start_band: u32) -> Self {
+        self.start_band = start_band;
+        self
+    }
+
+    /// Set `end_band`.
+    pub fn with_end_band(mut self, end_band: u32) -> Self {
+        self.end_band = end_band;
+        self
+    }
+
+    /// Set `resample`.
+    pub fn with_resample(mut self, resample: bool) -> Self {
+        self.resample = resample;
+        self
     }
 }
 
@@ -127,6 +159,7 @@ impl CodecOptionsStruct for CeltCodecOptions {
 /// Typed options for the encoder factory: the shared `frame_size`
 /// plus the rate-control mode.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CeltEncoderOptions {
     /// CELT frame size in samples: 120/240/480/960 at the standard
     /// 48 kHz modes, or any legal custom-mode size at other rates.
@@ -167,6 +200,55 @@ impl Default for CeltEncoderOptions {
             end_band: 21,
             resample: false,
         }
+    }
+}
+
+impl CeltEncoderOptions {
+    /// The defaults: 960-sample CBR frames, bands 0..21, search effort 2.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set `frame_size`.
+    pub fn with_frame_size(mut self, frame_size: u32) -> Self {
+        self.frame_size = frame_size;
+        self
+    }
+
+    /// Set `vbr`.
+    pub fn with_vbr(mut self, vbr: bool) -> Self {
+        self.vbr = vbr;
+        self
+    }
+
+    /// Set `vbr_constrained`.
+    pub fn with_vbr_constrained(mut self, vbr_constrained: bool) -> Self {
+        self.vbr_constrained = vbr_constrained;
+        self
+    }
+
+    /// Set `start_band`.
+    pub fn with_start_band(mut self, start_band: u32) -> Self {
+        self.start_band = start_band;
+        self
+    }
+
+    /// Set `end_band`.
+    pub fn with_end_band(mut self, end_band: u32) -> Self {
+        self.end_band = end_band;
+        self
+    }
+
+    /// Set `resample`.
+    pub fn with_resample(mut self, resample: bool) -> Self {
+        self.resample = resample;
+        self
+    }
+
+    /// Set `search_effort`.
+    pub fn with_search_effort(mut self, search_effort: u32) -> Self {
+        self.search_effort = search_effort;
+        self
     }
 }
 
