@@ -4,6 +4,15 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-celt/compare/v0.1.15...v0.2.0) - 2026-11-21
+
+### Other
+
+- clippy 1.100: rewrite index loops flagged by needless_range_loop
+- clippy 1.100: walk the per-channel energy rows instead of indexing them
+- parse only this decoder's own option keys
+- API hygiene: non_exhaustive Error, option records and CeltCustomMode
+
 ### Fixed
 
 - decoder: option keys this decoder does not define (a container's track records such as the MP4 edit-list entries, or the producing encoder's options) no longer fail the decoder factory; only its own keys are parsed, and a malformed value of one of them is still an error. Such streams could not be opened through the registry at all.
