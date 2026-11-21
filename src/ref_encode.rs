@@ -1597,10 +1597,8 @@ impl CeltRefEncoder {
             frame_bytes = best.frame_bytes;
         } else {
             // Silence: floor the prediction state like the decoder.
-            for c in 0..2 {
-                for i in 0..MAX_BANDS {
-                    self.coarse.energy[c][i] = -28.0;
-                }
+            for energy in self.coarse.energy.iter_mut().take(2) {
+                energy[..MAX_BANDS].fill(-28.0);
             }
             // §A.1 VBR: a silence frame sends the 2-byte minimum and
             // refills the reservoir without touching the drift

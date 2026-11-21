@@ -633,10 +633,10 @@ impl CeltRefDecoder {
                 if fq <= 0 {
                     continue;
                 }
-                for c in 0..channels {
+                for energy in self.coarse.energy.iter_mut().take(channels) {
                     let q2 = dec.dec_bits(fq as u32) as f32;
                     let offset = (q2 + 0.5) * (1 << (14 - fq)) as f32 * (1.0 / 16384.0) - 0.5;
-                    self.coarse.energy[c][i] += offset;
+                    energy[i] += offset;
                 }
             }
 
@@ -676,12 +676,12 @@ impl CeltRefDecoder {
                         i += 1;
                         continue;
                     }
-                    for c in 0..channels {
+                    for energy in self.coarse.energy.iter_mut().take(channels) {
                         let q2 = dec.dec_bits(1) as f32;
                         let offset = (q2 - 0.5)
                             * (1 << (14 - alloc.fine_bits[i] - 1)) as f32
                             * (1.0 / 16384.0);
-                        self.coarse.energy[c][i] += offset;
+                        energy[i] += offset;
                         bits_left -= 1;
                     }
                     i += 1;
@@ -719,10 +719,8 @@ impl CeltRefDecoder {
             }
         } else {
             // Silence: zero spectrum, floor energies.
-            for c in 0..2 {
-                for i in 0..MAX_BANDS {
-                    self.coarse.energy[c][i] = -28.0;
-                }
+            for energy in self.coarse.energy.iter_mut().take(2) {
+                energy[..MAX_BANDS].fill(-28.0);
             }
         }
 
