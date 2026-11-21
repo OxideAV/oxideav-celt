@@ -120,8 +120,8 @@ fn end_band_state_pinning_and_mismatch() {
             .encode_frame(&pcm[f * frame..(f + 1) * frame], 90)
             .expect("encode");
         dec.decode_frame(&bytes).expect("decode");
-        for i in end..21 {
-            assert_eq!(dec.coarse.energy[0][i], 0.0, "band {i} energy not pinned");
+        for (i, energy) in dec.coarse.energy[0].iter().enumerate().take(21).skip(end) {
+            assert_eq!(*energy, 0.0, "band {i} energy not pinned");
         }
     }
     // Constructor validation.

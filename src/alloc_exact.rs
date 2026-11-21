@@ -741,8 +741,8 @@ mod tests {
                     assert!(alloc.shape_bits[j] >= 0);
                     assert!(alloc.fine_bits[j] >= 0 && alloc.fine_bits[j] <= MAX_FINE_BITS);
                 }
-                for j in alloc.coded_bands..NUM_BANDS {
-                    assert_eq!(alloc.shape_bits[j], 0, "skipped bands carry no shape bits");
+                for &bits in &alloc.shape_bits[alloc.coded_bands..NUM_BANDS] {
+                    assert_eq!(bits, 0, "skipped bands carry no shape bits");
                 }
             }
         }

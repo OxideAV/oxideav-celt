@@ -763,9 +763,7 @@ mod tests {
     fn quant_coarse_energy_rd_decay_bound() {
         let bytes = 40u32; // max_decay = 5.0
         let mut state = CoarseEnergyState::new();
-        for b in 0..NUM_BANDS {
-            state.energy[0][b] = 6.0;
-        }
+        state.energy[0][..NUM_BANDS].fill(6.0);
         let start_energy = state.energy;
         let target = [[-28.0f32; MAX_BANDS]; MAX_CHANNELS];
         let mut delayed = 0.0f32;
@@ -806,8 +804,8 @@ mod tests {
     fn quant_coarse_energy_rd_prefers_lower_badness() {
         let bytes = 21u32; // tight: end-of-budget clamps bite inter
         let mut state = CoarseEnergyState::new();
-        for b in 0..NUM_BANDS {
-            state.energy[0][b] = if b % 2 == 0 { 8.0 } else { -8.0 };
+        for (b, e) in state.energy[0][..NUM_BANDS].iter_mut().enumerate() {
+            *e = if b % 2 == 0 { 8.0 } else { -8.0 };
         }
         let mut target = [[0.0f32; MAX_BANDS]; MAX_CHANNELS];
         for (b, t) in target[0].iter_mut().enumerate() {
@@ -904,13 +902,10 @@ mod tests {
         // qi = -1 everywhere.
         let beta = 4915.0_f32 / 32768.0;
         let mut prev = 0.0_f32;
-        for band in 0..NUM_BANDS {
+        for (band, &energy) in state.energy[0][..NUM_BANDS].iter().enumerate() {
             let q = -1.0_f32;
             let expected = prev + q; // coef = 0 kills the time arm
-            assert_eq!(
-                state.energy[0][band], expected,
-                "band {band} mismatch vs hand recursion"
-            );
+            assert_eq!(energy, expected, "band {band} mismatch vs hand recursion");
             prev += q - beta * q;
         }
         // Channel 1 was not coded (mono) and stays untouched.
@@ -1159,12 +1154,9 @@ mod tests {
                 decode_coarse_energy(&mut dec, &mut state, intra, lm, 0, NUM_BANDS, 2).unwrap();
                 assert!(dec.tell() > tell_before, "no bits consumed");
                 assert!(!dec.has_error(), "sticky error lm={lm} intra={intra}");
-                for c in 0..2 {
-                    for band in 0..NUM_BANDS {
-                        assert!(
-                            state.energy[c][band].is_finite(),
-                            "non-finite energy at c={c} band={band}"
-                        );
+                for (c, chan) in state.energy[..2].iter().enumerate() {
+                    for (band, energy) in chan[..NUM_BANDS].iter().enumerate() {
+                        assert!(energy.is_finite(), "non-finite energy at c={c} band={band}");
                     }
                 }
             }

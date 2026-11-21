@@ -953,11 +953,11 @@ mod tests {
         assert_eq!(r.bits_consumed, 5);
         assert_eq!(r.bits_unused, 5);
         // All-zero buffer biases each raw bit to 0; correction(f=0, B=1) = -4096.
-        for b in 0..coded_bands {
-            assert_eq!(r.extra_correction_q14[b], -4096);
+        for &corr in &r.extra_correction_q14[..coded_bands] {
+            assert_eq!(corr, -4096);
         }
-        for b in coded_bands..NUM_BANDS {
-            assert_eq!(r.extra_correction_q14[b], 0);
+        for &corr in &r.extra_correction_q14[coded_bands..NUM_BANDS] {
+            assert_eq!(corr, 0);
         }
     }
 
@@ -975,8 +975,8 @@ mod tests {
         assert_eq!(r.bits_consumed, 10);
         assert_eq!(r.bits_unused, 90);
         // All-zero bits: each channel contributes -4096; summed = -8192.
-        for b in 0..coded_bands {
-            assert_eq!(r.extra_correction_q14[b], -8192);
+        for &corr in &r.extra_correction_q14[..coded_bands] {
+            assert_eq!(corr, -8192);
         }
     }
 

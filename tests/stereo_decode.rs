@@ -106,14 +106,15 @@ fn driver_coarse_energy_matches_standalone_prefix() {
     assert_eq!(out.envelope_q8[1], ref_env1, "right envelope mismatch");
 
     // The driver's carried coarse state equals the standalone decode.
-    for c in 0..2 {
-        for b in 0..NUM_BANDS {
-            assert_eq!(
-                st.coarse_energy().energy[c][b],
-                ref_coarse.energy[c][b],
-                "coarse[{c}][{b}] mismatch"
-            );
-        }
+    for (c, (got, want)) in st
+        .coarse_energy()
+        .energy
+        .iter()
+        .zip(ref_coarse.energy.iter())
+        .enumerate()
+        .take(2)
+    {
+        assert_eq!(got[..NUM_BANDS], want[..NUM_BANDS], "coarse[{c}] mismatch");
     }
 }
 

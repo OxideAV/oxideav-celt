@@ -9,7 +9,6 @@ authors = ["Mark Karpeles"]
 description = "Pure-Rust CELT (MDCT path of Opus) — orphan-rebuild scaffold pending clean-room re-implementation."
 
 readme = "README.md"
-homepage = "https://github.com/OxideAV/oxideav-celt"
 keywords = ["multimedia", "audio", "celt", "opus", "codec"]
 categories = ["multimedia::encoding", "multimedia::audio"]
 
