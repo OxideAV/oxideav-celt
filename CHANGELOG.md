@@ -4,6 +4,10 @@ All notable changes to `oxideav-celt` are recorded here.
 
 ## [Unreleased]
 
+### Fixed
+
+- decoder: option keys this decoder does not define (a container's track records such as the MP4 edit-list entries, or the producing encoder's options) no longer fail the decoder factory; only its own keys are parsed, and a malformed value of one of them is still an error. Such streams could not be opened through the registry at all.
+
 ### Added
 
 - `CeltCodecOptions::new` / `CeltEncoderOptions::new` plus a `with_<field>` builder for every option field.

@@ -550,10 +550,29 @@ impl oxideav_core::Decoder for CeltDecoder {
     }
 }
 
+/// The options of `params` that belong to schema `T`.
+///
+/// A stream's parameter set also carries what its container recorded
+/// about the track (edit lists, bit-rate boxes, handler names, …) and
+/// may carry the options of the encoder that produced it; none of that
+/// configures this decoder, so only its own keys are parsed (a
+/// malformed value of one of them is still an error).
+fn own_options<T: oxideav_core::CodecOptionsStruct>(
+    options: &oxideav_core::CodecOptions,
+) -> oxideav_core::CodecOptions {
+    let mut own = oxideav_core::CodecOptions::default();
+    for (key, value) in options.iter() {
+        if T::SCHEMA.iter().any(|f| f.name == key) {
+            own.insert(key, value);
+        }
+    }
+    own
+}
+
 /// Direct decoder factory (the dual-API entry point; also installed
 /// into the registry by [`register`]).
 pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn oxideav_core::Decoder>> {
-    let opts: CeltCodecOptions = parse_options(&params.options)?;
+    let opts: CeltCodecOptions = parse_options(&own_options::<CeltCodecOptions>(&params.options))?;
     let cfg = stream_config(params, opts.frame_size, opts.resample)?;
     let start = start_band(opts.start_band)?;
     let end = end_band(opts.end_band, start)?;
@@ -1121,8 +1140,10 @@ mod tests {
         assert!(make_encoder(&p).is_err());
 
         let mut p = params(1, 960, None);
-        p.options.insert("bogus", "1");
-        assert!(make_decoder(&p).is_err());
+        // A key this decoder does not define (a container's track
+        // record, say) is not its business.
+        p.options.insert("elst_entry_count", "1");
+        assert!(make_decoder(&p).is_ok());
     }
 
     /// A non-48 kHz stream configuration derives its custom-mode
